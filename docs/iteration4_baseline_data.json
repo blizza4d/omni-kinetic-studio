@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-10-28T16:48:27.866Z",
+  "gpu": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "terrain": {
+    "minHeight": -0.8477026312427463,
+    "maxHeight": 0.8072091295574679,
+    "relief": 1.6549117608002142,
+    "medianSlope": 5.27086619703012,
+    "p95Slope": 11.035809384910014
+  },
+  "debris": {
+    "total": 1696,
+    "radialBins": [
+      46,
+      199,
+      370,
+      465,
+      451,
+      165
+    ],
+    "pyramidCount": 481,
+    "pyramidPercent": 28.4
+  },
+  "motion": {
+    "simRateRatio": 0.991,
+    "staleRatio": 0.958,
+    "staleCount": 115,
+    "totalSamples": 120,
+    "maxJump": 0.521,
+    "wallSec": 2.018,
+    "startSimT": 5.9833,
+    "endSimT": 7.9833
+  },
+  "ui": {
+    "headerTitle": "Omni-Kinetic",
+    "headerChips": [
+      "/",
+      "Low-Gravity Debris Traversal",
+      "Iteration 1",
+      "Task PromptCtrl+K",
+      "Task Prompt",
+      "TeleopT",
+      "Teleop",
+      "ARENA: INSIDE",
+      "(13.31m)",
+      "DEMO: LOCAL RUNNER",
+      "DEMO: LOCAL RUNNER",
+      "16.7msp50/16.9msp951high",
+      "16.7msp50",
+      "16.7ms",
+      "p50",
+      "/",
+      "16.9msp95",
+      "16.9ms",
+      "p95",
+      "1",
+      "1",
+      "high",
+      "2380 tok",
+      "2380 tok",
+      "Layout",
+      "Layout"
+    ],
+    "hasRadar": true
+  }
+}

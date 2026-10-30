@@ -1,0 +1,73 @@
+{
+  "timestamp": "2026-10-29T15:04:34.625Z",
+  "buildStamp": "iteration-5-dev • 21842619 [main] • prod • NVIDIA RTX 3050",
+  "gpu": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "audit": {
+    "header": {
+      "isSingleRow": true,
+      "height": 48,
+      "title": "Omni-Kinetic",
+      "hasPolicyV1Chip": true,
+      "hasNoIteration1Chip": true,
+      "hasTokenCost": true,
+      "tokenText": "ARENA: INSIDEDEMO: LOCAL RUNNERDEMO16.7msp50/17.2msp952 long taskshigh2,380 tok · $0.0232Layout",
+      "noDuplicateEdgeDist": true
+    },
+    "perf": {
+      "perfBadgeText": "Not found",
+      "warningBadgeText": "2 long tasks",
+      "warningBadgeTooltip": "2 long tasks (>50ms) detected in main thread. Click to open P panel diagnostics."
+    },
+    "radar": {
+      "hasRadar": true,
+      "radarText": "RADAR 40×40 mLIVE",
+      "isCachedRemoved": true,
+      "isSquareFormat": true
+    },
+    "logBanner": {
+      "text": "Omni-Kinetic",
+      "hasBuildStamp": false,
+      "hasNoIteration3Text": true
+    },
+    "invariants": {
+      "I1_noGhostShadows": true,
+      "I2_noStraySprites": true,
+      "I3_surfaceDrapedRim": true,
+      "I4_smoothHorizon": true,
+      "I5_contactVisible": true,
+      "I6_legibility": {
+        "bodyContrast": 2.12,
+        "rockContrast": 1.65,
+        "passed": true
+      },
+      "I7_reliefVisible": {
+        "reliefM": 2.42,
+        "hasContourLines": true,
+        "passed": true
+      },
+      "I8_rockShapes": {
+        "triangleCounts": [
+          80,
+          80,
+          80
+        ],
+        "hasZeroPyramids": true,
+        "passed": true
+      }
+    },
+    "robotLegs": {
+      "torsoElevation": 0.385,
+      "pitchRotationsPresent": true,
+      "feetCount": 4,
+      "maxPenetrationMm": 0
+    },
+    "gpu": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+  },
+  "seeds": [
+    42,
+    101,
+    777,
+    2024,
+    9999
+  ]
+}

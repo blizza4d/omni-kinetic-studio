@@ -1,0 +1,439 @@
+{
+  "timestamp": "2026-10-28T15:53:47.506Z",
+  "baseline": {
+    "p50": 16.7,
+    "p95": 17.1,
+    "p99": 17.7,
+    "mean": 16.7,
+    "max": 17.8,
+    "fps": 60,
+    "tier": "high",
+    "longTaskCount": 1,
+    "longTasks": [
+      {
+        "duration": 454,
+        "startTime": 327.60000000009313,
+        "name": "self"
+      }
+    ],
+    "rendererInfo": {
+      "drawCalls": 38,
+      "triangles": 47920,
+      "geometries": 33,
+      "textures": 1,
+      "programs": 13
+    },
+    "gpu": {
+      "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "vendor": "Google Inc. (NVIDIA)",
+      "isHardware": true
+    },
+    "subsystemMs": {
+      "physics": 0,
+      "telemetry": 0,
+      "radar": 0.08
+    },
+    "memory": {
+      "usedMb": 14,
+      "totalMb": 20
+    },
+    "commitsPerSecond": 2
+  },
+  "store": {
+    "currentFrame": {
+      "schemaVersion": "2.0",
+      "t": 5.9833,
+      "episode": 1,
+      "iteration": 1,
+      "bodies": [
+        {
+          "id": "torso",
+          "pos": [
+            4.621,
+            -3.3006,
+            0.7944
+          ],
+          "quat": [
+            0,
+            0.0136,
+            0,
+            0.999
+          ],
+          "vel": [
+            0.827,
+            0,
+            -0.591
+          ]
+        }
+      ],
+      "joints": [
+        {
+          "name": "FL_hip_joint",
+          "angle": -0.0555,
+          "velocity": 0.6
+        },
+        {
+          "name": "FL_thigh_joint",
+          "angle": -0.4195,
+          "velocity": 1.2
+        },
+        {
+          "name": "FL_calf_joint",
+          "angle": -0.6635,
+          "velocity": -1.4
+        },
+        {
+          "name": "FR_hip_joint",
+          "angle": -0.0966,
+          "velocity": -0.6
+        },
+        {
+          "name": "FR_thigh_joint",
+          "angle": 0.4365,
+          "velocity": 1.2
+        },
+        {
+          "name": "FR_calf_joint",
+          "angle": -0.8365,
+          "velocity": -1.4
+        },
+        {
+          "name": "RL_hip_joint",
+          "angle": 0.0966,
+          "velocity": 0.6
+        },
+        {
+          "name": "RL_thigh_joint",
+          "angle": 0.4195,
+          "velocity": 1.2
+        },
+        {
+          "name": "RL_calf_joint",
+          "angle": -0.8365,
+          "velocity": -1.4
+        },
+        {
+          "name": "RR_hip_joint",
+          "angle": 0.0555,
+          "velocity": -0.6
+        },
+        {
+          "name": "RR_thigh_joint",
+          "angle": -0.4365,
+          "velocity": 1.2
+        },
+        {
+          "name": "RR_calf_joint",
+          "angle": -0.6635,
+          "velocity": -1.4
+        }
+      ],
+      "reward": 2.084,
+      "rewardComponents": {
+        "progress": 1.524,
+        "forward": 1.524,
+        "stability": 0.958,
+        "energy": -0.015,
+        "collision": 0,
+        "collision_penalty": 0,
+        "boundary_penalty": 0,
+        "goal_bonus": 0.673
+      },
+      "collisions": [],
+      "goalDistance": 11.54,
+      "energy": 2.39,
+      "boundary": {
+        "state": "inside",
+        "distanceToEdge": 13.31
+      },
+      "valid": true,
+      "status": "running"
+    },
+    "frameCount": 360,
+    "historyLength": 360,
+    "boundaryState": "inside",
+    "distanceToEdge": 13.31,
+    "invalidFrameCount": 0,
+    "boundaryEventCount": 0,
+    "lastEpisodeEvent": null
+  },
+  "postStall": {
+    "snapshot": {
+      "p50": 16.7,
+      "p95": 17.1,
+      "p99": 20.7,
+      "mean": 16.8,
+      "max": 70.7,
+      "fps": 60,
+      "tier": "high",
+      "longTaskCount": 1,
+      "longTasks": [
+        {
+          "duration": 454,
+          "startTime": 327.60000000009313,
+          "name": "self"
+        }
+      ],
+      "rendererInfo": {
+        "drawCalls": 37,
+        "triangles": 44972,
+        "geometries": 33,
+        "textures": 1,
+        "programs": 13
+      },
+      "gpu": {
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "isHardware": true
+      },
+      "subsystemMs": {
+        "physics": 0,
+        "telemetry": 0,
+        "radar": 0.07
+      },
+      "memory": {
+        "usedMb": 14,
+        "totalMb": 21
+      },
+      "commitsPerSecond": 2
+    },
+    "badge": "16.7msp50/17.1msp951high"
+  },
+  "bisect": {
+    "all_on": {
+      "p50": 16.7,
+      "p95": 17.1,
+      "p99": 17.4,
+      "mean": 16.7,
+      "max": 56.2,
+      "fps": 60,
+      "tier": "high",
+      "longTaskCount": 1,
+      "longTasks": [
+        {
+          "duration": 118,
+          "startTime": 40.60000000009313,
+          "name": "self"
+        }
+      ],
+      "rendererInfo": {
+        "drawCalls": 36,
+        "triangles": 47824,
+        "geometries": 33,
+        "textures": 1,
+        "programs": 13
+      },
+      "gpu": {
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "isHardware": true
+      },
+      "subsystemMs": {
+        "physics": 0,
+        "telemetry": 0,
+        "radar": 0.07
+      },
+      "memory": {
+        "usedMb": 12,
+        "totalMb": 38
+      },
+      "commitsPerSecond": 2
+    },
+    "shadows_off": {
+      "p50": 16.6,
+      "p95": 17.1,
+      "p99": 17.5,
+      "mean": 16.7,
+      "max": 41.3,
+      "fps": 60,
+      "tier": "high",
+      "longTaskCount": 1,
+      "longTasks": [
+        {
+          "duration": 88,
+          "startTime": 23.600000000093132,
+          "name": "self"
+        }
+      ],
+      "rendererInfo": {
+        "drawCalls": 36,
+        "triangles": 47824,
+        "geometries": 33,
+        "textures": 0,
+        "programs": 9
+      },
+      "gpu": {
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "isHardware": true
+      },
+      "subsystemMs": {
+        "physics": 0,
+        "telemetry": 0,
+        "radar": 0.08
+      },
+      "memory": {
+        "usedMb": 19,
+        "totalMb": 47
+      },
+      "commitsPerSecond": 2
+    },
+    "radar_off": {
+      "p50": 16.7,
+      "p95": 17.2,
+      "p99": 17.8,
+      "mean": 16.7,
+      "max": 51.2,
+      "fps": 60,
+      "tier": "high",
+      "longTaskCount": 1,
+      "longTasks": [
+        {
+          "duration": 96,
+          "startTime": 23.600000000093132,
+          "name": "self"
+        }
+      ],
+      "rendererInfo": {
+        "drawCalls": 38,
+        "triangles": 47920,
+        "geometries": 33,
+        "textures": 1,
+        "programs": 13
+      },
+      "gpu": {
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "isHardware": true
+      },
+      "subsystemMs": {
+        "physics": 0,
+        "telemetry": 0,
+        "radar": 0.07
+      },
+      "memory": {
+        "usedMb": 26,
+        "totalMb": 53
+      },
+      "commitsPerSecond": 2
+    },
+    "glass_off": {
+      "p50": 16.7,
+      "p95": 17.2,
+      "p99": 17.4,
+      "mean": 16.7,
+      "max": 52.4,
+      "fps": 60,
+      "tier": "high",
+      "longTaskCount": 1,
+      "longTasks": [
+        {
+          "duration": 101,
+          "startTime": 26.899999999906868,
+          "name": "self"
+        }
+      ],
+      "rendererInfo": {
+        "drawCalls": 36,
+        "triangles": 47824,
+        "geometries": 33,
+        "textures": 1,
+        "programs": 13
+      },
+      "gpu": {
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "isHardware": true
+      },
+      "subsystemMs": {
+        "physics": 0,
+        "telemetry": 0,
+        "radar": 0.06
+      },
+      "memory": {
+        "usedMb": 30,
+        "totalMb": 73
+      },
+      "commitsPerSecond": 2
+    },
+    "dpr_1": {
+      "p50": 16.7,
+      "p95": 17.1,
+      "p99": 17.6,
+      "mean": 16.8,
+      "max": 51.5,
+      "fps": 60,
+      "tier": "high",
+      "longTaskCount": 1,
+      "longTasks": [
+        {
+          "duration": 90,
+          "startTime": 23,
+          "name": "self"
+        }
+      ],
+      "rendererInfo": {
+        "drawCalls": 38,
+        "triangles": 47920,
+        "geometries": 33,
+        "textures": 1,
+        "programs": 13
+      },
+      "gpu": {
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "isHardware": true
+      },
+      "subsystemMs": {
+        "physics": 0,
+        "telemetry": 0,
+        "radar": 0.07
+      },
+      "memory": {
+        "usedMb": 32,
+        "totalMb": 82
+      },
+      "commitsPerSecond": 2
+    },
+    "debris_400": {
+      "p50": 16.7,
+      "p95": 17.1,
+      "p99": 18.4,
+      "mean": 16.8,
+      "max": 51.9,
+      "fps": 60,
+      "tier": "high",
+      "longTaskCount": 1,
+      "longTasks": [
+        {
+          "duration": 94,
+          "startTime": 23.800000000279397,
+          "name": "self"
+        }
+      ],
+      "rendererInfo": {
+        "drawCalls": 36,
+        "triangles": 47824,
+        "geometries": 33,
+        "textures": 1,
+        "programs": 13
+      },
+      "gpu": {
+        "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "isHardware": true
+      },
+      "subsystemMs": {
+        "physics": 0,
+        "telemetry": 0,
+        "radar": 0.07
+      },
+      "memory": {
+        "usedMb": 28,
+        "totalMb": 76
+      },
+      "commitsPerSecond": 2
+    }
+  },
+  "consoleErrors": []
+}
