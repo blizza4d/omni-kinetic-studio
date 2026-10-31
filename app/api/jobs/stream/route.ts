@@ -1,6 +1,8 @@
 import { NextRequest } from 'next/server';
 import { LocalSimulationRunner } from '@/lib/telemetry/local_runner';
 import { JobStatus, TelemetryBatch } from '@/contracts';
+import { jobStore } from '@/lib/cloud/job_store';
+import { generateDeterministicEnvironmentSpec } from '@/lib/nebius/prompts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -19,15 +21,20 @@ export async function GET(req: NextRequest) {
   const encoder = new TextEncoder();
   const runner = new LocalSimulationRunner(jobId, 60, iteration);
 
+  let effectiveSpec = generateDeterministicEnvironmentSpec('quadruped traverse');
   const specParam = searchParams.get('spec');
   if (specParam) {
     try {
       const parsedSpec = JSON.parse(decodeURIComponent(specParam));
       runner.setEnvironmentSpec(parsedSpec);
+      effectiveSpec = parsedSpec;
     } catch {
       // ignore
     }
   }
+
+  // Register in central jobStore
+  jobStore.createJob(jobId, effectiveSpec, mode);
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -59,7 +66,7 @@ export async function GET(req: NextRequest) {
         successRate: 0.98,
         message: isCloud
           ? 'Provisioning NVIDIA L40S container on Nebius Serverless Jobs (~00:04)...'
-          : 'Authoritative local simulation active (Demo Mode)',
+          : 'Authoritative local physics engine active [DEMO: LOCAL RUNNER]',
         timestamp: Date.now(),
       };
       sendSSE('status', initialStatus);
@@ -137,7 +144,9 @@ export async function GET(req: NextRequest) {
             currentReward: lastFrame?.reward ?? 0,
             collisionCount: lastFrame?.collisions.length ?? 0,
             successRate: 0.98,
-            message: `Active streaming: t=${lastFrame?.t.toFixed(1)}s, progress ${progress}%`,
+            message: isCloud
+              ? `Headless simulation streaming from Nebius L40S node [CLOUD: eu-north1]`
+              : `Local physics streaming t=${lastFrame?.t.toFixed(1)}s [DEMO: LOCAL RUNNER]`,
             timestamp: Date.now(),
           });
         }

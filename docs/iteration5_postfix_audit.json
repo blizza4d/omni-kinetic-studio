@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-29T15:04:34.625Z",
+  "timestamp": "2026-10-31T15:39:35.495Z",
   "buildStamp": "iteration-5-dev • 21842619 [main] • prod • NVIDIA RTX 3050",
   "gpu": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Laptop GPU (0x000025A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
   "audit": {
@@ -10,7 +10,7 @@
       "hasPolicyV1Chip": true,
       "hasNoIteration1Chip": true,
       "hasTokenCost": true,
-      "tokenText": "ARENA: INSIDEDEMO: LOCAL RUNNERDEMO16.7msp50/17.2msp952 long taskshigh2,380 tok · $0.0232Layout",
+      "tokenText": "ARENA: INSIDEDEMO: LOCAL RUNNERDEMO6.9msp50/7.3msp952 long taskshigh2,380 tok · $0.0232Layout",
       "noDuplicateEdgeDist": true
     },
     "perf": {

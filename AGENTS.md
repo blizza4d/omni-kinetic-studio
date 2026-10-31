@@ -1,24 +1,31 @@
-# AGENTS.md — Omni-Kinetic System Specification (Iteration 5)
+# AGENTS.md — Omni-Kinetic System Specification (Iteration 6: "SHIP IT")
 
-## 1. ARCHITECTURE SUMMARY & AGENT ROLES
-Omni-Kinetic is a browser-native Sim-to-Real Embodied AI Studio with 7 specialized parallel engineering agents:
-- **Agent A (Terrain & Debris):** Owns `/lib/world/terrain`, `/workers/terrain`, `/lib/world/debris`, `/contracts/terrain*`. Canonical 257x257 TerrainField v1, PCG craters & ridges, Poisson-disk debris, A* reachability corridor.
-- **Agent B (Sim, Gait & Contact):** Owns `/sim`, `/lib/world/bounds`, `/app/api/jobs`. Trot gait with speed-proportional cadence, foot stance/swing logic, 2-link leg IK, boundary penalty & steering assist.
-- **Agent C (Viewer & Render):** Owns `/components/viewer`, `/lib/world/render`, `/workers/physics`. Canonical mesh, slope-tinted regolith shader, draped boundary rim, critically damped spring camera, rendering invariants (I1–I8).
-- **Agent D (Telemetry & Clock):** Owns `/lib/telemetry`, `/workers/telemetry`, `/lib/clock`. Target-time pacing, time-based batching ($\le 50\text{ ms}$), playhead clock with phase-locked soft resync, Hermite/slerp interpolation.
-- **Agent E (Shell & UI):** Owns `/components/shell`, `/components/ui`, `/components/radar`, `/styles`. Single-row header, hillshaded canonical radar with debris dots and square bounds, Motion HUD in P panel, Run Summary & Replay.
-- **Agent F (QA & Harness):** Owns `/tests`, `/lib/perf`, `/lib/debug`, `/scripts`, `/docs`, `/app/status`. Build stamp, Acceptance Matrix, golden-seed regression renders, visual invariant checks, CI regression gates.
-- **Agent G (Architect & Tokens):** Owns `/lib/nebius`, `/lib/spec`, `/lib/safety`, `/app/api/architect`, `/app/api/logs`, `/app/api/usage`, `/sim/reward_sandbox`. 11-stage pipeline, Token Factory client & fallback, deterministic SpecCompiler, AST safety gate v2, sandbox.
+## 1. ARCHITECTURE SUMMARY & AGENT ROLES (9 Specialized Parallel Agents)
+Omni-Kinetic is a browser-native Sim-to-Real Embodied AI Studio for the Physical AI track with 9 parallel engineering agents:
+- **Agent A (World):** Owns `/lib/world/terrain`, `/workers/terrain`, `/lib/world/debris`, `/contracts/terrain*`. Canonical 257x257 TerrainField v1, PCG craters, Poisson debris, rendering invariants I1–I8. [@terrain-contract.md](.agents/rules/terrain-contract.md)
+- **Agent B (Controller, Sim, Learning):** Owns `/sim`, `/lib/controller-core`, `/lib/world/bounds`, `/lib/learning`, `/workers/learning`. Shared controller core, 2-link leg IK, trot gait, Takeover Sandbox, residual MLP training, held-out evaluation. [@controller-core.md](.agents/rules/controller-core.md) [@learning.md](.agents/rules/learning.md) [@eval.md](.agents/rules/eval.md)
+- **Agent C (Viewer & Takeover Render):** Owns `/components/viewer`, `/lib/world/render`, `/workers/physics`, `/components/takeover`. Three.js spring camera, takeover framing, ghost policy visualization (v1 cream vs v2 sage). [@frontend-3d.md](.agents/rules/frontend-3d.md)
+- **Agent D (Telemetry, Clock, Relay):** Owns `/lib/telemetry`, `/workers/telemetry`, `/lib/clock`, `/app/api/relay`. Playhead clock, chunked S3 telemetry relay with `Last-Event-ID`, gap detection, backpressure. [@relay.md](.agents/rules/relay.md)
+- **Agent E (Shell, UI, Judge Mode):** Owns `/components/shell`, `/components/ui`, `/components/radar`, `/components/judge`, `/styles`. Single-row header (48px), hillshade radar, Latency HUD, Dataset panel, Evaluation comparison, Judge Mode (`J`). [@judge-mode.md](.agents/rules/judge-mode.md) [@design-system.md](.agents/rules/design-system.md) [@a11y.md](.agents/rules/a11y.md)
+- **Agent F (QA, Release, Docs):** Owns `/tests`, `/lib/perf`, `/lib/debug`, `/scripts`, `/docs`, `/app/status`. Build stamp, Acceptance Matrix, golden seed renders, fake-camera CI, soak tests, submission manifest. [@testing.md](.agents/rules/testing.md) [@release.md](.agents/rules/release.md)
+- **Agent G (Architect & Tokens):** Owns `/lib/nebius`, `/lib/spec`, `/lib/safety`, `/app/api/architect`, `/app/api/logs`, `/app/api/usage`, `/sim/reward_sandbox`. 11-stage visible pipeline, deterministic SpecCompiler, Python AST Safety Gate v2, Reward Sandbox, Training Plan stage. [@architect.md](.agents/rules/architect.md) [@spec-compiler.md](.agents/rules/spec-compiler.md) [@safety-gate.md](.agents/rules/safety-gate.md) [@reward-sandbox.md](.agents/rules/reward-sandbox.md)
+- **Agent H (Cloud & Deploy):** Owns `/sim/adapters`, `/sim/worker`, `/app/api/jobs`, `/lib/cloud`, deployment configs, `Dockerfile`s. Nebius Serverless Jobs runner, S3 storage layout, cold-start card, SimAdapters (`mujoco`, `groot`, `cosmos`). [@cloud.md](.agents/rules/cloud.md) [@deploy.md](.agents/rules/deploy.md)
+- **Agent I (Vision & Teleop):** Owns `/components/teleop`, `/workers/vision`, `/lib/teleop`, `/lib/dataset`, `/public/models`. MediaPipe Tasks Vision Web Worker, WebGPU delegate + WASM fallback, 5s calibration, One Euro filter, privacy enforcement. [@teleop.md](.agents/rules/teleop.md) [@privacy.md](.agents/rules/privacy.md)
+
+---
 
 ## 2. STRICT GUARDRAILS & CORE INVARIANTS
-- **BUILD STAMP MANDATE:** Every screenshot, log banner, report, and `/status` response carries the canonical `BuildStamp` (git SHA, branch, iteration tag, build type, GPU renderer, resolved model IDs). The banner text is generated strictly from the stamp.
+- **DEMO LOCAL IS SACRED:** The offline Demo Local path (runner, viewer, Architect fixtures, keyboard teleop, Judge Mode) must ALWAYS function end-to-end without network, cloud credentials, or a camera.
+- **BUILD STAMP MANDATE:** Every screenshot, log banner, report, and `/status` response carries the canonical `BuildStamp` (git SHA, branch, iteration tag, build type, GPU renderer, resolved model IDs). Banner text is generated strictly from the stamp.
 - **LLM PROPOSES, COMPILER DISPOSES:** Raw LLM outputs NEVER reach the simulator. All specs pass through the deterministic `SpecCompiler` which clamps parameters to safe limits and logs every adjustment in the `SpecCompileReport`.
+- **PRIVACY MANDATE:** Webcam frames NEVER leave the browser and are NEVER persisted or transmitted. Only normalized landmarks are recorded, and only after the user presses `R`.
+- **SHARED CONTROLLER CORE:** A single pure TypeScript module (`/lib/controller-core`) executes locomotion, kinematics, IK, bounds, and terrain sampling across the browser viewer, takeover sandbox, Node.js server, and container worker.
 - **SINGLE TERRAIN SOURCE OF TRUTH:** Authoritative runner compiles canonical `TerrainField v1` (257x257 grid, Int16 mm, center origin). The viewer, radar, physics worker, and runner MUST read this identical grid. Zero independent generation from seeds.
 - **AUTHORITATIVE CLOCK & CONTINUOUS PLAYHEAD:** Simulation runner owns sim time $t$. The viewer samples poses strictly at `playhead = latestSimT - renderDelay` using `performance.now()` deltas. Frames are NEVER stepped by arrival order or message count.
 - **ZERO ROBOT POSE SMOOTHING IN VIEWER:** Viewport NEVER applies `lerp(pos, target, factor)` to the robot chassis, rotation, or joints. Smoothing applies strictly to the camera follow rig.
 - **GROUND-CONTACT INVARIANTS:** Zero frames with any foot tip $> 1\text{ cm}$ below terrain surface; zero frames with hull bottom $> 2\text{ cm}$ below surface. Stance feet are pinned ($< 2\text{ cm}$ slip).
 - **RENDERING INVARIANTS (I1–I8):**
-  - **I1 No Ghost Shadows:** All visible shadow blobs must touch an active visible rock instance within 12 px.
+  - **I1 No Ghost Shadows:** Visible shadow blobs must touch an active visible rock instance within 12 px.
   - **I2 No Stray Sprites:** Every viewport primitive belongs to a named scene object.
   - **I3 Surface-Draped Rim:** Arena boundary drawn strictly in terrain shader; zero floating polylines.
   - **I4 Smooth Horizon:** Horizon silhouette is a low-amplitude ridge with exponential fog; zero dome curvature.
@@ -26,31 +33,29 @@ Omni-Kinetic is a browser-native Sim-to-Real Embodied AI Studio with 7 specializ
   - **I6 Legibility:** Body contrast $\ge 2.0:1$ and rock contrast $\ge 1.4:1$ relative to terrain background.
   - **I7 Relief Visible:** Contour lines ($0.25\text{m}$ subtle, $1.0\text{m}$ bold), craters, and slope shading clearly readable.
   - **I8 Rock Shapes:** Subdivided icosahedrons with noise displacement; zero octahedrons or pyramids.
-- **WORLD-BOUNDS INVARIANTS:** Arena: `halfExtent: 18m`, `softMargin: 2m`, `hardMargin: 20m`. Catch plane at `y = -5.0m`.
-- **PERFORMANCE BUDGET:** Frame time p50 $\le 12\text{ ms}$, p95 $\le 20\text{ ms}$. Terrain shader $\le 1.0\text{ ms}$. Radar $\le 1.5\text{ ms}$. React commits $\le 10/\text{s}$.
-- **TRUTHFUL UI MANDATE:** Honest FPS badge with p50/p95, tier, and labeled warning badge. Source labels: `[LIVE: NEBIUS L40S]`, `[CACHED LIVE RUN]`, `[RECORDED FIXTURE]`, `[DEMO: LOCAL RUNNER]`, `[SIMULATED IMPROVEMENT]`.
-- **REGRESSION GUARD:** Baseline metrics recorded before every package. Any regression in hotkeys, logs, radar, or bounds must be resolved before proceeding.
+- **PERFORMANCE BUDGET:** Frame time p50 $\le 12\text{ ms}$, p95 $\le 20\text{ ms}$ (vsync 16.7 ms). With CV running, p95 $\le 22\text{ ms}$. Teleop latency p50 $\le 100\text{ ms}$, p95 $\le 150\text{ ms}$.
+- **TRUTHFUL UI MANDATE:** Every number on screen is real. Honest source badges: `[LIVE: NEBIUS L40S]`, `[CACHED CLOUD RUN]`, `[RECORDED FIXTURE]`, `[DEMO: LOCAL RUNNER]`, `[SIMULATED IMPROVEMENT]`. Never claim GR00T, Cosmos, cloud execution, or learning improvement unless actually measured.
 
-## 3. DESIGN TOKENS ("Analog AI")
-- `--charcoal: #2A2A2A` (Workspace base and viewport canvas)
-- `--charcoal-deep: #1F1F1F` (Recessed panels and docks)
-- `--sage: #6B705C` (Success, reward curves, low flat terrain tint, stance contact)
-- `--brick: #B83B2F` (Collisions, boundary rim warnings, safety alerts)
-- `--cream: #FDFBF7` (Primary text, dials, high-contrast labels)
-- `--cream-dim: rgba(253, 251, 247, 0.62)` (Secondary labels, contour lines, swing feet)
-- `--hairline: rgba(253, 251, 247, 0.08)` (Subtle glass borders)
-- `--robot-body: #3A3A3A`, `--rock-top: #4A4A44` (Visual contrast tokens)
+---
+
+## 3. FEATURE FLAGS & RELEASE PROCESS
+| Flag | Description | Default (Local) | Default (Public Demo) |
+| :--- | :--- | :---: | :---: |
+| `CLOUD_ENABLED` | Nebius Serverless Jobs cloud execution | `true` | `false` (requires key) |
+| `LIVE_LLM_ENABLED` | Live Nebius Token Factory generation | `true` | `false` (requires key) |
+| `VISION_ENABLED` | Web camera computer vision tracking | `true` | `true` |
+| `ONNX_PROVIDER_ENABLED` | Optional ONNX Runtime Web WebGPU provider | `false` | `false` |
+| `LEARNING_ENABLED` | Residual policy demonstration training | `true` | `true` |
+| `JUDGE_MODE_ENABLED` | Scripted 3-minute offline tour (`J`) | `true` | `true` |
+| `DEBUG_ENABLED` | Debug HUD, render modes, takeover overrides | `true` | `false` |
+
+**Release Progression:** `rc1` (stable base) $\rightarrow$ `rc2` (+cloud) $\rightarrow$ `rc3` (+teleop) $\rightarrow$ `rc4` (+learning) $\rightarrow$ `rc-final`.  
+**Cut-lines:** (1) Cut ONNX WebGPU, (2) Cut live GR00T/Cosmos (keep SimAdapter stubs), (3) Cut cloud training, (4) Cut DAgger v3 loop, (5) Cut mapping gain UI, (6) 1 cloud run + cached fixture, (7) Cut Hermite polish.  
+**Never Cut:** Truthful UI badges, Demo Local, keyboard teleop, Judge Mode, evaluation honesty, README, demo script, and final video recording.
+
+---
+
+## 4. DESIGN TOKENS ("Analog AI")
+- `--charcoal: #2A2A2A`, `--charcoal-deep: #1F1F1F`, `--sage: #6B705C`, `--brick: #B83B2F`, `--cream: #FDFBF7`, `--cream-dim: rgba(253, 251, 247, 0.62)`, `--hairline: rgba(253, 251, 247, 0.08)`, `--robot-body: #3A3A3A`, `--rock-top: #4A4A44`.
 - Glassmorphism: `background: rgba(42,42,42,0.55)`, `backdrop-filter: blur(14px) saturate(120%)`. Max 3 surfaces over canvas.
-- Hotkeys: `Ctrl+K` (Palette), `T` (Teleop), `Space` (Play/Pause), `?` (Shortcuts), `Q` (Quality Tier), `B` (Boundary Rim), `P` (Perf Panel), `C` (Contact Debug), `S` (Stage Rail Focus), `D` (Debug Render), `A/E/X` (Review Actions), `1`-`4` (Camera Presets).
-
-## 4. VERSIONED DATA CONTRACTS (/contracts)
-- **BuildStamp v1:** `sha`, `branch`, `iterationTag`, `buildType`, `contractVersions`, `gpuRenderer`, `modelIds`, `createdAt`.
-- **AcceptanceMatrix v1:** entries of `{testId, iteration, status: passed|failed|not_implemented|regressed, evidence[], notes}`.
-- **VisualReport v1:** invariant results I1 to I8 per golden seed with measured deviations and image links.
-- **EnvironmentSpec v4:** `taskId`, `taskName`, `description`, `gravity`, `terrainRecipe`, `debris`, `arena`, `spawn`, `goal`, `robot`, `motion`, `episodeLength`, `successCriteria`, `rationale`.
-- **CompiledSpec v1:** clamped spec parameters, `specHash`, `seed`, `attempt`, `path`.
-- **SpecCompileReport v1:** `adjustments[{field, from, to, reason}]`, `reachability`, `attempts`, `terrainStats`, `warnings`.
-- **TelemetryFrame v4:** `t`, `seq`, `dt`, `episode`, `bodies[{id, pos[3], quat[4], vel[3]}]`, `joints[{name, angle, velocity}]`, `feet[{id, pos[3], contact}]`, `bodyHeightAboveGround`, `slopeUnderBody`, `gait{phase, speed, cmdSpeed}`, `reward`, `rewardComponents{}`, `collisions[...]`, `boundary{state, distanceToEdge}`, `valid`, `episodeEvent?`, `status`.
-- **TerrainField v1:** canonical 257x257 heights Int16 mm, origin center, spacing 0.1875, fixed a-d triangulation, SHA-256 hash.
-- **RewardSpec v2:** entrypoint, component names, weights, summary, sandbox limits, fixture results.
-- **RunSummary v3:** success, distance, mean reward, collisions, boundary events, stalls, energy, duration, tokens, cost, source labels, build stamp.
+- Hotkeys: `Ctrl+K` (Palette), `T` (Takeover/Teleop), `Shift+T` (Recalibrate), `R` (Record), `Enter` (Commit), `Esc` (Release), `Space` (Play/Pause), `?` (Shortcuts), `Q` (Tier), `B` (Boundary), `P` (Perf), `C` (Contact), `S` (Stage Rail), `D` (Debug), `A/E/X` (Review Actions), `J` (Judge Mode), `G` (Ghost Overlay), `L` (Cycle Limb), `1`-`4` (Camera Presets / Limb Select).

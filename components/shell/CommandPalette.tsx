@@ -110,29 +110,52 @@ export default function CommandPalette({
             ))}
           </div>
 
-          {/* Quick System Actions */}
-          <div className="pt-2 border-t border-cream/10 flex items-center justify-between text-xs font-mono">
-            <button
-              onClick={() => {
-                onToggleSimMode();
-                onClose();
-              }}
-              className="flex items-center space-x-2 text-cream-muted hover:text-cream py-1 px-2 rounded hover:bg-charcoal"
-            >
-              <Cpu className="w-3.5 h-3.5 text-sage" />
-              <span>Switch Mode: {currentMode === 'cloud_nebius' ? 'Nebius L40S' : 'Local Demo Runner'}</span>
-            </button>
+          {/* Simulation Execution Engine Selector */}
+          <div className="pt-2 border-t border-cream/10 space-y-2 text-xs font-mono">
+            <div className="text-[10px] text-cream-dim uppercase tracking-wider flex items-center justify-between">
+              <span>Simulation Execution Mode</span>
+              <span className="text-sage">{currentMode === 'cloud_nebius' ? '[CLOUD: L40S]' : '[DEMO: LOCAL RUNNER]'}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (currentMode !== 'local_demo') onToggleSimMode();
+                  onClose();
+                }}
+                className={`p-2 rounded border text-left flex items-center justify-between transition-colors ${
+                  currentMode === 'local_demo'
+                    ? 'bg-charcoal border-sage text-cream'
+                    : 'bg-charcoal-deep/60 border-cream/10 text-cream-dim hover:text-cream hover:bg-charcoal'
+                }`}
+              >
+                <div>
+                  <div className="font-semibold text-[11px] text-cream">Demo Local Runner</div>
+                  <div className="text-[9px] text-cream-dim">Deterministic pure kinematics, 0 cold start</div>
+                </div>
+                {currentMode === 'local_demo' && <span className="text-[9px] px-1 py-0.5 rounded bg-sage/20 text-sage">ACTIVE</span>}
+              </button>
 
-            <button
-              onClick={() => {
-                onToggleTeleop();
-                onClose();
-              }}
-              className="flex items-center space-x-2 text-cream-muted hover:text-cream py-1 px-2 rounded hover:bg-charcoal"
-            >
-              <span className="text-brick">[T]</span>
-              <span>Launch CV Teleop</span>
-            </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (currentMode !== 'cloud_nebius') onToggleSimMode();
+                  onClose();
+                }}
+                className={`p-2 rounded border text-left flex items-center justify-between transition-colors ${
+                  currentMode === 'cloud_nebius'
+                    ? 'bg-charcoal border-sage text-cream'
+                    : 'bg-charcoal-deep/60 border-cream/10 text-cream-dim hover:text-cream hover:bg-charcoal'
+                }`}
+                title="Nebius Serverless L40S GPU container with S3 chunked relay"
+              >
+                <div>
+                  <div className="font-semibold text-[11px] text-cream">Nebius Cloud L40S</div>
+                  <div className="text-[9px] text-cream-dim">NVIDIA L40S GPU, S3 telemetry relay</div>
+                </div>
+                {currentMode === 'cloud_nebius' && <span className="text-[9px] px-1 py-0.5 rounded bg-sage/20 text-sage">ACTIVE</span>}
+              </button>
+            </div>
           </div>
         </div>
       </div>

@@ -32,6 +32,7 @@ import {
 } from '@/contracts';
 import { compileSpec } from '@/lib/spec/compiler';
 import CodeDiffViewer from '@/components/shell/CodeDiffViewer';
+import JobCard from '@/components/shell/JobCard';
 
 export type LogTab =
   | 'console'
@@ -746,22 +747,29 @@ export default function AnalogLogPane({
 
         {/* JOBS TAB */}
         {activeTab === 'jobs' && (
-          <div className="flex-1 p-3 overflow-y-auto font-mono space-y-2">
+          <div className="flex-1 p-3 overflow-y-auto font-mono space-y-3">
             {activeJobStatus ? (
-              <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-cream-dim">Job ID:</span>
-                  <span className="text-cream font-bold">{activeJobStatus.jobId}</span>
-                </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-cream-dim">Mode:</span>
-                  <span className="text-sage uppercase">{activeJobStatus.mode}</span>
-                </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-cream-dim">Status:</span>
-                  <span className="text-cream capitalize">{activeJobStatus.status}</span>
-                </div>
-              </div>
+              <JobCard
+                status={{
+                  jobId: activeJobStatus.jobId,
+                  state: activeJobStatus.status,
+                  status: activeJobStatus.status,
+                  progress: activeJobStatus.progress,
+                  message: activeJobStatus.message,
+                  mode: activeJobStatus.mode,
+                  elapsed: activeJobStatus.elapsed,
+                  costSoFar: activeJobStatus.mode === 'cloud_nebius' ? 0.024 : 0.0,
+                  estimatedRange: activeJobStatus.mode === 'cloud_nebius' ? [0.02, 0.05] : [0, 0],
+                  region: activeJobStatus.mode === 'cloud_nebius' ? 'eu-north1' : 'local_browser',
+                  heartbeatAge: 0,
+                  currentEpisode: activeJobStatus.currentEpisode ?? 1,
+                  currentReward: activeJobStatus.currentReward ?? 0,
+                  collisionCount: activeJobStatus.collisionCount ?? 0,
+                  successRate: activeJobStatus.successRate ?? 0.99,
+                  timestamp: activeJobStatus.timestamp ?? Date.now(),
+                }}
+                logs={logs.slice(-12).map((l) => `[${l.timestamp}] ${l.text}`)}
+              />
             ) : (
               <EmptyTabState
                 icon={Cpu}

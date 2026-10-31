@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-10-31T16:35:37.903Z",
+  "buildStamp": "iteration-5-dev • 21842619 [main] • prod • NVIDIA RTX 3050",
+  "audit": {
+    "headerText": "Omni-Kinetic/Low-Gravity Lunar Crater ExplorationPolicy v1Task PromptCtrl+KTeleopTARENA: INSIDEDEMO: LOCAL RUNNERDEMO6.9msp50/7.2msp952 long taskshigh2,380 tok · $0.0232Layout",
+    "perfChip": "Hardware active",
+    "canvasPresent": true
+  },
+  "verification": {
+    "coldStartCardDisplayed": true,
+    "instantSwitchToLocalSucceeded": true,
+    "jobCardRendered": true,
+    "relayChaosTestPassed": true,
+    "truthTableSimDecisionHonored": true
+  },
+  "cloudCost": {
+    "sessionSpendCapUsd": 5,
+    "currentSpendUsd": 0.005,
+    "tokensUsed": 4550,
+    "tokenBudget": 200000
+  }
+}
