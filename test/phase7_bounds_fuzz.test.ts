@@ -29,7 +29,7 @@ test('Bounds Fuzz Test: 1,000 Seeded Episodes across 3 Policies remain within ar
       for (let s = 0; s < 600; s++) {
         const frame = runner.generateFrame(s);
         const torso = frame.bodies[0];
-        const [x, z, y] = torso.pos;
+        const [x, y, z] = torso.pos;
 
         // Check for NaN or corrupt transforms
         if (isNaN(x) || isNaN(y) || isNaN(z)) {

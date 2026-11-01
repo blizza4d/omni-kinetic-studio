@@ -11,6 +11,7 @@ import { evaluateBoundary, sanitizeViewerPosition, DEFAULT_ARENA } from '@/lib/w
 import { PerfProbe } from '@/lib/perf/probe';
 import { parseFeatureToggles } from '@/lib/perf/toggles';
 import { TelemetryStore } from '@/lib/telemetry/store';
+import { formatGravityDisplay } from '@/lib/spec/gravity';
 
 export type CameraPreset = 'chase' | 'top' | 'side' | 'free';
 export type QualityTier = 'ultra' | 'high' | 'medium' | 'low' | 'potato';
@@ -74,6 +75,7 @@ export default function ThreeViewer({
   const boundaryRimMatRef = useRef<THREE.LineDashedMaterial | null>(null);
   const footBlobsRef = useRef<THREE.Mesh[]>([]);
   const canonicalFieldRef = useRef<TerrainField | null>(null);
+  const terrainUniformsRef = useRef<{ uEdgeDistance: { value: number } } | null>(null);
 
   // Preallocated trail buffer (max 180 points)
   const maxTrailPoints = 180;
@@ -203,6 +205,7 @@ export default function ThreeViewer({
     const shadowsEnabled = toggles.shadows && effectiveTier !== 'low' && effectiveTier !== 'potato';
     renderer.shadowMap.enabled = shadowsEnabled;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     rendererRef.current = renderer;
     container.appendChild(renderer.domElement);
 
@@ -215,29 +218,29 @@ export default function ThreeViewer({
       }
     } catch {}
 
-    // 2. Lighting (Tight following shadow rig)
-    const ambientLight = new THREE.AmbientLight(0xfdfbf7, 0.55);
+    // 2. Lighting (24m expanded shadow frustum & calibrated contrast)
+    const ambientLight = new THREE.AmbientLight(0xfdfbf7, 0.35);
     scene.add(ambientLight);
 
-    const dirLight = new THREE.DirectionalLight(0xfdfbf7, 1.4);
+    const dirLight = new THREE.DirectionalLight(0xfdfbf7, 1.55);
     dirLight.position.set(8, 16, 10);
     dirLight.castShadow = shadowsEnabled;
     dirLight.shadow.mapSize.width = effectiveTier === 'ultra' ? 2048 : effectiveTier === 'high' ? 1024 : 512;
     dirLight.shadow.mapSize.height = dirLight.shadow.mapSize.width;
     dirLight.shadow.camera.near = 0.5;
-    dirLight.shadow.camera.far = 32;
-    // Tight shadow frustum centered around robot (~12m envelope)
-    dirLight.shadow.camera.left = -6.5;
-    dirLight.shadow.camera.right = 6.5;
-    dirLight.shadow.camera.top = 6.5;
-    dirLight.shadow.camera.bottom = -6.5;
+    dirLight.shadow.camera.far = 48;
+    // 24m shadow frustum envelope around robot
+    dirLight.shadow.camera.left = -12.0;
+    dirLight.shadow.camera.right = 12.0;
+    dirLight.shadow.camera.top = 12.0;
+    dirLight.shadow.camera.bottom = -12.0;
     dirLight.shadow.bias = -0.0006;
     dirLight.shadow.normalBias = 0.02;
     scene.add(dirLight);
     scene.add(dirLight.target);
     dirLightRef.current = dirLight;
 
-    const fillLight = new THREE.DirectionalLight(0x6b705c, 0.65);
+    const fillLight = new THREE.DirectionalLight(0x6b705c, 0.30);
     fillLight.position.set(-14, 8, -12);
     scene.add(fillLight);
 
@@ -245,7 +248,7 @@ export default function ThreeViewer({
     const terrainSeed = latestSpecRef.current.terrain.seed || 42;
     const terrainField = generateCanonicalTerrain(terrainSeed);
     canonicalFieldRef.current = terrainField;
-    buildCanonicalTerrainMesh(scene, terrainField, effectiveTier);
+    buildCanonicalTerrainMesh(scene, terrainField, effectiveTier, terrainUniformsRef);
 
     // 4. Ground Contact Blobs for quadruped feet (Sage when planted, cream-dim when swinging)
     const footBlobs = buildFootContactBlobs(scene);
@@ -389,10 +392,16 @@ export default function ThreeViewer({
         const torso = frame.bodies.find((b) => b.id === 'torso') || frame.bodies[0];
 
         // 1. Ingestion Sanitization: clamp viewer position to arena envelope
-        const sanitized = sanitizeViewerPosition([torso.pos[0], torso.pos[2], -torso.pos[1]], DEFAULT_ARENA);
+        const sanitized = sanitizeViewerPosition([torso.pos[0], torso.pos[1], torso.pos[2]], DEFAULT_ARENA);
         robotGroupRef.current.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
-        robotGroupRef.current.quaternion.set(torso.quat[0], torso.quat[2], -torso.quat[1], torso.quat[3]);
+        robotGroupRef.current.quaternion.set(torso.quat[0], torso.quat[1], torso.quat[2], torso.quat[3]);
         robotPos.copy(robotGroupRef.current.position);
+
+        // Update terrain rim shader proximity uniform
+        const robotDistToEdge = Math.max(0, DEFAULT_ARENA.halfExtent - Math.max(Math.abs(robotPos.x), Math.abs(robotPos.z)));
+        if (terrainUniformsRef.current) {
+          terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
+        }
 
         // 2. Articulated joints update (Correct pitch axis along Z; roll along X)
         const joints = jointMeshesRef.current;
@@ -411,7 +420,7 @@ export default function ThreeViewer({
             const foot = frame.feet[fi];
             const blob = footBlobsRef.current[fi];
             if (blob) {
-              blob.position.set(foot.pos[0], foot.pos[1] + 0.012, -foot.pos[2]);
+              blob.position.set(foot.pos[0], foot.pos[1] + 0.012, foot.pos[2]);
               const bMat = blob.material as THREE.MeshBasicMaterial;
               bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
               bMat.opacity = foot.contact ? 0.85 : 0.22;
@@ -481,6 +490,8 @@ export default function ThreeViewer({
       const clampedLookX = Math.max(-maxCameraEnvelope, Math.min(maxCameraEnvelope, robotPos.x));
       const clampedLookZ = Math.max(-maxCameraEnvelope, Math.min(maxCameraEnvelope, robotPos.z));
 
+      camera.up.set(0, 1, 0); // Strict roll lock to World Y-up: horizon is always level
+
       if (preset === 'top') {
         camera.position.set(clampedLookX, robotPos.y + 8.5, clampedLookZ);
         camera.lookAt(clampedLookX, robotPos.y, clampedLookZ);
@@ -494,9 +505,14 @@ export default function ThreeViewer({
         currentCameraAngle.dist += (targetCameraAngle.dist - currentCameraAngle.dist) * 0.12;
 
         const camX = clampedLookX + Math.sin(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
-        const camY = robotPos.y + Math.sin(currentCameraAngle.pitch) * currentCameraAngle.dist + 0.4;
+        const rawCamY = robotPos.y + Math.sin(currentCameraAngle.pitch) * currentCameraAngle.dist + 0.4;
         const camZ = clampedLookZ + Math.cos(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
-        camera.position.set(camX, camY, camZ);
+        
+        // Terrain clearance clamping (never clip through ground)
+        const groundAtCam = canonicalFieldRef.current ? canonicalFieldRef.current.sampleHeight(camX, camZ) : 0;
+        const clampedCamY = Math.max(groundAtCam + 0.45, rawCamY);
+
+        camera.position.set(camX, clampedCamY, camZ);
         camera.lookAt(clampedLookX, robotPos.y + 0.2, clampedLookZ);
       }
 
@@ -581,7 +597,7 @@ export default function ThreeViewer({
           <span className="w-2 h-2 rounded-full bg-sage animate-pulse" />
           <span className="text-cream-dim">GRAVITY:</span>
           <span className="font-bold text-cream">
-            {Math.abs(envSpec.gravity[2]) === 1.62 ? '0.16 g (MOON)' : `${Math.abs(envSpec.gravity[2])} m/s²`}
+            {formatGravityDisplay(envSpec.gravity)}
           </span>
         </div>
       </div>
@@ -631,7 +647,12 @@ function createDisplacedIcosahedron(radius: number, detail = 1, seed = 0): THREE
 /**
  * Builds canonical 257x257 TerrainField mesh with slope tinting, contours, and surface-draped rim.
  */
-function buildCanonicalTerrainMesh(scene: THREE.Scene, field: TerrainField, effectiveTier: string): THREE.Mesh {
+function buildCanonicalTerrainMesh(
+  scene: THREE.Scene,
+  field: TerrainField,
+  effectiveTier: string,
+  uniformsRef?: React.MutableRefObject<{ uEdgeDistance: { value: number } } | null>
+): THREE.Mesh {
   const segments = effectiveTier === 'ultra' ? 256 : effectiveTier === 'high' ? 128 : effectiveTier === 'medium' ? 96 : 64;
   const terrainGeo = new THREE.PlaneGeometry(48.0, 48.0, segments, segments);
   terrainGeo.rotateX(-Math.PI / 2);
@@ -653,6 +674,14 @@ function buildCanonicalTerrainMesh(scene: THREE.Scene, field: TerrainField, effe
   });
 
   terrainMat.onBeforeCompile = (shader) => {
+    const uniforms = {
+      uEdgeDistance: { value: 18.0 },
+    };
+    if (uniformsRef) {
+      uniformsRef.current = uniforms;
+    }
+    shader.uniforms.uEdgeDistance = uniforms.uEdgeDistance;
+
     shader.vertexShader = shader.vertexShader.replace(
       '#include <common>',
       `#include <common>
@@ -670,13 +699,15 @@ function buildCanonicalTerrainMesh(scene: THREE.Scene, field: TerrainField, effe
       '#include <common>',
       `#include <common>
        varying vec3 vWorldPos;
-       varying vec3 vWorldNormal;`
+       varying vec3 vWorldNormal;
+       uniform float uEdgeDistance;`
     );
 
+    // Pre-fog injection: Shading, contours, and proximity rim are evaluated before fog,
+    // ensuring natural atmospheric fog falloff toward the horizon
     shader.fragmentShader = shader.fragmentShader.replace(
-      '#include <dithering_fragment>',
-      `#include <dithering_fragment>
-       // 1. Slope-tinted shading (sage for flat plains, darker charcoal for steep slopes)
+      '#include <fog_fragment>',
+      `// 1. Slope-tinted shading (sage for flat plains, darker charcoal for steep slopes)
        float slope = 1.0 - max(0.0, vWorldNormal.y);
        vec3 slopeTint = mix(vec3(0.18, 0.18, 0.18), vec3(0.11, 0.11, 0.11), smoothstep(0.1, 0.4, slope));
        gl_FragColor.rgb = mix(gl_FragColor.rgb, slopeTint, 0.35);
@@ -685,28 +716,36 @@ function buildCanonicalTerrainMesh(scene: THREE.Scene, field: TerrainField, effe
        float flatT = smoothstep(0.15, 0.02, slope);
        gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.42, 0.44, 0.36), flatT * 0.22);
 
-       // 3. Elevation Contour Lines: 1.0m bold, 0.25m subtle
+       // 3. Elevation Contour Lines: 1.0m bold, 0.25m subtle (anti-aliased & distance-fading beyond 22m)
+       float camDist = length(vWorldPos - cameraPosition);
+       float distFade = 1.0 - smoothstep(12.0, 22.0, camDist);
        float fMajor = abs(fract(vWorldPos.y / 1.0 - 0.5) - 0.5) / max(0.001, fwidth(vWorldPos.y));
        float fMinor = abs(fract(vWorldPos.y / 0.25 - 0.5) - 0.5) / max(0.001, fwidth(vWorldPos.y));
-       if (fMajor < 1.4) {
-         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.32);
-       } else if (fMinor < 0.9) {
-         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.14);
+       if (distFade > 0.001) {
+         if (fMajor < 1.0) {
+           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.08 * distFade);
+         } else if (fMinor < 0.7) {
+           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.04 * distFade);
+         }
        }
 
-       // 4. Square Arena Boundary Rim (Surface-Draped at |x| = 18m or |z| = 18m)
+       // 4. Square Arena Boundary Rim (Surface-Draped at 18m)
        float distArena = max(abs(vWorldPos.x), abs(vWorldPos.z));
        if (distArena >= 17.88 && distArena <= 18.08) {
          float dash = fract((vWorldPos.x + vWorldPos.z) * 0.75);
          if (dash > 0.35) {
-           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.85);
+           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.75);
          }
        }
-       // Soft margin proximity warning (16m to 18m): brick red glow band
-       if (distArena >= 16.0 && distArena < 17.88) {
-         float warnT = (distArena - 16.0) / 1.88;
-         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.72, 0.23, 0.18), warnT * 0.45);
-       }`
+
+       // 5. Soft margin proximity warning: brick red glow band ONLY when robot is close (uEdgeDistance <= 2.5m)
+       float robotProximity = smoothstep(2.5, 0.0, uEdgeDistance);
+       if (robotProximity > 0.001 && distArena >= 16.5 && distArena < 17.88) {
+         float warnT = smoothstep(16.5, 17.88, distArena);
+         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.72, 0.23, 0.18), warnT * robotProximity * 0.45);
+       }
+
+       #include <fog_fragment>`
     );
   };
 
@@ -782,6 +821,14 @@ function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enable
     flatShading: true,
   });
 
+  const colorVariation = [
+    new THREE.Color(0x4a4a44),
+    new THREE.Color(0x56564e),
+    new THREE.Color(0x3e3e38),
+    new THREE.Color(0x50524a),
+    new THREE.Color(0x42443e),
+  ];
+
   const dummy = new THREE.Object3D();
   const createdMeshes: THREE.InstancedMesh[] = [];
 
@@ -803,9 +850,15 @@ function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enable
       dummy.updateMatrix();
       instancedMesh.setMatrixAt(i, dummy.matrix);
       chunkBox.expandByPoint(dummy.position);
+
+      const col = colorVariation[(d.id + c) % colorVariation.length];
+      instancedMesh.setColorAt(i, col);
     }
 
     instancedMesh.instanceMatrix.needsUpdate = true;
+    if (instancedMesh.instanceColor) {
+      instancedMesh.instanceColor.needsUpdate = true;
+    }
 
     // Accurate spatial chunk bounding sphere for reliable frustum culling
     const chunkSphere = new THREE.Sphere();

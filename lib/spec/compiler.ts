@@ -8,6 +8,7 @@ import {
   SpecAdjustment,
 } from '@/contracts';
 import { getTerrainHeight } from '@/lib/world/terrain';
+import { parseGravityInput } from './gravity';
 
 export interface CompileOptions {
   maxAttempts?: number;
@@ -33,7 +34,7 @@ export function compileSpec(
     taskId: rawInput.taskId || `task_${Date.now()}`,
     taskName: rawInput.taskName || 'Autonomous Debris Navigation',
     description: rawInput.description || 'Traverse unstructured extraterrestrial terrain.',
-    gravity: Array.isArray(rawInput.gravity) ? [...rawInput.gravity] : [0, -1.62, 0],
+    gravity: parseGravityInput(rawInput.gravity),
     terrain: {
       type: rawInput.terrain?.type || 'cratered_debris',
       seed: options.forceSeed ?? (typeof rawInput.terrain?.seed === 'number' ? rawInput.terrain.seed : 42),
@@ -109,7 +110,7 @@ export function compileSpec(
   // 2. Physical & Safety Clamping
   // Gravity
   candidate.gravity[0] = clamp('gravity[0]', candidate.gravity[0], -2.0, 2.0, 'Lateral gravity exceeds limits');
-  candidate.gravity[1] = clamp('gravity[1]', candidate.gravity[1], -20.0, -0.5, 'Vertical gravity must provide downward acceleration');
+  candidate.gravity[1] = clamp('gravity[1]', candidate.gravity[1], -20.0, -0.1, 'Vertical gravity must provide downward acceleration');
   candidate.gravity[2] = clamp('gravity[2]', candidate.gravity[2], -2.0, 2.0, 'Longitudinal gravity exceeds limits');
 
   // Terrain

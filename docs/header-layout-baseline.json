@@ -1,0 +1,87 @@
+{
+  "timestamp": "2026-11-01T17:20:58.996Z",
+  "audits": [
+    {
+      "viewportWidth": 1280,
+      "headerHeight": 48,
+      "chipCount": 10,
+      "overlaps": [
+        {
+          "chipA": "Policy v1",
+          "chipB": "Task PromptCtrl+K",
+          "gapPx": -1
+        },
+        {
+          "chipA": "Policy v1",
+          "chipB": "TeleopT",
+          "gapPx": 3.2
+        },
+        {
+          "chipA": "TeleopT",
+          "chipB": "ARENA: INSIDE",
+          "gapPx": -1
+        },
+        {
+          "chipA": "6.9msp50/7.2msp952 long tasksh",
+          "chipB": "2 long tasks",
+          "gapPx": -1
+        },
+        {
+          "chipA": "6.9msp50/7.2msp952 long tasksh",
+          "chipB": "high",
+          "gapPx": -1
+        }
+      ],
+      "truncatedTitle": "Low-Gravity Lunar Crater Exploration",
+      "hasTitleTooltip": false
+    },
+    {
+      "viewportWidth": 1440,
+      "headerHeight": 48,
+      "chipCount": 10,
+      "overlaps": [
+        {
+          "chipA": "Policy v1",
+          "chipB": "Task PromptCtrl+K",
+          "gapPx": -1
+        },
+        {
+          "chipA": "TeleopT",
+          "chipB": "ARENA: INSIDE",
+          "gapPx": -1
+        },
+        {
+          "chipA": "6.9msp50/7.2msp951 long taskhi",
+          "chipB": "1 long task",
+          "gapPx": -1
+        },
+        {
+          "chipA": "6.9msp50/7.2msp951 long taskhi",
+          "chipB": "high",
+          "gapPx": -1
+        }
+      ],
+      "truncatedTitle": "Low-Gravity Lunar Crater Exploration",
+      "hasTitleTooltip": false
+    },
+    {
+      "viewportWidth": 1920,
+      "headerHeight": 48,
+      "chipCount": 10,
+      "overlaps": [
+        {
+          "chipA": "6.9msp50/7.2msp951 long taskhi",
+          "chipB": "1 long task",
+          "gapPx": -1
+        },
+        {
+          "chipA": "6.9msp50/7.2msp951 long taskhi",
+          "chipB": "high",
+          "gapPx": -1
+        }
+      ],
+      "truncatedTitle": "Low-Gravity Lunar Crater Exploration",
+      "hasTitleTooltip": false
+    }
+  ]
+}

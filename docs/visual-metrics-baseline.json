@@ -1,0 +1,342 @@
+{
+  "count": 37,
+  "crushed_black_p95": 0.0,
+  "max_rim_red_pixels": 302,
+  "avg_stripe_score": 10.352135135135136,
+  "avg_polyline_score": 0.03332432432432432,
+  "results": [
+    {
+      "file": "00_baseline_overview.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 219,
+      "stripe_score": 10.173,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 37.85,
+      "mean_luminance": 0.2103
+    },
+    {
+      "file": "run_progress_t0s.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.524,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 38.09,
+      "mean_luminance": 0.211
+    },
+    {
+      "file": "run_progress_t10s.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.646,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 14.23,
+      "mean_luminance": 0.2026
+    },
+    {
+      "file": "run_progress_t20s.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.293,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 37.84,
+      "mean_luminance": 0.2086
+    },
+    {
+      "file": "run_progress_t30s.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.549,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 7.44,
+      "mean_luminance": 0.2016
+    },
+    {
+      "file": "run_progress_t45s.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.556,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 13.44,
+      "mean_luminance": 0.202
+    },
+    {
+      "file": "run_progress_t60s.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.794,
+      "polyline_score": 0.024,
+      "horizon_tilt_deg": 13.7,
+      "mean_luminance": 0.2019
+    },
+    {
+      "file": "seed_101_V1_chase_t0.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.174,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 37.87,
+      "mean_luminance": 0.2102
+    },
+    {
+      "file": "seed_101_V2_chase_t12_5.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.589,
+      "polyline_score": 0.0,
+      "horizon_tilt_deg": 4.82,
+      "mean_luminance": 0.2004
+    },
+    {
+      "file": "seed_101_V3_top.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.182,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2082
+    },
+    {
+      "file": "seed_101_V4_low_angle.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.148,
+      "polyline_score": 0.019,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2107
+    },
+    {
+      "file": "seed_101_V5_side.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 302,
+      "stripe_score": 10.636,
+      "polyline_score": 0.102,
+      "horizon_tilt_deg": 0.0,
+      "mean_luminance": 0.2001
+    },
+    {
+      "file": "seed_101_V6_close_up.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.132,
+      "polyline_score": 0.048,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.21
+    },
+    {
+      "file": "seed_2024_V1_chase_t0.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.175,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 37.86,
+      "mean_luminance": 0.2102
+    },
+    {
+      "file": "seed_2024_V2_chase_t12_5.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.59,
+      "polyline_score": 0.0,
+      "horizon_tilt_deg": 4.82,
+      "mean_luminance": 0.2004
+    },
+    {
+      "file": "seed_2024_V3_top.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.182,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2082
+    },
+    {
+      "file": "seed_2024_V4_low_angle.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.152,
+      "polyline_score": 0.019,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2107
+    },
+    {
+      "file": "seed_2024_V5_side.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 301,
+      "stripe_score": 10.681,
+      "polyline_score": 0.103,
+      "horizon_tilt_deg": 0.0,
+      "mean_luminance": 0.2
+    },
+    {
+      "file": "seed_2024_V6_close_up.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.134,
+      "polyline_score": 0.048,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.21
+    },
+    {
+      "file": "seed_42_V1_chase_t0.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.173,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 37.86,
+      "mean_luminance": 0.2102
+    },
+    {
+      "file": "seed_42_V2_chase_t12_5.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.589,
+      "polyline_score": 0.0,
+      "horizon_tilt_deg": 4.82,
+      "mean_luminance": 0.2004
+    },
+    {
+      "file": "seed_42_V3_top.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.181,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2082
+    },
+    {
+      "file": "seed_42_V4_low_angle.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.148,
+      "polyline_score": 0.019,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2107
+    },
+    {
+      "file": "seed_42_V5_side.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 301,
+      "stripe_score": 10.678,
+      "polyline_score": 0.103,
+      "horizon_tilt_deg": 0.0,
+      "mean_luminance": 0.2
+    },
+    {
+      "file": "seed_42_V6_close_up.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.133,
+      "polyline_score": 0.048,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.21
+    },
+    {
+      "file": "seed_777_V1_chase_t0.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.173,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 37.87,
+      "mean_luminance": 0.2102
+    },
+    {
+      "file": "seed_777_V2_chase_t12_5.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.59,
+      "polyline_score": 0.0,
+      "horizon_tilt_deg": 4.82,
+      "mean_luminance": 0.2004
+    },
+    {
+      "file": "seed_777_V3_top.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.181,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2082
+    },
+    {
+      "file": "seed_777_V4_low_angle.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.15,
+      "polyline_score": 0.019,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2107
+    },
+    {
+      "file": "seed_777_V5_side.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 301,
+      "stripe_score": 10.678,
+      "polyline_score": 0.103,
+      "horizon_tilt_deg": 0.0,
+      "mean_luminance": 0.2
+    },
+    {
+      "file": "seed_777_V6_close_up.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.133,
+      "polyline_score": 0.048,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.21
+    },
+    {
+      "file": "seed_9999_V1_chase_t0.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.175,
+      "polyline_score": 0.022,
+      "horizon_tilt_deg": 37.87,
+      "mean_luminance": 0.2102
+    },
+    {
+      "file": "seed_9999_V2_chase_t12_5.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.589,
+      "polyline_score": 0.0,
+      "horizon_tilt_deg": 4.82,
+      "mean_luminance": 0.2004
+    },
+    {
+      "file": "seed_9999_V3_top.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.182,
+      "polyline_score": 0.023,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2082
+    },
+    {
+      "file": "seed_9999_V4_low_angle.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.152,
+      "polyline_score": 0.019,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.2107
+    },
+    {
+      "file": "seed_9999_V5_side.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 299,
+      "stripe_score": 10.68,
+      "polyline_score": 0.103,
+      "horizon_tilt_deg": 0.0,
+      "mean_luminance": 0.2
+    },
+    {
+      "file": "seed_9999_V6_close_up.png",
+      "crushed_black_fraction": 0.0,
+      "rim_red_pixels": 201,
+      "stripe_score": 10.134,
+      "polyline_score": 0.048,
+      "horizon_tilt_deg": 45.0,
+      "mean_luminance": 0.21
+    }
+  ]
+}

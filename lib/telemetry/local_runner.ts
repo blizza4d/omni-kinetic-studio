@@ -1,6 +1,7 @@
 import { TelemetryFrame, TelemetryBatch, TelemetryFrameSchema, EnvironmentSpec } from '@/contracts';
 import { getTerrainHeight, TerrainConfig } from '@/lib/world/terrain';
 import { evaluateBoundary, DEFAULT_ARENA } from '@/lib/world/bounds';
+import { eulerToQuaternion, bodyToWorld, RobotPose } from '@/lib/frames';
 import fs from 'fs';
 import path from 'path';
 
@@ -22,7 +23,9 @@ export class LocalSimulationRunner {
   private episodeStep = 0;
   private robotX = 0;
   private robotZ = 0;
-  private robotHeading = -0.62; // Radians heading toward goal at (14, -10)
+  private robotHeading = 0.6202; // Radians heading toward goal at (14, -10): atan2(-(-10), 14)
+  private filteredPitch = 0;
+  private filteredRoll = 0;
   private needsResetNextStep = false;
   private resetReason: 'out_of_bounds' | 'fell_through_world' | 'success' | null = null;
 
@@ -57,6 +60,7 @@ export class LocalSimulationRunner {
 
   public setEnvironmentSpec(spec: EnvironmentSpec) {
     this.envSpec = spec;
+    this.reset();
   }
 
   public setIteration(iter: number) {
@@ -76,7 +80,11 @@ export class LocalSimulationRunner {
       this.episodeStep = 0;
       this.robotX = this.envSpec?.spawn?.pos?.[0] ?? 0;
       this.robotZ = this.envSpec?.spawn?.pos?.[2] ?? 0;
-      this.robotHeading = -0.62;
+      const initialGoalX = this.envSpec?.goal?.pos?.[0] ?? 14.0;
+      const initialGoalZ = this.envSpec?.goal?.pos?.[2] ?? -10.0;
+      this.robotHeading = Math.atan2(-(initialGoalZ - this.robotZ), initialGoalX - this.robotX);
+      this.filteredPitch = 0;
+      this.filteredRoll = 0;
       this.needsResetNextStep = false;
       this.resetReason = null;
     }
@@ -94,7 +102,9 @@ export class LocalSimulationRunner {
     const policyBoost = isRetrained ? 1.24 : 1.0;
     const stabilityModifier = isRetrained ? 0.35 : 1.0;
 
-    // Goal at (14m, -10m)
+    // Spawn and Goal coordinates
+    const spawnX = this.envSpec?.spawn?.pos?.[0] ?? 0;
+    const spawnZ = this.envSpec?.spawn?.pos?.[2] ?? 0;
     const goalX = this.envSpec?.goal?.pos?.[0] ?? 14.0;
     const goalZ = this.envSpec?.goal?.pos?.[2] ?? -10.0;
     const goalDist = Math.hypot(goalX - this.robotX, goalZ - this.robotZ);
@@ -111,28 +121,57 @@ export class LocalSimulationRunner {
       floorCatchY: DEFAULT_ARENA.floorCatchY,
     };
 
-    const currentDist = Math.hypot(this.robotX, this.robotZ);
+    // Pure pursuit path following along the spawn->goal line
+    const dxPath = goalX - spawnX;
+    const dzPath = goalZ - spawnZ;
+    const lineLen = Math.hypot(dxPath, dzPath);
+    const uProj = lineLen > 0
+      ? Math.max(0, Math.min(1, ((this.robotX - spawnX) * dxPath + (this.robotZ - spawnZ) * dzPath) / (lineLen * lineLen)))
+      : 1.0;
 
-    // Soft steering assist when approaching the soft margin (dist > 16m)
-    if (currentDist > arena.halfExtent - arena.softMargin) {
-      const angleToOrigin = Math.atan2(-this.robotZ, -this.robotX);
-      const angleDiff = angleToOrigin - this.robotHeading;
-      this.robotHeading += Math.sin(angleDiff) * 0.08; // curve inward
-    } else {
-      // Steer smoothly toward goal
-      const angleToGoal = Math.atan2(goalZ - this.robotZ, goalX - this.robotX);
-      const angleDiff = angleToGoal - this.robotHeading;
-      this.robotHeading += Math.sin(angleDiff) * 0.03;
+    const lookaheadDistM = Math.min(1.4, Math.max(0.8, 0.8 + 0.5 * forwardSpeed));
+    const uLook = lineLen > 0 ? Math.min(1.0, uProj + lookaheadDistM / lineLen) : 1.0;
+    const targetX = spawnX + uLook * dxPath;
+    const targetZ = spawnZ + uLook * dzPath;
+
+    // In canonical frames, body forward in world is (cos theta, 0, -sin theta)
+    const targetHeading = Math.atan2(-(targetZ - this.robotZ), targetX - this.robotX);
+
+    // Boundary assist only activates when strictly inside the soft margin
+    const edgeDistX = arena.halfExtent - Math.abs(this.robotX);
+    const edgeDistZ = arena.halfExtent - Math.abs(this.robotZ);
+    const distToEdge = Math.min(edgeDistX, edgeDistZ);
+
+    let steeringTarget = targetHeading;
+    if (distToEdge < arena.softMargin) {
+      const angleToCenter = Math.atan2(this.robotZ, -this.robotX);
+      const blend = (arena.softMargin - distToEdge) / arena.softMargin;
+      steeringTarget = targetHeading * (1.0 - blend) + angleToCenter * blend;
     }
 
-    // Step position
-    this.robotX += Math.cos(this.robotHeading) * forwardSpeed * this.dt;
-    this.robotZ += Math.sin(this.robotHeading) * forwardSpeed * this.dt;
+    // Continuous yaw unwrapping
+    let diff = steeringTarget - this.robotHeading;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+
+    // Yaw damping / smooth heading rate-limiting
+    const maxTurnRate = 2.0; // rad/s
+    const maxDelta = maxTurnRate * this.dt;
+    const steerDelta = Math.max(-maxDelta, Math.min(maxDelta, diff * 6.0 * this.dt));
+    this.robotHeading += steerDelta;
+
+    // Step position along canonical forward vector (cos theta, 0, -sin theta)
+    const fwdX = Math.cos(this.robotHeading);
+    const fwdZ = -Math.sin(this.robotHeading);
+    this.robotX += fwdX * forwardSpeed * this.dt;
+    this.robotZ += fwdZ * forwardSpeed * this.dt;
     this.episodeStep++;
 
     // Sample terrain elevation & dynamically ground robot torso
     const groundElevation = getTerrainHeight(this.robotX, this.robotZ, terrainConfig);
-    const lowGravityBounce = Math.sin(this.episodeStep * this.dt * 6.5) * 0.025;
+    const gravY = Math.abs(this.envSpec?.gravity?.[1] ?? 1.62);
+    const gravScale = Math.min(1.5, Math.max(0.2, 1.62 / Math.max(0.1, gravY)));
+    const lowGravityBounce = Math.sin(this.episodeStep * this.dt * 6.5) * (0.025 * gravScale);
     const bodyHeight = 0.385; // Calibrated for 0.22m thigh + 0.22m calf IK reach
     const y = groundElevation + bodyHeight + lowGravityBounce;
 
@@ -169,29 +208,48 @@ export class LocalSimulationRunner {
     const rlPhase = gaitPhase + Math.PI;
     const rrPhase = gaitPhase;
 
-    // Terrain slope reaction
-    const slopeX = getTerrainHeight(this.robotX + 0.3, this.robotZ, terrainConfig) - getTerrainHeight(this.robotX - 0.3, this.robotZ, terrainConfig);
-    const slopeZ = getTerrainHeight(this.robotX, this.robotZ + 0.3, terrainConfig) - getTerrainHeight(this.robotX, this.robotZ - 0.3, terrainConfig);
-    const terrainPitch = Math.atan2(slopeX, 0.6) * stabilityModifier;
-    const terrainRoll = Math.atan2(slopeZ, 0.6) * stabilityModifier;
+    // Terrain slope reaction (sampled along body forward and right)
+    const rightX = Math.sin(this.robotHeading);
+    const rightZ = Math.cos(this.robotHeading);
 
-    // Compute Foot Contact States (Stance when sin(phase) <= 0.05)
+    const hFwd = getTerrainHeight(this.robotX + fwdX * 0.3, this.robotZ + fwdZ * 0.3, terrainConfig);
+    const hBack = getTerrainHeight(this.robotX - fwdX * 0.3, this.robotZ - fwdZ * 0.3, terrainConfig);
+    const hRight = getTerrainHeight(this.robotX + rightX * 0.2, this.robotZ + rightZ * 0.2, terrainConfig);
+    const hLeft = getTerrainHeight(this.robotX - rightX * 0.2, this.robotZ - rightZ * 0.2, terrainConfig);
+
+    const rawPitch = Math.atan2(hFwd - hBack, 0.6) * 0.6 * stabilityModifier;
+    const rawRoll = Math.atan2(hLeft - hRight, 0.4) * 0.6 * stabilityModifier;
+
+    // Time-filtered slope following (tau = 0.2s)
+    const alphaSlope = this.dt / (0.2 + this.dt);
+    this.filteredPitch += alphaSlope * (rawPitch - this.filteredPitch);
+    this.filteredRoll += alphaSlope * (rawRoll - this.filteredRoll);
+    this.filteredPitch = Math.max(-0.35, Math.min(0.35, this.filteredPitch));
+    this.filteredRoll = Math.max(-0.35, Math.min(0.35, this.filteredRoll));
+
+    // Torso orientation quaternion in canonical right-handed Y-up convention
+    const torsoQuat = eulerToQuaternion(this.robotHeading, this.filteredPitch, this.filteredRoll);
+
+    // Compute Foot Contact States (Stance when sin(phase) <= 0.08)
     const flContact = Math.sin(flPhase) <= 0.08;
     const frContact = Math.sin(frPhase) <= 0.08;
     const rlContact = Math.sin(rlPhase) <= 0.08;
     const rrContact = Math.sin(rrPhase) <= 0.08;
 
-    // World foot coordinates with ground height conformance
-    const cosH = Math.cos(this.robotHeading);
-    const sinH = Math.sin(this.robotHeading);
+    // Body pose for foot coordinate transforms
+    const bodyPose: RobotPose = {
+      position: [this.robotX, groundElevation, this.robotZ],
+      yaw: this.robotHeading,
+      pitch: 0,
+      roll: 0,
+    };
 
     const calcFoot = (id: string, lx: number, lz: number, phase: number, contact: boolean) => {
-      const wx = this.robotX + cosH * lx - sinH * lz;
-      const wz = this.robotZ + sinH * lx + cosH * lz;
-      const groundH = getTerrainHeight(wx, wz, terrainConfig);
+      const wPos = bodyToWorld([lx, 0, lz], bodyPose);
+      const groundH = getTerrainHeight(wPos[0], wPos[2], terrainConfig);
       const lift = contact ? 0.0 : Math.max(0, Math.sin(phase) * 0.055);
       const wy = Number((groundH + lift).toFixed(4));
-      return { id, pos: [Number(wx.toFixed(4)), wy, Number(wz.toFixed(4))] as [number, number, number], contact };
+      return { id, pos: [Number(wPos[0].toFixed(4)), wy, Number(wPos[2].toFixed(4))] as [number, number, number], contact };
     };
 
     const feet = [
@@ -202,20 +260,20 @@ export class LocalSimulationRunner {
     ];
 
     const jointStates = [
-      { name: 'FL_hip_joint', angle: Number((0.08 * Math.sin(flPhase) + terrainRoll * 0.3).toFixed(4)), velocity: 0.6 },
-      { name: 'FL_thigh_joint', angle: Number((0.38 * Math.sin(flPhase) + terrainPitch * 0.35).toFixed(4)), velocity: 1.2 },
+      { name: 'FL_hip_joint', angle: Number((0.08 * Math.sin(flPhase) + this.filteredRoll * 0.3).toFixed(4)), velocity: 0.6 },
+      { name: 'FL_thigh_joint', angle: Number((0.38 * Math.sin(flPhase) + this.filteredPitch * 0.35).toFixed(4)), velocity: 1.2 },
       { name: 'FL_calf_joint', angle: Number((-0.72 + 0.25 * Math.cos(flPhase)).toFixed(4)), velocity: -1.4 },
 
-      { name: 'FR_hip_joint', angle: Number((-0.08 * Math.sin(frPhase) - terrainRoll * 0.3).toFixed(4)), velocity: -0.6 },
-      { name: 'FR_thigh_joint', angle: Number((0.38 * Math.sin(frPhase) + terrainPitch * 0.35).toFixed(4)), velocity: 1.2 },
+      { name: 'FR_hip_joint', angle: Number((-0.08 * Math.sin(frPhase) - this.filteredRoll * 0.3).toFixed(4)), velocity: -0.6 },
+      { name: 'FR_thigh_joint', angle: Number((0.38 * Math.sin(frPhase) + this.filteredPitch * 0.35).toFixed(4)), velocity: 1.2 },
       { name: 'FR_calf_joint', angle: Number((-0.72 + 0.25 * Math.cos(frPhase)).toFixed(4)), velocity: -1.4 },
 
-      { name: 'RL_hip_joint', angle: Number((0.08 * Math.sin(rlPhase) + terrainRoll * 0.3).toFixed(4)), velocity: 0.6 },
-      { name: 'RL_thigh_joint', angle: Number((0.38 * Math.sin(rlPhase) - terrainPitch * 0.35).toFixed(4)), velocity: 1.2 },
+      { name: 'RL_hip_joint', angle: Number((0.08 * Math.sin(rlPhase) + this.filteredRoll * 0.3).toFixed(4)), velocity: 0.6 },
+      { name: 'RL_thigh_joint', angle: Number((0.38 * Math.sin(rlPhase) - this.filteredPitch * 0.35).toFixed(4)), velocity: 1.2 },
       { name: 'RL_calf_joint', angle: Number((-0.72 + 0.25 * Math.cos(rlPhase)).toFixed(4)), velocity: -1.4 },
 
-      { name: 'RR_hip_joint', angle: Number((-0.08 * Math.sin(rrPhase) - terrainRoll * 0.3).toFixed(4)), velocity: -0.6 },
-      { name: 'RR_thigh_joint', angle: Number((0.38 * Math.sin(rrPhase) - terrainPitch * 0.35).toFixed(4)), velocity: 1.2 },
+      { name: 'RR_hip_joint', angle: Number((-0.08 * Math.sin(rrPhase) - this.filteredRoll * 0.3).toFixed(4)), velocity: -0.6 },
+      { name: 'RR_thigh_joint', angle: Number((0.38 * Math.sin(rrPhase) - this.filteredPitch * 0.35).toFixed(4)), velocity: 1.2 },
       { name: 'RR_calf_joint', angle: Number((-0.72 + 0.25 * Math.cos(rrPhase)).toFixed(4)), velocity: -1.4 },
     ];
 
@@ -234,13 +292,14 @@ export class LocalSimulationRunner {
     }
 
     // Boundary penalty inside soft margin
+    const currentDist = Math.hypot(this.robotX, this.robotZ);
     const boundaryPenalty = boundaryCheck.state === 'soft' || boundaryCheck.state === 'hard'
       ? Number((Math.max(0, currentDist - (arena.halfExtent - arena.softMargin)) * -2.5).toFixed(3))
       : 0;
 
     // Named reward components
     const rForward = Number((forwardSpeed * 1.5).toFixed(3));
-    const rUpright = Number(Math.exp(-Math.abs(terrainPitch) * 2.0).toFixed(3));
+    const rUpright = Number(Math.exp(-Math.abs(this.filteredPitch) * 2.0).toFixed(3));
     const rCollision = collisions.length > 0 ? -3.0 : 0.0;
     const rEnergy = -0.015;
     const totalStepReward = Number((rForward + 0.6 * rUpright + rCollision + rEnergy + boundaryPenalty).toFixed(3));
@@ -256,19 +315,19 @@ export class LocalSimulationRunner {
       bodies: [
         {
           id: 'torso',
-          pos: [Number(this.robotX.toFixed(4)), Number(this.robotZ.toFixed(4)), Number(y.toFixed(4))],
-          quat: [0.0, Number((0.02 * Math.sin(t * 2.5)).toFixed(4)), 0.0, 0.999],
+          pos: [Number(this.robotX.toFixed(4)), Number(y.toFixed(4)), Number(this.robotZ.toFixed(4))],
+          quat: torsoQuat,
           vel: [
-            Number((Math.cos(this.robotHeading) * forwardSpeed).toFixed(3)),
+            Number((fwdX * forwardSpeed).toFixed(3)),
             0.0,
-            Number((Math.sin(this.robotHeading) * forwardSpeed).toFixed(3)),
+            Number((fwdZ * forwardSpeed).toFixed(3)),
           ],
         },
       ],
       joints: jointStates,
       feet,
       bodyHeightAboveGround: bodyHeight,
-      slopeUnderBody: Number(terrainPitch.toFixed(3)),
+      slopeUnderBody: Number(this.filteredPitch.toFixed(3)),
       gait: {
         phase: Number(gaitPhase.toFixed(3)),
         speed: Number(forwardSpeed.toFixed(3)),
@@ -317,9 +376,13 @@ export class LocalSimulationRunner {
     this.collisionCount = 0;
     this.currentEpisode = 1;
     this.episodeStep = 0;
-    this.robotX = 0;
-    this.robotZ = 0;
-    this.robotHeading = -0.62;
+    this.robotX = this.envSpec?.spawn?.pos?.[0] ?? 0;
+    this.robotZ = this.envSpec?.spawn?.pos?.[2] ?? 0;
+    const goalX = this.envSpec?.goal?.pos?.[0] ?? 14.0;
+    const goalZ = this.envSpec?.goal?.pos?.[2] ?? -10.0;
+    this.robotHeading = Math.atan2(-(goalZ - this.robotZ), goalX - this.robotX);
+    this.filteredPitch = 0;
+    this.filteredRoll = 0;
     this.needsResetNextStep = false;
     this.resetReason = null;
   }

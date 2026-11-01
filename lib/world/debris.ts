@@ -46,7 +46,11 @@ export function generateDebrisField(
 
   const instances: DebrisInstance[] = [];
 
-  for (let i = 0; i < count; i++) {
+  let attempt = 0;
+  const maxAttempts = count * 3;
+
+  while (instances.length < count && attempt < maxAttempts) {
+    const i = attempt++;
     // Deterministic pseudo-random distribution
     const r1 = Math.sin(i * 12.9898 + seed * 19.3) * 43758.5453;
     const r2 = Math.cos(i * 78.233 + seed * 37.1) * 43758.5453;
@@ -71,6 +75,15 @@ export function generateDebrisField(
     const distFromGoal = Math.hypot(x - goal[0], z - goal[2]);
     if (distFromGoal < goalClear) {
       continue;
+    }
+
+    // 3. Perimeter radial falloff: prevent boulder accumulation at the 17.6m perimeter
+    const distArena = Math.max(Math.abs(x), Math.abs(z));
+    if (distArena > 14.5) {
+      const keepProb = 1.0 - ((distArena - 14.5) / 3.1) * 0.9;
+      if (w > keepProb) {
+        continue;
+      }
     }
 
     // 3. Keep a guaranteed navigable corridor between Spawn and Goal

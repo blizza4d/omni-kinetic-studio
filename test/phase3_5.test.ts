@@ -78,6 +78,6 @@ test('Local Runner Realism: emits valid TelemetryFrame v2 grounded on heightfiel
 
     // Robot y (elevation) must be grounded above heightfield
     const torso = parsed.bodies[0];
-    assert.ok(torso.pos[2] > -2.0 && torso.pos[2] < 5.0, 'Robot elevation within physical bounds');
+    assert.ok(torso.pos[1] > -2.0 && torso.pos[1] < 5.0, 'Robot elevation within physical bounds');
   }
 });

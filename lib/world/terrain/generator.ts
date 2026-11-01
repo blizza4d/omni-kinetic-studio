@@ -157,6 +157,20 @@ function attemptGeneration(
       continue;
     }
 
+    // Keep primary craters off the direct travel corridor to ensure walkable slope
+    const dxCorridor = goal[0] - spawn[0];
+    const dzCorridor = goal[1] - spawn[1];
+    const lenCorridor = Math.hypot(dxCorridor, dzCorridor);
+    const tCorridor = ((cx - spawn[0]) * dxCorridor + (cz - spawn[1]) * dzCorridor) / (lenCorridor * lenCorridor);
+    if (tCorridor >= 0.0 && tCorridor <= 1.0) {
+      const projX = spawn[0] + tCorridor * dxCorridor;
+      const projZ = spawn[1] + tCorridor * dzCorridor;
+      const distToLine = Math.hypot(cx - projX, cz - projZ);
+      if (distToLine < 3.8) {
+        continue;
+      }
+    }
+
     const radius = 1.8 + rng() * 4.8;
     const depth = radius * (0.12 + rng() * 0.08);
     const rimHeight = depth * 0.15;
@@ -172,6 +186,19 @@ function attemptGeneration(
 
     if (dSpawn < cfg.spawnClearRadius || dGoal < cfg.goalClearRadius) {
       continue;
+    }
+
+    // Keep secondary craters off the direct travel line
+    const dxCorridor = goal[0] - spawn[0];
+    const dzCorridor = goal[1] - spawn[1];
+    const lenCorridor = Math.hypot(dxCorridor, dzCorridor);
+    const tCorridor = ((cx - spawn[0]) * dxCorridor + (cz - spawn[1]) * dzCorridor) / (lenCorridor * lenCorridor);
+    if (tCorridor >= 0.0 && tCorridor <= 1.0) {
+      const projX = spawn[0] + tCorridor * dxCorridor;
+      const projZ = spawn[1] + tCorridor * dzCorridor;
+      if (Math.hypot(cx - projX, cz - projZ) < 2.5) {
+        continue;
+      }
     }
 
     const radius = 0.4 + rng() * 0.8;
@@ -190,9 +217,9 @@ function attemptGeneration(
       const x = -halfExtent + ix * spacing;
       const idx = iz * N + ix;
 
-      // 1. Macro undulation: 5-octave fBm
+      // 1. Macro undulation: 5-octave fBm (detrended & amplitude calibrated for window tilt <= 3.0 deg)
       let fbm = 0.0;
-      let amp = cfg.fbmAmplitude;
+      let amp = cfg.fbmAmplitude * 0.68;
       let freq = 1.0 / cfg.fbmWavelength;
       for (let o = 0; o < cfg.fbmOctaves; o++) {
         fbm += macroNoise.noise(x * freq, z * freq) * amp;
@@ -203,7 +230,7 @@ function attemptGeneration(
       // 2. Ridges: ridged multifractal
       const rFreq = 1.0 / cfg.ridgeWavelength;
       let ridgeVal = 1.0 - Math.abs(ridgeNoise.noise(x * rFreq, z * rFreq));
-      ridgeVal = ridgeVal * ridgeVal * cfg.ridgeAmplitude;
+      ridgeVal = ridgeVal * ridgeVal * (cfg.ridgeAmplitude * 0.70);
       const coverageMask = Math.max(0, maskNoise.noise(x * 0.04, z * 0.04) * 2.0);
       const ridge = ridgeVal * Math.min(1.0, coverageMask);
 
@@ -234,41 +261,43 @@ function attemptGeneration(
       const micro = microNoise.noise(x * uFreq, z * uFreq) * cfg.regolithAmplitude;
       h += micro;
 
-      // 5. Flat zones: blend toward flat plane at spawn and goal
+      // 5. Corridor & Clear Zones: Single continuous navigable relief softening
+      let reliefFactor = 1.0;
+
+      // Spawn flat zone
       const distSpawn = Math.hypot(x - spawn[0], z - spawn[1]);
-      if (distSpawn < cfg.spawnClearRadius) {
-        const t = Math.max(0, Math.min(1, distSpawn / cfg.spawnClearRadius));
+      if (distSpawn < 9.5) {
+        const t = Math.min(1.0, distSpawn / 9.5);
         const smoothT = t * t * (3.0 - 2.0 * t);
-        h = h * smoothT;
+        reliefFactor = Math.min(reliefFactor, 0.05 + 0.95 * smoothT);
       }
 
+      // Goal flat zone
       const distGoal = Math.hypot(x - goal[0], z - goal[1]);
-      if (distGoal < cfg.goalClearRadius) {
-        const t = Math.max(0, Math.min(1, distGoal / cfg.goalClearRadius));
+      if (distGoal < 9.5) {
+        const t = Math.min(1.0, distGoal / 9.5);
         const smoothT = t * t * (3.0 - 2.0 * t);
-        h = h * smoothT;
+        reliefFactor = Math.min(reliefFactor, 0.05 + 0.95 * smoothT);
       }
 
-      // 6. Corridor: gently winding drivable channel
+      // Straight travel corridor from spawn to goal
       const dx = goal[0] - spawn[0];
       const dz = goal[1] - spawn[1];
       const lineLen = Math.hypot(dx, dz);
-      const lineT = Math.max(0, Math.min(1, ((x - spawn[0]) * dx + (z - spawn[1]) * dz) / (lineLen * lineLen)));
+      const lineT = Math.max(-0.35, Math.min(1.35, ((x - spawn[0]) * dx + (z - spawn[1]) * dz) / (lineLen * lineLen)));
       const projX = spawn[0] + lineT * dx;
       const projZ = spawn[1] + lineT * dz;
-      // Offset corridor center line by sinusoidal meander
-      const meander = Math.sin(lineT * Math.PI * 2.0) * 1.5;
-      const perpX = -dz / lineLen;
-      const perpZ = dx / lineLen;
-      const meanderX = projX + perpX * meander;
-      const meanderZ = projZ + perpZ * meander;
-      const distCorridor = Math.hypot(x - meanderX, z - meanderZ);
+      const distCorridor = Math.hypot(x - projX, z - projZ);
 
-      if (distCorridor < cfg.corridorWidth) {
-        const t = distCorridor / cfg.corridorWidth;
+      const corridorHalfWidth = 7.5;
+      if (distCorridor < corridorHalfWidth) {
+        const t = Math.min(1.0, distCorridor / corridorHalfWidth);
         const smoothT = t * t * (3.0 - 2.0 * t);
-        h = h * (0.6 + 0.4 * smoothT); // Soften relief in corridor
+        reliefFactor = Math.min(reliefFactor, 0.08 + 0.92 * smoothT);
       }
+
+      // Apply unified smooth relief factor
+      h = h * reliefFactor;
 
       // 7. Perimeter Skirt: beyond 18m square arena, rise gently into distant ridge ring (max slope <= 12 deg)
       const distArenaEdge = Math.max(Math.abs(x), Math.abs(z));
@@ -308,6 +337,47 @@ function attemptGeneration(
         rawHeights[idx] = targetH;
       }
     }
+  }
+
+  // 9. Planar Detrend (Agent A & B: Mean tilt <= 1.0 deg, window tilt <= 3.0 deg)
+  // Fit least-squares best-fit plane across playable arena bounds (|x| <= 18m, |z| <= 18m)
+  let sumX2 = 0;
+  let sumZ2 = 0;
+  let sumXH = 0;
+  let sumZH = 0;
+
+  for (let iz = 0; iz < N; iz++) {
+    const z = -halfExtent + iz * spacing;
+    if (Math.abs(z) > 18.0) continue;
+    for (let ix = 0; ix < N; ix++) {
+      const x = -halfExtent + ix * spacing;
+      if (Math.abs(x) > 18.0) continue;
+      const h = rawHeights[iz * N + ix];
+      sumX2 += x * x;
+      sumZ2 += z * z;
+      sumXH += x * h;
+      sumZH += z * h;
+    }
+  }
+
+  const planeA = sumXH / Math.max(1e-6, sumX2);
+  const planeB = sumZH / Math.max(1e-6, sumZ2);
+
+  // Subtract planar trend across all vertices
+  for (let iz = 0; iz < N; iz++) {
+    const z = -halfExtent + iz * spacing;
+    for (let ix = 0; ix < N; ix++) {
+      const x = -halfExtent + ix * spacing;
+      const idx = iz * N + ix;
+      rawHeights[idx] -= (planeA * x + planeB * z);
+    }
+  }
+
+  // Anchor spawn (0, 0) to 0.0m datum
+  const centerIdx = Math.floor(N / 2) * N + Math.floor(N / 2);
+  const centerH = rawHeights[centerIdx];
+  for (let i = 0; i < N * N; i++) {
+    rawHeights[i] -= centerH;
   }
 
   // Quantize heights to Int16 millimeters & calculate arena statistics

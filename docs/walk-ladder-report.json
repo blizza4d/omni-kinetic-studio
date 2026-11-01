@@ -1,0 +1,149 @@
+{
+  "rungs": [
+    {
+      "rung": "L0",
+      "name": "Flat and empty (goal 15m straight)",
+      "verdict": "PASS",
+      "metrics": {
+        "duration": 4.17,
+        "frames": 250,
+        "slipAngleMeanDeg": null,
+        "slipAngleP95Deg": 0,
+        "slipAngleMaxDeg": 0,
+        "lateralErrorMeanM": 0,
+        "lateralErrorP95M": 0,
+        "lateralErrorMaxM": 0,
+        "headingErrorP95Deg": 0,
+        "headingZeroCrossingsPerSec": 0,
+        "pathStraightness": 1,
+        "rollRMSDeg": 0,
+        "pitchRMSDeg": 0,
+        "stanceSlipMaxM": 0.008,
+        "footprintLineResidualM": 0.15,
+        "goalReached": false
+      },
+      "details": "Slip P95: 0° (limit <= 2°), Lat Error Max: 0m (limit <= 0.05m), Straightness: 1 (limit >= 0.995)"
+    },
+    {
+      "rung": "L1",
+      "name": "Flat, goal at 45-degree bearing",
+      "verdict": "PASS",
+      "metrics": {
+        "duration": 4.17,
+        "frames": 250,
+        "slipAngleMeanDeg": null,
+        "slipAngleP95Deg": 0,
+        "slipAngleMaxDeg": 0,
+        "lateralErrorMeanM": 0,
+        "lateralErrorP95M": 0,
+        "lateralErrorMaxM": 0,
+        "headingErrorP95Deg": 0,
+        "headingZeroCrossingsPerSec": 0,
+        "pathStraightness": 1,
+        "rollRMSDeg": 0,
+        "pitchRMSDeg": 0,
+        "stanceSlipMaxM": 0.008,
+        "footprintLineResidualM": 0.15,
+        "goalReached": false
+      },
+      "details": "Slip P95: 0°, Lat Error Max: 0m, Straightness: 1"
+    },
+    {
+      "rung": "L2",
+      "name": "Real terrain, no debris",
+      "verdict": "PASS",
+      "metrics": {
+        "duration": 5.34,
+        "frames": 320,
+        "slipAngleMeanDeg": 0.01,
+        "slipAngleP95Deg": 0.03,
+        "slipAngleMaxDeg": 0.03,
+        "lateralErrorMeanM": 0,
+        "lateralErrorP95M": 0,
+        "lateralErrorMaxM": 0.0001,
+        "headingErrorP95Deg": 0.03,
+        "headingZeroCrossingsPerSec": 27.88,
+        "pathStraightness": 1,
+        "rollRMSDeg": 0,
+        "pitchRMSDeg": 0.31,
+        "stanceSlipMaxM": 0.008,
+        "footprintLineResidualM": 0.15,
+        "goalReached": false
+      },
+      "details": "Slip P95: 0.03°, Lat Error P95: 0m, Straightness: 1"
+    },
+    {
+      "rung": "L3",
+      "name": "Real terrain, sparse debris",
+      "verdict": "PASS",
+      "metrics": {
+        "duration": 5.84,
+        "frames": 350,
+        "slipAngleMeanDeg": 0.01,
+        "slipAngleP95Deg": 0.03,
+        "slipAngleMaxDeg": 0.03,
+        "lateralErrorMeanM": 0,
+        "lateralErrorP95M": 0,
+        "lateralErrorMaxM": 0.0001,
+        "headingErrorP95Deg": 0.03,
+        "headingZeroCrossingsPerSec": 27.89,
+        "pathStraightness": 1,
+        "rollRMSDeg": 0,
+        "pitchRMSDeg": 0.33,
+        "stanceSlipMaxM": 0.008,
+        "footprintLineResidualM": 0.15,
+        "goalReached": false
+      },
+      "details": "Slip P95: 0.03°, Straightness: 1"
+    },
+    {
+      "rung": "L4",
+      "name": "Real terrain, full debris, boundary active",
+      "verdict": "PASS",
+      "metrics": {
+        "duration": 6.35,
+        "frames": 380,
+        "slipAngleMeanDeg": 0.01,
+        "slipAngleP95Deg": 0.03,
+        "slipAngleMaxDeg": 0.03,
+        "lateralErrorMeanM": 0,
+        "lateralErrorP95M": 0,
+        "lateralErrorMaxM": 0.0001,
+        "headingErrorP95Deg": 0.03,
+        "headingZeroCrossingsPerSec": 26.79,
+        "pathStraightness": 1,
+        "rollRMSDeg": 0,
+        "pitchRMSDeg": 0.43,
+        "stanceSlipMaxM": 0.008,
+        "footprintLineResidualM": 0.15,
+        "goalReached": false
+      },
+      "details": "Slip P95: 0.03°, Straightness: 1"
+    },
+    {
+      "rung": "L5",
+      "name": "Lunar vs Earth gravity (at L0)",
+      "verdict": "PASS",
+      "metrics": {
+        "duration": 4.17,
+        "frames": 250,
+        "slipAngleMeanDeg": null,
+        "slipAngleP95Deg": 0,
+        "slipAngleMaxDeg": 0,
+        "lateralErrorMeanM": 0,
+        "lateralErrorP95M": 0,
+        "lateralErrorMaxM": 0,
+        "headingErrorP95Deg": 0,
+        "headingZeroCrossingsPerSec": 0,
+        "pathStraightness": 1,
+        "rollRMSDeg": 0,
+        "pitchRMSDeg": 0,
+        "stanceSlipMaxM": 0.008,
+        "footprintLineResidualM": 0.15,
+        "goalReached": false
+      },
+      "details": "Lunar Slip P95: 0°, Earth Slip P95: 0°"
+    }
+  ],
+  "firstFailingRung": null
+}

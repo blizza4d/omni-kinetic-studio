@@ -295,7 +295,7 @@ def generate_demonstrations(env_spec: dict, num_episodes: int = 5, steps_per_epi
     Generates synthetic trajectory demonstrations with domain randomization.
     """
     episodes = []
-    base_gravity = np.array(env_spec.get('gravity', [0, 0, -1.62]))
+    base_gravity = np.array(env_spec.get('gravity', [0, -1.62, 0]))
     
     for ep in range(num_episodes):
         # Apply domain randomization: +-10% gravity perturbation & terrain friction
@@ -389,6 +389,6 @@ export function generateDeterministicCritique(spec: EnvironmentSpec): {
       `Domain randomization: Mass (+-10%) and terrain friction (+-15%) randomized across rollouts.`,
       `Numerical safety: Zero division-by-zero or unclipped exponential hazards identified.`,
     ],
-    critiqueText: `Physical audit passed with score 96/100. Reward function properly decomposes progress, stability, energy, and collision penalties. Synthetic trajectories adhere to 12-DOF quadruped kinematic boundaries under ${spec.gravity[2]} m/s² gravity.`,
+    critiqueText: `Physical audit passed with score 96/100. Reward function properly decomposes progress, stability, energy, and collision penalties. Synthetic trajectories adhere to 12-DOF quadruped kinematic boundaries under ${Math.abs(spec.gravity[1])} m/s² gravity.`,
   };
 }
