@@ -1,0 +1,10 @@
+{
+  "viewport": "1917x881",
+  "crushed_black_percent": 1.2,
+  "rock_dark_percent": 1.54,
+  "horizon_position_percent": 45.5,
+  "bright_white_dash_pixels": 3063,
+  "oversized_beacon_high_pixels": 0,
+  "radar_speckle_pixels": 747,
+  "mean_canvas_luminance": 0.2032
+}

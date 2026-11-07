@@ -1,15 +1,16 @@
-# RISKS AND OPEN QUESTIONS — OMNI-KINETIC BUG-FIX RELEASE
-**Build Stamp:** `iteration-5-dev (baseline: bugfix-baseline) • sha:21842619 (main) • production`  
-**Date:** 2026-11-01  
-**Gate:** Gate 1 Baseline Review (Planning Mode)
+# RISKS AND OPEN QUESTIONS — FIX PASS 3: "RECONCILE, PROVE, THEN FIX"
+**Project:** Omni-Kinetic Browser-Native Sim-to-Real Embodied AI Studio  
+**Gate:** Gate 1 (Planning Gate / Baseline Reconciliation — Zero Production Code Modifications)  
+**Date:** 2026-11-02  
+**Baseline Git Tag:** `fix3-baseline` (`aa9ea1d`)  
 
 ---
 
-## 1. Resolution of Mandatory Section 10 Questions
+## 1. Core Risk & Diagnostic Assessment (Mandated by Section 10)
 
-### Question 1: Does the browser agent render on a software GPU or real hardware?
-- **Status:** **RESOLVED (VERIFIED ON REAL HARDWARE)**
-- **Evidence:** During headless Chrome execution, `WEBGL_debug_renderer_info` was queried directly from the running WebGL2 context:
+### Question 1: Is the Browser Agent Rendering on Software or Hardware GPU?
+- **Empirical Measurement:**  
+  During the live reproduction run of `scripts/reproduce_fix3_user_view.ts`, the browser agent queried `WEBGL_debug_renderer_info`:
   ```json
   {
     "vendor": "Google Inc. (NVIDIA)",
@@ -17,57 +18,65 @@
     "webgl2": true
   }
   ```
-- **Conclusion:** The browser agent is running on a physical **NVIDIA GeForce RTX 3050 Laptop GPU** via ANGLE Direct3D11 with full hardware acceleration. Frame time measurements (p50 = 6.9 ms, p95 = 7.2 ms) are representative of real user hardware.
+- **Conclusion:** The browser agent is running on **genuine hardware GPU acceleration** via Direct3D11 on an NVIDIA GeForce RTX 3050 Laptop GPU. Performance metrics ($6.9\text{ ms}$ p50 / $7.1\text{ ms}$ p95) and shader executions reflect real hardware rendering, not software SwiftShader emulation.
 
 ---
 
-### Question 2: Do the controller and mesh currently share any kinematic definition?
-- **Status:** **RESOLVED (NO — COMPLETE DECOUPLING)**
-- **Evidence:**
-  - `lib/controller-core/`: Does NOT exist in the repository.
-  - `lib/telemetry/local_runner.ts`: Hardcodes link dimensions (`bodyHeight = 0.385`, `0.22m thigh + 0.22m calf`), nominal foot coordinates (`±0.24, ±0.15`), and joint angles.
-  - `components/viewer/ThreeViewer.tsx`: Independently hardcodes mesh geometry (`BoxGeometry(0.6, 0.16, 0.3)`, leg offsets `±0.24, ±0.15`, link lengths `0.22m, 0.22m`), and applies ad-hoc rotation axes (`rotation.x` for hip roll, `rotation.z` for thigh pitch).
-  - Furthermore, `ThreeViewer` applies an ad-hoc coordinate permutation `[torso.pos[0], torso.pos[2], -torso.pos[1]]` and quaternion mapping `[q[0], q[2], -q[1], q[3]]`.
-- **Conclusion:** There is zero shared kinematic definition. Creating `RobotModelSpec v1` and `/lib/frames` in Part I is an absolute prerequisite to eliminate splayed legs and mismatched kinematics.
+### Question 2: Do Any Uncommitted Changes Exist?
+- **Empirical Measurement:**  
+  `git status` outputs:
+  ```text
+  On branch main
+  Your branch is up to date with 'origin/main'.
+  nothing to commit, working tree clean
+  ```
+  Tagged baseline commit: `fix3-baseline` (`aa9ea1d`).
+- **Conclusion:** **Zero uncommitted files exist.** The tree is 100% clean. All baseline measurements and reproductions represent committed, reproducible code.
 
 ---
 
-### Question 3: Is the runner in the same language as the controller core?
-- **Status:** **RESOLVED (YES — 100% PURE TYPESCRIPT)**
-- **Evidence:**
-  - `LocalSimulationRunner` is implemented entirely in TypeScript (`lib/telemetry/local_runner.ts`).
-  - `RunnerInterface` and `LocalRunnerAdapter` are implemented in TypeScript (`sim/runner_interface.ts`).
-  - There are Python container worker scripts (`sim/worker/main.py`, `sim/adapters/*.py`), but the authoritative local simulation runner is 100% TypeScript.
-- **Conclusion:** The shared controller core (`/lib/controller-core`) and frame convention (`/lib/frames`) can be authored in pure TypeScript and shared directly between the runner, viewer, tests, and API routes without WebAssembly or IPC translation barriers.
+### Question 3: Is the User's Browser Serving Cached Assets?
+- **Empirical Measurement:**  
+  Next.js App Router chunks client JavaScript with unique content hashes (e.g. `117-37743225d74b84a7.js`). However, `next.config.mjs` lacked explicit `Cache-Control` headers on the HTML entrypoint. In browsers that cache HTML aggressively, a soft page refresh might continue executing previously loaded bundles if the HTML document itself is served from memory cache.
+- **Risk Mitigation:**
+  1. Add `Cache-Control: no-cache, no-store, must-revalidate` for all HTML routes in `next.config.mjs`.
+  2. Implement an automated `/api/stamp` endpoint and a client-side polling detector in `ThreeViewer.tsx` that notifies the user if their client bundle SHA mismatches the server's running SHA.
+  3. Ensure BuildStamp v2 is baked directly into the corner of the canvas viewport so any screenshot definitively proves whether the client has updated.
 
 ---
 
-### Question 4: Which of the "2 long tasks" are startup versus steady state?
-- **Status:** **RESOLVED (STARTUP ONLY — ZERO STEADY-STATE LONG TASKS)**
-- **Evidence:**
-  - Chrome `PerformanceObserver` logged exactly two long tasks (> 50 ms) during cold start:
-    1. Task 1: Next.js production bundle evaluation and initial React hydration (~110 ms).
-    2. Task 2: Synchronous execution of `generateCanonicalTerrain(42)` (sampling 257×257 Int16 grid on main thread) and Three.js geometry compilation (~65 ms).
-  - In steady state (over a 60-second default run), frame times are rock solid at 6.9 ms p50 / 7.2 ms p95 with **zero long tasks**.
-- **Conclusion:** The red `"2 long tasks"` badge in `FpsBadge` is an accounting defect: it displays lifetime startup tasks instead of tasks within a 60-second rolling steady-state window.
+### Question 4: Why Do Episode Resets Occur Every 12 to 18 Seconds?
+- **Empirical Measurement & Root Cause:**  
+  In [`lib/telemetry/local_runner.ts:105-199`](file:///d:/project%20all/nvidia/lib/telemetry/local_runner.ts#L105-L199):
+  1. The robot spawns at $(0, 0)$ and the goal is hardcoded at $(14.0, 0, -10.0)$.
+  2. The Euclidean distance between spawn and goal is:
+     $$\text{dist} = \sqrt{14^2 + 10^2} = \sqrt{296} \approx 17.20\text{ meters}$$
+  3. Under the pure pursuit path tracker implemented in Pass 2, the quadruped walks straight toward the goal at a forward velocity of $\approx 1.10\text{ m/s}$.
+  4. The required travel time to reach the goal is:
+     $$t = \frac{17.20\text{ m}}{1.10\text{ m/s}} \approx \mathbf{15.6\text{ seconds}}$$
+  5. At line 194 of `local_runner.ts`:
+     ```typescript
+     } else if (goalDist < 1.0) {
+       status = 'goal_reached';
+       episodeEvent = 'success';
+       this.needsResetNextStep = true;
+       this.resetReason = 'success';
+     }
+     ```
+     When the robot arrives within $1.0\text{ m}$ of the goal, it triggers a successful goal completion and sets `needsResetNextStep = true`.
+  6. The runner resets to spawn and increments `currentEpisode++`.
+  7. At $t=32\text{s}$, the robot completes Episode 2 and resets to begin Episode 3.
+  8. **The Defect:** Although the robot was successfully completing its navigation goal, **zero log lines were emitted to the Console**, the playback scrubber rendered a continuous timeline without boundary ticks, and zero Run Summary cards were displayed. To the user, this appeared as an unexplained recurring crash/reset!
+- **Conclusion:** The reset is functionally correct (`goal_reached` / `success`), but the UI failed to truthfully inform the user. In P3, we will emit typed `EpisodeEvent` records, log clean completion lines to the Console (`"Episode 1 ended: goal reached in 15.2s, 17.2m, reward: 28.4"`), and mark episode boundaries on the scrubber.
 
 ---
 
-## 2. Identified Architectural & Technical Risks
+## 2. Additional Project Risks & Mitigation Strategies
 
-| Risk ID | Severity | Description | Mitigation Strategy |
-| :--- | :---: | :--- | :--- |
-| **R-1** | **HIGH** | **Coordinate Migration Regression Risk:** Migrating all components to `/lib/frames` could temporarily invert radar, teleop, or bounds checking if not gated by comprehensive unit tests. | Author `/lib/frames` with 1,000 round-trip test vectors and chirality tests BEFORE touching any consumer. |
-| **R-2** | **MEDIUM** | **Shadow Frustum Performance Budget:** Expanding shadow map coverage from 13m to 24m at 2048×2048 could increase GPU draw time. | Frame budget has > 8 ms headroom (current p95 is 7.2 ms vs 16.0 ms budget). Bound shadow casters to rocks within 14m of the robot using chunk bounding spheres. |
-| **R-3** | **MEDIUM** | **Terrain Detrend Boundary Skirt Discontinuity:** Subtracting the best-fit plane could introduce height discontinuities at the outer perimeter if skirt blending is unadjusted. | Apply planar subtraction to the inner heightfield prior to skirt blending and re-assert canonical terrain parity. |
-| **R-4** | **LOW** | **Header Tooltip Browser Clamping:** Title tooltips on narrow viewports might clip outside browser edges. | Use lightweight styled CSS tooltip with `pointer-events-none` constrained to the viewport envelope. |
-
----
-
-## 3. Open Design Decisions for User Review
-1. **Robot Detail Level:**
-   - *Option A (Recommended per brief):* Stylized industrial quadruped in Analog AI palette: shaped beveled chassis with panel lines, front stereo camera sensor head with sage rings, rear lidar puck, actuator housings at all 12 joints, tapered sturdy legs, rubber foot pads, and telemetry LED strip.
-   - *Option B:* Minimalist box chassis with chamfered edges and simple cylinders.
-   - *Recommendation:* Option A provides the machine legibility required by Section 3.2.
-2. **Contour Lines Fading Distance:**
-   - *Recommendation:* Anti-aliased shader contours at 8% opacity, fading out between 16m and 22m from the camera to prevent distant horizon stripes.
+| Risk | Impact | Mitigation Strategy |
+| :--- | :--- | :--- |
+| **Shadow Frustum Aliasing** | Expanding directional light to 24m could cause shadow edge shimmering if unaligned. | Snap directional shadow camera to integer shadow texel increments in world space; use soft PCF filtering. |
+| **Performance Overhead of Detailed Robot** | Adding sensor head, actuators, and panels could increase draw calls above the 30 call budget. | Merge static geometry into single `BufferGeometry` per material; implement 3 LOD levels (LOD0 $\le 25\text{k}$ tris, LOD1 $\le 6\text{k}$ tris, LOD2 $\le 1.5\text{k}$ tris). |
+| **Header Layout Breakage on Mobile / Small Screens** | Adding tooltips and responsive labels could wrap the header. | Strict flex row layout with `min-width: 0`, 32px chip height, and automatic icon-only collapse when viewport width $< 1400\text{px}$. |
+| **Contour Line Shimmering** | Screen-space derivatives (`fwidth`) can produce moiré patterns at extreme distances. | Apply a smooth distance fade starting at $22\text{m}$ down to zero at $35\text{m}$, preventing distant contour aliasing while preserving near/mid-ground depth cues. |
+| **Goal Drift into Obstacles** | Randomizing goal position could place it inside a crater bowl or boulder. | Goal selector checks terrain slope ($\le 5^\circ$) and rejects coordinates within rock colliders plus $3\text{m}$ margin. |
