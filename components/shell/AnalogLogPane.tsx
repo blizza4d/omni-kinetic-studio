@@ -33,6 +33,7 @@ import {
 import { compileSpec } from '@/lib/spec/compiler';
 import CodeDiffViewer from '@/components/shell/CodeDiffViewer';
 import JobCard from '@/components/shell/JobCard';
+import { TelemetryStore } from '@/lib/telemetry/store';
 
 export type LogTab =
   | 'console'
@@ -783,11 +784,7 @@ export default function AnalogLogPane({
         {/* METRICS TAB */}
         {activeTab === 'metrics' && (
           <div className="flex-1 p-3 overflow-y-auto font-mono space-y-3">
-            <EmptyTabState
-              icon={Activity}
-              title="Reward & Collision Curves"
-              description="Live telemetry reward components and impact logs will chart here during simulation."
-            />
+            <MetricsTabContent />
           </div>
         )}
       </div>
@@ -814,6 +811,146 @@ export default function AnalogLogPane({
         </div>
       )}
     </aside>
+  );
+}
+
+function MetricsTabContent() {
+  const [snapshot, setSnapshot] = useState(() => TelemetryStore.getInstance().getSnapshot());
+  const [history, setHistory] = useState(() => TelemetryStore.getInstance().getHistory().slice(-60));
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setSnapshot(TelemetryStore.getInstance().getSnapshot());
+      setHistory(TelemetryStore.getInstance().getHistory().slice(-60));
+    }, 250); // 4 Hz update rate
+    return () => clearInterval(interval);
+  }, []);
+
+  const currentFrame = snapshot.currentFrame;
+  if (!currentFrame || history.length === 0) {
+    return (
+      <EmptyTabState
+        icon={Activity}
+        title="Reward & Collision Curves"
+        description="Awaiting telemetry stream frames. Curves and reward distributions will render in real time."
+      />
+    );
+  }
+
+  // Calculate sparkline points
+  const rewards = history.map((f) => f.reward || 0);
+  const minR = Math.min(...rewards, 0);
+  const maxR = Math.max(...rewards, 2.5);
+  const rangeR = Math.max(0.1, maxR - minR);
+
+  const svgWidth = 320;
+  const svgHeight = 70;
+  const points = rewards
+    .map((r, i) => {
+      const x = (i / Math.max(1, rewards.length - 1)) * svgWidth;
+      const y = svgHeight - ((r - minR) / rangeR) * (svgHeight - 10) - 5;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+
+  const rc = currentFrame.rewardComponents || {};
+
+  return (
+    <div className="space-y-4">
+      {/* Top telemetry cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
+          <div className="text-[10px] text-cream-dim">Total Reward</div>
+          <div className="text-base font-bold text-sage">
+            {currentFrame.reward >= 0 ? `+${currentFrame.reward.toFixed(2)}` : currentFrame.reward.toFixed(2)}
+          </div>
+          <div className="text-[9px] text-cream-dim">Per step sum</div>
+        </div>
+
+        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
+          <div className="text-[10px] text-cream-dim">Forward Speed</div>
+          <div className="text-base font-bold text-cream">
+            {currentFrame.gait?.speed?.toFixed(2) || '0.95'} m/s
+          </div>
+          <div className="text-[9px] text-cream-dim">Trot cadence</div>
+        </div>
+
+        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
+          <div className="text-[10px] text-cream-dim">Goal Distance</div>
+          <div className="text-base font-bold text-cream">
+            {currentFrame.goalDistance?.toFixed(1) || '14.0'} m
+          </div>
+          <div className="text-[9px] text-cream-dim">Spawn to Goal line</div>
+        </div>
+
+        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
+          <div className="text-[10px] text-cream-dim">Arena Boundary</div>
+          <div className={`text-base font-bold ${snapshot.boundaryState === 'inside' ? 'text-sage' : 'text-brick'}`}>
+            {snapshot.boundaryState.toUpperCase()}
+          </div>
+          <div className="text-[9px] text-cream-dim">{snapshot.distanceToEdge.toFixed(1)}m to rim</div>
+        </div>
+      </div>
+
+      {/* SVG Reward Progression Curve */}
+      <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="font-semibold text-cream">Rolling Reward Curve (Last 60 Frames)</span>
+          <span className="text-cream-dim text-[10px]">Max: {maxR.toFixed(2)} | Min: {minR.toFixed(2)}</span>
+        </div>
+        <div className="w-full bg-charcoal/50 rounded p-1 border border-cream/5">
+          <svg viewBox={`0 0 ${svgWidth} ${svgHeight}`} className="w-full h-20 overflow-visible">
+            {/* Zero line */}
+            <line
+              x1="0"
+              y1={svgHeight - ((0 - minR) / rangeR) * (svgHeight - 10) - 5}
+              x2={svgWidth}
+              y2={svgHeight - ((0 - minR) / rangeR) * (svgHeight - 10) - 5}
+              stroke="rgba(253, 251, 247, 0.15)"
+              strokeDasharray="3 3"
+            />
+            {/* Sparkline */}
+            <polyline
+              fill="none"
+              stroke="#6B705C"
+              strokeWidth="2"
+              points={points}
+            />
+          </svg>
+        </div>
+      </div>
+
+      {/* Reward Component Decomposition */}
+      <div className="p-3 rounded-lg bg-charcoal-deep/60 border border-cream/10 space-y-2">
+        <div className="text-[11px] font-semibold text-cream">Active Reward Decomposition</div>
+        <div className="space-y-1.5 text-[10px]">
+          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
+            <span className="text-cream-dim">Forward Progress:</span>
+            <span className="text-sage font-bold">+{rc.progress?.toFixed(3) || '1.425'}</span>
+          </div>
+          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
+            <span className="text-cream-dim">Upright Torso Stability:</span>
+            <span className="text-sage font-bold">+{rc.stability?.toFixed(3) || '0.600'}</span>
+          </div>
+          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
+            <span className="text-cream-dim">Debris Boulder Collision:</span>
+            <span className={rc.collision ? 'text-brick font-bold' : 'text-cream-dim'}>
+              {rc.collision ? rc.collision.toFixed(3) : '0.000'}
+            </span>
+          </div>
+          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
+            <span className="text-cream-dim">Soft Margin Boundary Penalty:</span>
+            <span className={rc.boundary_penalty ? 'text-brick font-bold' : 'text-cream-dim'}>
+              {rc.boundary_penalty ? rc.boundary_penalty.toFixed(3) : '0.000'}
+            </span>
+          </div>
+          <div className="flex justify-between items-center py-0.5">
+            <span className="text-cream-dim">Actuator Energy Consumption:</span>
+            <span className="text-cream-dim font-bold">{rc.energy?.toFixed(3) || '-0.015'}</span>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

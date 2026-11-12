@@ -19,16 +19,19 @@ export function setRuntimeModelIds(ids: { ultra?: string; super?: string; nano?:
 
 export function getBuildStamp(): BuildStamp {
   const isProd = process.env.NODE_ENV === 'production';
+  const gitSha = process.env.NEXT_PUBLIC_GIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || '780d751';
+  const branch = process.env.NEXT_PUBLIC_GIT_BRANCH || process.env.VERCEL_GIT_COMMIT_REF || 'main';
+
   return BuildStampSchema.parse({
-    sha: '21842619',
-    branch: 'main',
-    iterationTag: 'iteration-5-dev (baseline: iteration-4-baseline)',
+    sha: gitSha.substring(0, 8),
+    branch,
+    iterationTag: isProd ? 'v1.0.0-production' : 'v1.0.0-dev',
     buildType: isProd ? 'production' : 'development',
     contractVersions: {
       EnvironmentSpec: 'v4',
       TelemetryFrame: 'v4',
       TerrainField: 'v1',
-      BuildStamp: 'v1',
+      BuildStamp: 'v2',
       CompiledSpec: 'v1',
       VisualReport: 'v1',
       AcceptanceMatrix: 'v1',

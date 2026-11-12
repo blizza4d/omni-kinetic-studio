@@ -10,6 +10,9 @@ export interface FrameMetrics {
   mean: number;
   max: number;
   fps: number;
+  isMeasuring: boolean;
+  isWarmingUp: boolean;
+  sampleCount: number;
 }
 
 export interface LongTaskRecord {
@@ -28,12 +31,14 @@ export interface RendererInfoSnapshot {
 
 export class PerfProbe {
   private static instance: PerfProbe | null = null;
-  
-  // Rolling 5-second frame time ring buffer (300 frames @ 60 FPS)
-  private readonly windowSize = 300;
+
+  // Rolling 10-second frame time ring buffer (600 frames @ 60 FPS)
+  private readonly windowSize = 600;
   private readonly frameDeltas: number[] = [];
+  private totalFramesObserved = 0;
   private lastTimestamp = 0;
-  
+  private warmUpFrames = 30; // Discard first 30 frames during asset loading/shader compilation
+
   // Long task observer
   private longTasks: LongTaskRecord[] = [];
   private observer: PerformanceObserver | null = null;
@@ -42,7 +47,7 @@ export class PerfProbe {
   private physicsTimes: number[] = [];
   private telemetryTimes: number[] = [];
   private radarTimes: number[] = [];
-  
+
   // Renderer snapshot
   private rendererInfo: RendererInfoSnapshot = {
     drawCalls: 0,
@@ -101,12 +106,17 @@ export class PerfProbe {
   }
 
   public recordFrame(now: number) {
+    this.totalFramesObserved++;
+
     if (this.lastTimestamp > 0) {
       const delta = now - this.lastTimestamp;
-      if (delta > 0 && delta < 500) { // filter out tab backgrounding pauses
-        this.frameDeltas.push(delta);
-        if (this.frameDeltas.length > this.windowSize) {
-          this.frameDeltas.shift();
+      // Filter out tab backgrounding pauses (> 500ms)
+      if (delta > 0 && delta < 500) {
+        if (this.totalFramesObserved > this.warmUpFrames) {
+          this.frameDeltas.push(delta);
+          if (this.frameDeltas.length > this.windowSize) {
+            this.frameDeltas.shift();
+          }
         }
       }
     }
@@ -163,12 +173,22 @@ export class PerfProbe {
   }
 
   public getMetrics(): FrameMetrics {
-    if (this.frameDeltas.length === 0) {
-      return { p50: 16.6, p95: 16.6, p99: 16.6, mean: 16.6, max: 16.6, fps: 60 };
+    const n = this.frameDeltas.length;
+    if (n === 0) {
+      return {
+        p50: 0.0,
+        p95: 0.0,
+        p99: 0.0,
+        mean: 0.0,
+        max: 0.0,
+        fps: 0,
+        isMeasuring: false,
+        isWarmingUp: this.totalFramesObserved <= this.warmUpFrames,
+        sampleCount: 0,
+      };
     }
 
     const sorted = [...this.frameDeltas].sort((a, b) => a - b);
-    const n = sorted.length;
     const p50 = sorted[Math.floor(n * 0.50)];
     const p95 = sorted[Math.floor(n * 0.95)];
     const p99 = sorted[Math.floor(n * 0.99)];
@@ -183,6 +203,9 @@ export class PerfProbe {
       mean: Number(mean.toFixed(1)),
       max: Number(max.toFixed(1)),
       fps,
+      isMeasuring: true,
+      isWarmingUp: n < 30,
+      sampleCount: n,
     };
   }
 

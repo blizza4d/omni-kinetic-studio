@@ -12,6 +12,7 @@ import { PerfProbe } from '@/lib/perf/probe';
 import { parseFeatureToggles } from '@/lib/perf/toggles';
 import { TelemetryStore } from '@/lib/telemetry/store';
 import { formatGravityDisplay } from '@/lib/spec/gravity';
+import { LunarDustSystem } from '@/lib/droid/fx/DustPuffs';
 
 export type CameraPreset = 'chase' | 'top' | 'side' | 'free';
 export type QualityTier = 'ultra' | 'high' | 'medium' | 'low' | 'potato';
@@ -89,6 +90,16 @@ export default function ThreeViewer({
   const currentTerrainSeedRef = useRef<number>(envSpec.terrain?.seed ?? 42);
   const cameraPresetRef = useRef<CameraPreset>(cameraPreset);
   const qualityTierRef = useRef<QualityTier>(qualityTier);
+  const lunarDustRef = useRef<LunarDustSystem | null>(null);
+  const prevFootContactsRef = useRef<boolean[]>([true, true, true, true]);
+  const showRadarRef = useRef(showRadar);
+  const showOverlaysRef = useRef(showOverlays);
+  const showGhostComparisonRef = useRef(showGhostComparison);
+  const showColliderDebugRef = useRef(showColliderDebug);
+  const currentFrameRef = useRef(currentFrame);
+  const onBoundaryWarningRef = useRef(onBoundaryWarning);
+  const onCollisionDetectedRef = useRef(onCollisionDetected);
+  const onEpisodeResetRef = useRef(onEpisodeReset);
 
   // Keep references updated with zero React re-render churn
   useEffect(() => {
@@ -104,15 +115,39 @@ export default function ThreeViewer({
   }, [cameraPreset]);
 
   useEffect(() => {
-    qualityTierRef.current = qualityTier;
-    PerfProbe.getInstance().setTier(qualityTier);
-  }, [qualityTier]);
+    currentFrameRef.current = currentFrame;
+  }, [currentFrame]);
 
   useEffect(() => {
+    showRadarRef.current = showRadar;
+  }, [showRadar]);
+
+  useEffect(() => {
+    showOverlaysRef.current = showOverlays;
+  }, [showOverlays]);
+
+  useEffect(() => {
+    showGhostComparisonRef.current = showGhostComparison;
+  }, [showGhostComparison]);
+
+  useEffect(() => {
+    showColliderDebugRef.current = showColliderDebug;
     if (colliderSphereRef.current) {
       colliderSphereRef.current.visible = showColliderDebug;
     }
   }, [showColliderDebug]);
+
+  useEffect(() => {
+    onBoundaryWarningRef.current = onBoundaryWarning;
+    onCollisionDetectedRef.current = onCollisionDetected;
+    onEpisodeResetRef.current = onEpisodeReset;
+  }, [onBoundaryWarning, onCollisionDetected, onEpisodeReset]);
+
+  useEffect(() => {
+    qualityTierRef.current = qualityTier;
+    PerfProbe.getInstance().setTier(qualityTier);
+  }, [qualityTier]);
+
 
   useEffect(() => {
     if (dustParticlesRef.current) {
@@ -273,6 +308,10 @@ export default function ThreeViewer({
     if (effectiveTier !== 'potato') {
       const dust = buildDustParticles(scene, 40, 40);
       dustParticlesRef.current = dust;
+
+      // 7b. Dynamic Lunar Dust Puffs (Ballistic zero-drag arcs on foot touchdown)
+      const lunarDust = new LunarDustSystem(scene);
+      lunarDustRef.current = lunarDust;
     }
 
     // 8. Goal Marker (V4: Ground ring + soft column of light)
@@ -285,11 +324,11 @@ export default function ThreeViewer({
     robotGroupRef.current = robotGroup;
     jointMeshesRef.current = jointGroups;
     colliderSphereRef.current = colliderSphere;
-    colliderSphere.visible = showColliderDebug;
+    colliderSphere.visible = showColliderDebugRef.current;
 
     // Ghost Quadruped
     const { robotGroup: ghostGroup, jointGroups: ghostJoints } = build12DOFQuadruped(true);
-    ghostGroup.visible = Boolean(showGhostComparison);
+    ghostGroup.visible = Boolean(showGhostComparisonRef.current);
     scene.add(ghostGroup);
     ghostRobotGroupRef.current = ghostGroup;
     ghostJointMeshesRef.current = ghostJoints;
@@ -376,13 +415,19 @@ export default function ThreeViewer({
         beacon.rotation.y += dt * 0.8;
       }
 
+      // Update ballistic lunar dust puffs
+      if (lunarDustRef.current) {
+        const gravY = Math.abs(latestSpecRef.current.gravity?.[1] ?? 1.62);
+        lunarDustRef.current.update(dt, gravY);
+      }
+
       // GPU dust particle offset
       if (dustParticlesRef.current) {
         dustParticlesRef.current.position.y = (now * 0.00018) % 3.0;
       }
 
       // Read latest frame directly from TelemetryStore (Zero React Re-render!)
-      const frame = store.getLatestFrame() || currentFrame;
+      const frame = store.getLatestFrame() || currentFrameRef.current;
       const teleop = latestTeleopRef.current;
       const preset = cameraPresetRef.current;
 
@@ -425,11 +470,18 @@ export default function ThreeViewer({
               bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
               bMat.opacity = foot.contact ? 0.85 : 0.22;
             }
+
+            // Emit ballistic dust puff on touchdown transition
+            const wasContact = prevFootContactsRef.current[fi];
+            if (foot.contact && !wasContact && lunarDustRef.current) {
+              lunarDustRef.current.emit(foot.pos, 5);
+            }
+            prevFootContactsRef.current[fi] = foot.contact;
           }
         }
 
         // 3. Translucent Ghost comparison
-        if (showGhostComparison && ghostRobotGroupRef.current) {
+        if (showGhostComparisonRef.current && ghostRobotGroupRef.current) {
           ghostRobotGroupRef.current.position.set(robotPos.x * 0.86, robotPos.y, robotPos.z);
           for (const j of frame.joints) {
             const group = ghostJointMeshesRef.current[j.name];
@@ -461,14 +513,14 @@ export default function ThreeViewer({
         if (distFromCenter > 16.0 && boundaryRimMatRef.current) {
           const pulse = (Math.sin(now * 0.005) + 1.0) * 0.5;
           boundaryRimMatRef.current.color.setRGB(0.72 + pulse * 0.28, 0.23, 0.18); // brick glow
-          if (onBoundaryWarning) onBoundaryWarning(distFromCenter > 20.0 ? 'out' : 'soft', Math.max(0, 18.0 - distFromCenter));
+          if (onBoundaryWarningRef.current) onBoundaryWarningRef.current(distFromCenter > 20.0 ? 'out' : 'soft', Math.max(0, 18.0 - distFromCenter));
         } else if (boundaryRimMatRef.current) {
           boundaryRimMatRef.current.color.set(0xfdfbf7); // cream default
         }
 
         // 6. Handle Episode Resets
-        if (frame.episodeEvent && onEpisodeReset) {
-          onEpisodeReset(frame.episodeEvent);
+        if (frame.episodeEvent && onEpisodeResetRef.current) {
+          onEpisodeResetRef.current(frame.episodeEvent);
         }
 
         // 7. Collision Flash
@@ -478,7 +530,7 @@ export default function ThreeViewer({
             collisionFlashRef.current.position.set(col.point[0], 0.05, -col.point[1]);
             (collisionFlashRef.current.material as THREE.MeshBasicMaterial).opacity = 0.95;
           }
-          if (onCollisionDetected) onCollisionDetected(col);
+          if (onCollisionDetectedRef.current) onCollisionDetectedRef.current(col);
         } else if (collisionFlashRef.current) {
           const mat = collisionFlashRef.current.material as THREE.MeshBasicMaterial;
           mat.opacity = Math.max(0, mat.opacity - dt * 2.8);
@@ -531,7 +583,7 @@ export default function ThreeViewer({
       probe.updateRendererInfo(renderer.info);
 
       // 15 Hz Cached Radar Render
-      if (now - lastRadarUpdate >= 66 && showRadar) {
+      if (now - lastRadarUpdate >= 66 && showRadarRef.current) {
         const radarStart = performance.now();
         radarSweepAngle = (radarSweepAngle + dt * 2.5) % (Math.PI * 2);
         renderCachedTerrainRadar(
@@ -568,6 +620,9 @@ export default function ThreeViewer({
       window.removeEventListener('mouseup', onMouseUp);
       container.removeEventListener('wheel', onWheel);
 
+      lunarDustRef.current?.dispose();
+      lunarDustRef.current = null;
+
       scene.traverse((obj) => {
         if ((obj as THREE.Mesh).isMesh) {
           const mesh = obj as THREE.Mesh;
@@ -585,7 +640,7 @@ export default function ThreeViewer({
       }
       renderer.dispose();
     };
-  }, [qualityTier, showColliderDebug, showDustParticles, showGhostComparison, showOverlays, showRadar]);
+  }, [qualityTier]);
 
   return (
     <div className="relative w-full h-full overflow-hidden select-none bg-charcoal">

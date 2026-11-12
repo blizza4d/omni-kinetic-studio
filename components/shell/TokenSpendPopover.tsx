@@ -18,24 +18,29 @@ export default function TokenSpendPopover({
   const [usage, setUsage] = useState<UsageState | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  const fetchUsage = async () => {
-    try {
-      const res = await fetch('/api/usage');
-      if (res.ok) {
-        const data: UsageState = await res.json();
-        setUsage(data);
-        if (onSpendUpdated) onSpendUpdated(data);
-      }
-    } catch (err) {
-      console.warn('Failed to fetch usage state:', err);
-    }
-  };
-
   useEffect(() => {
-    if (isOpen) {
-      fetchUsage();
-    }
-  }, [isOpen]);
+    if (!isOpen) return;
+    let isCancelled = false;
+
+    const fetchUsage = async () => {
+      try {
+        const res = await fetch('/api/usage');
+        if (res.ok && !isCancelled) {
+          const data: UsageState = await res.json();
+          setUsage(data);
+          if (onSpendUpdated) onSpendUpdated(data);
+        }
+      } catch (err) {
+        console.warn('Failed to fetch usage state:', err);
+      }
+    };
+
+    fetchUsage();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [isOpen, onSpendUpdated]);
 
   const handleReset = async () => {
     setIsLoading(true);
@@ -98,99 +103,102 @@ export default function TokenSpendPopover({
                 style={{ width: `${budgetPercent}%` }}
               />
             </div>
-            <div className="flex justify-between text-[9px] text-cream-dim">
-              <span>{usage?.totalTokens.toLocaleString() || 0} tokens processed</span>
-              <span>{budgetPercent.toFixed(1)}% limit reached</span>
+            <div className="flex justify-between items-center text-[10px] text-cream-dim pt-1">
+              <span>{budgetPercent.toFixed(1)}% of $5.00 max</span>
+              {budgetPercent > 80 && (
+                <span className="text-brick flex items-center space-x-1">
+                  <AlertTriangle className="w-3 h-3" />
+                  <span>Approaching limit</span>
+                </span>
+              )}
             </div>
           </div>
 
-          {/* Per-Tier Accounting Table */}
+          {/* Model Breakdown */}
           <div className="space-y-2">
-            <div className="text-[10px] uppercase text-cream-dim tracking-wider font-semibold">
-              Per-Tier Model Consumption
+            <div className="text-[10px] text-cream-dim uppercase tracking-wider">
+              Token Spend By Tier
             </div>
 
             <div className="space-y-1.5">
               {/* Ultra Tier */}
-              <div className="flex items-center justify-between p-2 rounded bg-charcoal/40 border border-cream/5">
+              <div className="flex items-center justify-between p-2 rounded bg-charcoal-deep/60 border border-cream/5">
                 <div>
-                  <div className="font-bold text-cream flex items-center space-x-1.5">
-                    <span className="w-2 h-2 rounded-full bg-sage" />
-                    <span>Nemotron 3 Ultra (Reasoning)</span>
-                  </div>
+                  <div className="font-semibold text-cream">Nemotron 3 Ultra (550B)</div>
                   <div className="text-[10px] text-cream-dim">
-                    {usage?.ultra.promptTokens || 0} prompt / {usage?.ultra.completionTokens || 0} comp
+                    {usage?.ultra?.promptTokens.toLocaleString() || 0} prompt /{' '}
+                    {usage?.ultra?.completionTokens.toLocaleString() || 0} comp
                   </div>
                 </div>
                 <div className="text-right">
-                  <div className="font-bold text-cream">
-                    ${usage?.ultra.costUsd.toFixed(4) || '0.0000'}
+                  <div className="font-bold text-sage">
+                    ${usage?.ultra?.costUsd.toFixed(4) || '0.0000'}
                   </div>
-                  <div className="text-[9px] text-cream-dim">
-                    {usage?.ultra.totalTokens || 0} tok
-                  </div>
+                  <div className="text-[9px] text-cream-dim">Physical Reasoning</div>
                 </div>
               </div>
 
               {/* Super Tier */}
-              <div className="flex items-center justify-between p-2 rounded bg-charcoal/40 border border-cream/5">
+              <div className="flex items-center justify-between p-2 rounded bg-charcoal-deep/60 border border-cream/5">
                 <div>
-                  <div className="font-bold text-cream flex items-center space-x-1.5">
-                    <span className="w-2 h-2 rounded-full bg-sage/70" />
-                    <span>Nemotron 3 Super (Mid / Critique)</span>
-                  </div>
+                  <div className="font-semibold text-cream">Nemotron 3 Super (120B)</div>
                   <div className="text-[10px] text-cream-dim">
-                    {usage?.super.promptTokens || 0} prompt / {usage?.super.completionTokens || 0} comp
+                    {usage?.super?.promptTokens.toLocaleString() || 0} prompt /{' '}
+                    {usage?.super?.completionTokens.toLocaleString() || 0} comp
                   </div>
                 </div>
                 <div className="text-right">
-                  <div className="font-bold text-cream">
-                    ${usage?.super.costUsd.toFixed(4) || '0.0000'}
+                  <div className="font-bold text-sage">
+                    ${usage?.super?.costUsd.toFixed(4) || '0.0000'}
                   </div>
-                  <div className="text-[9px] text-cream-dim">
-                    {usage?.super.totalTokens || 0} tok
-                  </div>
+                  <div className="text-[9px] text-cream-dim">Verification & Critique</div>
                 </div>
               </div>
 
               {/* Nano Tier */}
-              <div className="flex items-center justify-between p-2 rounded bg-charcoal/40 border border-cream/5">
+              <div className="flex items-center justify-between p-2 rounded bg-charcoal-deep/60 border border-cream/5">
                 <div>
-                  <div className="font-bold text-cream flex items-center space-x-1.5">
-                    <span className="w-2 h-2 rounded-full bg-sage/40" />
-                    <span>Nemotron 3 Nano (Fast Diagnostics)</span>
-                  </div>
+                  <div className="font-semibold text-cream">Nemotron 3 Nano (30B)</div>
                   <div className="text-[10px] text-cream-dim">
-                    {usage?.nano.promptTokens || 0} prompt / {usage?.nano.completionTokens || 0} comp
+                    {usage?.nano?.promptTokens.toLocaleString() || 0} prompt /{' '}
+                    {usage?.nano?.completionTokens.toLocaleString() || 0} comp
                   </div>
                 </div>
                 <div className="text-right">
-                  <div className="font-bold text-cream">
-                    ${usage?.nano.costUsd.toFixed(4) || '0.0000'}
+                  <div className="font-bold text-sage">
+                    ${usage?.nano?.costUsd.toFixed(4) || '0.0000'}
                   </div>
-                  <div className="text-[9px] text-cream-dim">
-                    {usage?.nano.totalTokens || 0} tok
-                  </div>
+                  <div className="text-[9px] text-cream-dim">Diagnostics Translation</div>
                 </div>
               </div>
+            </div>
+          </div>
+
+          {/* Pricing Model Note */}
+          <div className="p-2.5 rounded bg-sage/10 border border-sage/20 text-[10px] text-cream-dim flex items-start space-x-2">
+            <ShieldCheck className="w-3.5 h-3.5 text-sage shrink-0 mt-0.5" />
+            <div>
+              <span>
+                Standard rates: Ultra ($0.012/1K), Super ($0.004/1K), Nano ($0.0008/1K). Demo sessions use local mock counting when API key is unconfigured.
+              </span>
             </div>
           </div>
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-3 border-t border-cream/10 bg-charcoal-deep/80 flex items-center justify-between">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-cream/10 bg-charcoal-deep">
           <button
             onClick={handleReset}
             disabled={isLoading}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded bg-charcoal hover:bg-charcoal-light border border-cream/15 text-cream-dim hover:text-cream text-xs transition-colors"
+            className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/15 text-cream-dim hover:text-cream transition-colors text-[11px] disabled:opacity-50"
           >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span>Reset Counter</span>
+            <RotateCcw className={`w-3 h-3 ${isLoading ? 'animate-spin' : ''}`} />
+            <span>Reset Accounting</span>
           </button>
 
           <button
             onClick={onClose}
-            className="px-4 py-1.5 rounded bg-sage hover:bg-sage-light text-cream font-semibold text-xs transition-colors"
+            className="px-3 py-1 rounded bg-sage hover:bg-sage/80 text-cream font-bold transition-colors text-[11px]"
           >
             Done
           </button>

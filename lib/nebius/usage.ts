@@ -25,14 +25,14 @@ const TIER_PRICING = {
 };
 
 let globalUsageState: UsageState = {
-  ultra: { promptTokens: 1420, completionTokens: 960, totalTokens: 2380, costUsd: 0.0215 },
-  super: { promptTokens: 650, completionTokens: 320, totalTokens: 970, costUsd: 0.0013 },
-  nano: { promptTokens: 1200, completionTokens: 480, totalTokens: 1680, costUsd: 0.0004 },
-  totalTokens: 5030,
-  totalCostUsd: 0.0232,
+  ultra: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0.0 },
+  super: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0.0 },
+  nano: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0.0 },
+  totalTokens: 0,
+  totalCostUsd: 0.0,
   budgetLimitUsd: 5.0,
   budgetExceeded: false,
-  requestCount: 4,
+  requestCount: 0,
   lastUpdated: Date.now(),
 };
 
@@ -66,14 +66,14 @@ export function getUsageState(): UsageState {
   return JSON.parse(JSON.stringify(globalUsageState));
 }
 
-export function resetUsage(budgetLimitUsd = 5.0): UsageState {
+export function resetUsage(budgetLimit = 5.0): UsageState {
   globalUsageState = {
-    ultra: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0 },
-    super: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0 },
-    nano: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0 },
+    ultra: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0.0 },
+    super: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0.0 },
+    nano: { promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0.0 },
     totalTokens: 0,
-    totalCostUsd: 0,
-    budgetLimitUsd,
+    totalCostUsd: 0.0,
+    budgetLimitUsd: budgetLimit,
     budgetExceeded: false,
     requestCount: 0,
     lastUpdated: Date.now(),

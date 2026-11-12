@@ -22,7 +22,13 @@ export default function FpsBadge({ onTogglePanel, tier = 'high' }: FpsBadgeProps
     return () => clearInterval(interval);
   }, []);
 
-  const p50Color = metrics.p50 <= 12.0 ? 'text-sage' : metrics.p50 <= 16.7 ? 'text-cream' : 'text-brick';
+  const p50Color = !metrics.isMeasuring
+    ? 'text-cream-dim'
+    : metrics.p50 <= 12.0
+    ? 'text-sage'
+    : metrics.p50 <= 16.7
+    ? 'text-cream'
+    : 'text-brick';
 
   return (
     <button
@@ -32,19 +38,27 @@ export default function FpsBadge({ onTogglePanel, tier = 'high' }: FpsBadgeProps
       className="flex items-center space-x-2 px-2.5 py-1 rounded analog-glass hover:bg-charcoal-deep transition-colors text-[11px] font-mono border border-cream/15"
     >
       <Activity className={`w-3.5 h-3.5 ${metrics.p95 > 20 ? 'text-brick animate-pulse' : 'text-sage'}`} />
-      
+
       {/* Honest rolling metrics */}
-      <span className="flex items-baseline space-x-1">
-        <span className={`font-bold ${p50Color}`}>{metrics.p50}ms</span>
-        <span className="text-[9px] text-cream-dim">p50</span>
-      </span>
+      {!metrics.isMeasuring ? (
+        <span className="text-[10px] text-cream-dim italic">
+          {metrics.isWarmingUp ? 'WARMUP...' : 'MEASURING...'}
+        </span>
+      ) : (
+        <>
+          <span className="flex items-baseline space-x-1">
+            <span className={`font-bold ${p50Color}`}>{metrics.p50}ms</span>
+            <span className="text-[9px] text-cream-dim">p50</span>
+          </span>
 
-      <span className="text-cream/20">/</span>
+          <span className="text-cream/20">/</span>
 
-      <span className="flex items-baseline space-x-1">
-        <span className={`font-semibold ${metrics.p95 <= 20 ? 'text-cream' : 'text-brick'}`}>{metrics.p95}ms</span>
-        <span className="text-[9px] text-cream-dim">p95</span>
-      </span>
+          <span className="flex items-baseline space-x-1">
+            <span className={`font-semibold ${metrics.p95 <= 20 ? 'text-cream' : 'text-brick'}`}>{metrics.p95}ms</span>
+            <span className="text-[9px] text-cream-dim">p95</span>
+          </span>
+        </>
+      )}
 
       {/* Long task indicator if any with descriptive label and tooltip */}
       {longTasks > 0 && (

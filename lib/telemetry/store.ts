@@ -47,6 +47,21 @@ export class TelemetryStore {
    * Ingest new frame directly into store without React re-render.
    */
   public ingestFrame(frame: TelemetryFrame) {
+    this.ingestFrameInternal(frame);
+    this.scheduleNotify();
+  }
+
+  /**
+   * Batch ingestion for high-throughput network batches with a single debounced notification.
+   */
+  public ingestBatch(frames: TelemetryFrame[]) {
+    for (const f of frames) {
+      this.ingestFrameInternal(f);
+    }
+    this.scheduleNotify();
+  }
+
+  private ingestFrameInternal(frame: TelemetryFrame) {
     // 1. Telemetry validation at ingestion boundary
     if (!frame.bodies || frame.bodies.length === 0) {
       this.invalidFrameCount++;
@@ -97,14 +112,6 @@ export class TelemetryStore {
     } else {
       this.history[this.head] = frame;
       this.head = (this.head + 1) % this.capacity;
-    }
-
-    this.scheduleNotify();
-  }
-
-  public ingestBatch(frames: TelemetryFrame[]) {
-    for (const f of frames) {
-      this.ingestFrame(f);
     }
   }
 

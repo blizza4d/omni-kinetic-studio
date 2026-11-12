@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
   Camera,
   Zap,
@@ -46,15 +46,26 @@ export default function TeleopOverlay({
   currentRobotState,
   currentFrame,
 }: TeleopOverlayProps) {
-  const dispatchCommand = onTeleopCommand || onCommand || (() => {});
-  const effectiveRobotState = currentRobotState || (currentFrame?.bodies?.[0] ? {
-    pos: currentFrame.bodies[0].pos as [number, number, number],
-    quat: currentFrame.bodies[0].quat as [number, number, number, number],
-    joints: (currentFrame.joints || []).reduce((acc: Record<string, number>, j: any) => {
-      acc[j.name] = j.angle;
-      return acc;
-    }, {}),
-  } : undefined);
+  const dispatchCommand = useCallback(
+    (cmd: any) => {
+      (onTeleopCommand || onCommand || (() => {}))(cmd);
+    },
+    [onTeleopCommand, onCommand]
+  );
+  const effectiveRobotState = useMemo(() => {
+    if (currentRobotState) return currentRobotState;
+    if (currentFrame?.bodies?.[0]) {
+      return {
+        pos: currentFrame.bodies[0].pos as [number, number, number],
+        quat: currentFrame.bodies[0].quat as [number, number, number, number],
+        joints: (currentFrame.joints || []).reduce((acc: Record<string, number>, j: any) => {
+          acc[j.name] = j.angle;
+          return acc;
+        }, {}),
+      };
+    }
+    return undefined;
+  }, [currentRobotState, currentFrame]);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -84,6 +95,7 @@ export default function TeleopOverlay({
   const pinchFilterRef = useRef(new OneEuroFilter(1.0, 0.01));
   const calibrationOriginRef = useRef<[number, number, number] | null>(null);
   const animationFrameId = useRef<number | null>(null);
+  const handleVisionResultsRef = useRef<(data: any) => void>(() => {});
 
   // Load saved calibration origin from localStorage if present
   useEffect(() => {
@@ -110,7 +122,7 @@ export default function TeleopOverlay({
         if (data.type === 'READY') {
           setDelegate(data.delegate || 'GPU');
         } else if (data.type === 'RESULTS') {
-          handleVisionResults(data);
+          handleVisionResultsRef.current(data);
         }
       };
 
@@ -429,6 +441,7 @@ export default function TeleopOverlay({
     },
     [isCalibrating, activeLimb, isRecording, effectiveRobotState, dispatchCommand, isKeyboardMode]
   );
+  handleVisionResultsRef.current = handleVisionResults;
 
   const toggleRecording = () => {
     if (isRecording) {

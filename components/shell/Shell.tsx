@@ -137,7 +137,7 @@ export default function Shell() {
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [runSummary, setRunSummary] = useState<RunSummary | null>(null);
   const [showRunSummary, setShowRunSummary] = useState(false);
-  const [tokenSpend, setTokenSpend] = useState({ promptTokens: 1420, completionTokens: 960, costUsd: 0.0232 });
+  const [tokenSpend, setTokenSpend] = useState({ promptTokens: 0, completionTokens: 0, costUsd: 0.0000 });
   const [collisionAlert, setCollisionAlert] = useState(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -174,10 +174,23 @@ export default function Shell() {
   }, []);
 
   // Keyboard Shortcuts Handler
+  const architectOutputRef = useRef(architectOutput);
+  architectOutputRef.current = architectOutput;
+  const handleApproveJobRef = useRef<() => void>(() => {});
+  const handleRejectJobRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't trigger shortcuts if focus is inside text input or textarea
-      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
+      // Don't trigger shortcuts if focus is inside text input, textarea, or contenteditable
+      if (
+        document.activeElement &&
+        (document.activeElement.tagName === 'INPUT' ||
+          document.activeElement.tagName === 'TEXTAREA' ||
+          (document.activeElement as HTMLElement).isContentEditable)
+      ) {
+        if (e.key === 'Escape') {
+          (document.activeElement as HTMLElement).blur();
+        }
         return;
       }
 
@@ -228,14 +241,14 @@ export default function Shell() {
         setIsPlaying((prev) => !prev);
       }
       // A: Approve proposal
-      if (e.key.toLowerCase() === 'a' && !e.ctrlKey && !e.metaKey && architectOutput) {
+      if (e.key.toLowerCase() === 'a' && !e.ctrlKey && !e.metaKey && architectOutputRef.current) {
         e.preventDefault();
-        handleApproveJob();
+        handleApproveJobRef.current();
       }
       // X: Reject proposal
-      if (e.key.toLowerCase() === 'x' && !e.ctrlKey && !e.metaKey && architectOutput) {
+      if (e.key.toLowerCase() === 'x' && !e.ctrlKey && !e.metaKey && architectOutputRef.current) {
         e.preventDefault();
-        handleRejectJob();
+        handleRejectJobRef.current();
       }
       // S: Toggle Stage Rail focus
       if (e.key.toLowerCase() === 's' && !e.ctrlKey && !e.metaKey) {
@@ -422,7 +435,7 @@ export default function Shell() {
     }
   };
 
-  const handleApproveJob = () => {
+  const handleApproveJob = useCallback(() => {
     if (architectOutput?.spec) {
       const approvedSpec = architectOutput.spec;
       setEnvSpec(approvedSpec);
@@ -432,7 +445,7 @@ export default function Shell() {
       addLog('Architecture specification and reward scripts approved by user.', 'architect');
       connectTelemetryStream(simMode);
     }
-  };
+  }, [architectOutput, addLog, connectTelemetryStream, simMode]);
 
   const handleApproveCode = (rewardCode: string, datagenCode: string) => {
     if (architectOutput) {
@@ -447,10 +460,13 @@ export default function Shell() {
     }
   };
 
-  const handleRejectJob = () => {
+  const handleRejectJob = useCallback(() => {
     setArchitectOutput(null);
     addLog('Specification rejected. Requesting Architect retry...', 'warn');
-  };
+  }, [addLog]);
+
+  handleApproveJobRef.current = handleApproveJob;
+  handleRejectJobRef.current = handleRejectJob;
 
   const handleRejectWithFeedback = (feedback: string) => {
     addLog(`[RETRY REQUESTED] Developer feedback: "${feedback}"`, 'warn');
@@ -593,10 +609,19 @@ export default function Shell() {
           >
             <Coins className="w-3 h-3 text-sage" />
             <span>
-              {(tokenSpend.promptTokens + tokenSpend.completionTokens).toLocaleString()} tok · ${(
-                tokenSpend.costUsd > 0 ? tokenSpend.costUsd : (tokenSpend.promptTokens + tokenSpend.completionTokens) * 0.00000975
-              ).toFixed(4)}
+              {tokenSpend.promptTokens + tokenSpend.completionTokens === 0
+                ? '0 tok · $0.0000'
+                : `${(tokenSpend.promptTokens + tokenSpend.completionTokens).toLocaleString()} tok · $${tokenSpend.costUsd.toFixed(4)}`}
             </span>
+          </button>
+
+          {/* Quick Shortcuts Trigger */}
+          <button
+            onClick={() => setIsShortcutsOpen(true)}
+            title="Keyboard Shortcuts [?]"
+            className="p-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/10 text-cream-dim hover:text-cream text-[11px] font-mono px-2 transition-colors"
+          >
+            ?
           </button>
 
           {/* Layout & Settings Menu */}
