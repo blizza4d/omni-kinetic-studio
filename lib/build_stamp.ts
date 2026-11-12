@@ -19,7 +19,7 @@ export function setRuntimeModelIds(ids: { ultra?: string; super?: string; nano?:
 
 export function getBuildStamp(): BuildStamp {
   const isProd = process.env.NODE_ENV === 'production';
-  const gitSha = process.env.NEXT_PUBLIC_GIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || '780d751';
+  const gitSha = process.env.NEXT_PUBLIC_GIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || '21378b3';
   const branch = process.env.NEXT_PUBLIC_GIT_BRANCH || process.env.VERCEL_GIT_COMMIT_REF || 'main';
 
   return BuildStampSchema.parse({
