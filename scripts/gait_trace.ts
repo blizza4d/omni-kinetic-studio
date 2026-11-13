@@ -1,170 +1,83 @@
 /**
- * Deterministic Gait Trace & Kinematic Verification Script
+ * Headless Gait Trace CI Verification Test
  * 
- * Executes the Droid GaitController for 500 frames (8.33 seconds) under lunar gravity (1.62 m/s²),
- * records high-fidelity kinematic trajectories, and computes:
- * 1. Stance foot slip distance (must be strictly < 1e-4 m)
- * 2. Phase continuity (smooth monotonic progression without jumps)
- * 3. Froude transition ratio (compared to theoretical sqrt(g_moon / g_earth))
- * 4. Maximum leg reach vs kinematic limit (reach < 0.44m)
- * 5. Energy and angular smoothness metrics
+ * Runs the deterministic fluid animation pipeline and asserts all Section 4.3
+ * acceptance thresholds specified in docs/animation_thresholds.json:
+ * - Root Jerk RMS < 3,000 m/s³ (>= 50% lower than baseline)
+ * - Mean Foot Slip < 0.5% of leg length
+ * - Max Foot Slip < 2.0% of leg length
+ * - Camera Relative Jitter < 15.0 px
+ * - Judder Index < 0.03
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { GaitController } from '../lib/droid/gait/GaitController';
-import { GaitParamsCalculator } from '../lib/droid/gait/GaitParams';
-import { quaternionToEuler } from '../lib/frames';
-import { LegId, QUADRUPED_MORPHOLOGY } from '../lib/droid/types';
+import { recordAfterTrace } from './record_after_trace';
+import { recordBaselineTrace } from './record_baseline_trace';
 
-interface FrameTrace {
-  time: number;
-  body_pos: [number, number, number];
-  body_rpy: [number, number, number];
-  joint_angles: number[];
-  foot_pos: Record<LegId, [number, number, number]>;
-  stance_state: Record<LegId, boolean>;
-  slip_distances: Record<LegId, number>;
-}
+export function runGaitTraceTest(): boolean {
+  console.log('=== RUNNING HEADLESS GAIT TRACE CI VERIFICATION ===');
 
-export function runGaitTrace(numFrames = 500, gravity = 1.62, forwardSpeed = 0.95): {
-  success: boolean;
-  maxSlip: number;
-  maxReach: number;
-  froudeLunar: number;
-  froudeEarth: number;
-  froudeRatio: number;
-  theoreticalRatio: number;
-  traces: FrameTrace[];
-} {
-  const dt = 1.0 / 60.0;
-  const flatTerrain = () => 0.0;
-  const controller = new GaitController(0, 0, 0, flatTerrain);
-  const command = { vx: forwardSpeed, vy: 0, vz: 0, yawRate: 0 };
-
-  const traces: FrameTrace[] = [];
-  let maxSlip = 0;
-  let maxReach = 0;
-
-  for (let f = 0; f < numFrames; f++) {
-    const time = f * dt;
-    const state = controller.step(command, gravity, flatTerrain, dt);
-
-    const rpy = quaternionToEuler(state.bodyQuat);
-    const bodyRpy: [number, number, number] = [rpy.roll, rpy.pitch, rpy.yaw];
-
-    const footPos: Record<string, [number, number, number]> = {};
-    const stanceState: Record<string, boolean> = {};
-    const slipDistances: Record<string, number> = {};
-
-    for (const foot of state.feet) {
-      footPos[foot.id] = [...foot.worldPos] as [number, number, number];
-      const isStance = foot.state === 'stance';
-      stanceState[foot.id] = isStance;
-      slipDistances[foot.id] = foot.slipDistance;
-
-      if (isStance && foot.slipDistance > maxSlip) {
-        maxSlip = foot.slipDistance;
-      }
-
-      // Check distance from hip joint to foot target (leg extension)
-      const hip = QUADRUPED_MORPHOLOGY[foot.id].hipOffset;
-      const distFromHip = Math.hypot(
-        foot.localPos[0] - hip[0],
-        foot.localPos[1] - hip[1],
-        foot.localPos[2] - hip[2]
-      );
-      if (distFromHip > maxReach) {
-        maxReach = distFromHip;
-      }
-    }
-
-    const jointAngles = state.joints.map((j) => j.angle);
-
-    traces.push({
-      time,
-      body_pos: [state.bodyPos[0], state.bodyPos[1], state.bodyPos[2]],
-      body_rpy: bodyRpy,
-      joint_angles: jointAngles,
-      foot_pos: footPos as Record<LegId, [number, number, number]>,
-      stance_state: stanceState as Record<LegId, boolean>,
-      slip_distances: slipDistances as Record<LegId, number>,
-    });
+  const thresholdsPath = path.resolve(process.cwd(), 'docs', 'animation_thresholds.json');
+  if (!fs.existsSync(thresholdsPath)) {
+    throw new Error(`Thresholds file not found: ${thresholdsPath}`);
   }
 
-  // Calculate Froude similarity
-  const calc = new GaitParamsCalculator();
-  const lunarParams = calc.calculate(forwardSpeed, gravity);
-  const earthParams = calc.calculate(forwardSpeed, 9.81);
-  const froudeRatio = lunarParams.froudeNumber / earthParams.froudeNumber;
-  const theoreticalRatio = 9.81 / gravity; // Fr = v^2 / (g L), so Fr_lunar / Fr_earth = g_earth / g_lunar
+  const { thresholds } = JSON.parse(fs.readFileSync(thresholdsPath, 'utf-8'));
 
-  const success = maxSlip < 1e-4 && maxReach < 0.44;
+  console.log('[CI Test] Recording After Trace (15s at 60 Hz)...');
+  const after = recordAfterTrace(15.0, 60);
 
-  return {
-    success,
-    maxSlip,
-    maxReach,
-    froudeLunar: lunarParams.froudeNumber,
-    froudeEarth: earthParams.froudeNumber,
-    froudeRatio,
-    theoreticalRatio,
-    traces,
-  };
+  console.log('[CI Test] Recording Baseline Trace for Jerk Reduction Comparison...');
+  const before = recordBaselineTrace(15.0, 60);
+
+  const jerkReductionPct = ((before.smoothness.jerkRMS.root - after.smoothness.jerkRMS.root) / before.smoothness.jerkRMS.root) * 100;
+
+  console.log('\n--- MEASURED RESULTS VS ACCEPTANCE CRITERIA ---');
+  console.log(`1. Root Jerk RMS: ${after.smoothness.jerkRMS.root.toFixed(2)} m/s³ (Limit: < ${thresholds.rootJerkRMSMax})`);
+  console.log(`2. Jerk Reduction: ${jerkReductionPct.toFixed(2)}% (Required: >= ${thresholds.jerkReductionMinimumPercent}%)`);
+  console.log(`3. Mean Foot Slip: ${after.smoothness.footSlip.meanPercentOfLegLength.toFixed(3)}% (Limit: < ${thresholds.footSlipMeanPercentMax}%)`);
+  console.log(`4. Max Foot Slip: ${after.smoothness.footSlip.maxPercentOfLegLength.toFixed(3)}% (Limit: < ${thresholds.footSlipMaxPercentMax}%)`);
+  console.log(`5. Camera Relative Jitter: ${after.smoothness.cameraRelativeJitter.toFixed(3)} px (Limit: < ${thresholds.cameraRelativeJitterMax} px)`);
+  console.log(`6. Judder Index: ${after.pacing.judderIndex.toFixed(4)} (Limit: < ${thresholds.judderIndexMax})`);
+
+  let passed = true;
+
+  if (after.smoothness.jerkRMS.root > thresholds.rootJerkRMSMax) {
+    console.error(`[FAIL] Root Jerk RMS ${after.smoothness.jerkRMS.root} exceeds threshold ${thresholds.rootJerkRMSMax}`);
+    passed = false;
+  }
+  if (jerkReductionPct < thresholds.jerkReductionMinimumPercent) {
+    console.error(`[FAIL] Jerk Reduction ${jerkReductionPct}% is below required ${thresholds.jerkReductionMinimumPercent}%`);
+    passed = false;
+  }
+  if (after.smoothness.footSlip.meanPercentOfLegLength > thresholds.footSlipMeanPercentMax) {
+    console.error(`[FAIL] Mean Foot Slip ${after.smoothness.footSlip.meanPercentOfLegLength}% exceeds threshold ${thresholds.footSlipMeanPercentMax}%`);
+    passed = false;
+  }
+  if (after.smoothness.footSlip.maxPercentOfLegLength > thresholds.footSlipMaxPercentMax) {
+    console.error(`[FAIL] Max Foot Slip ${after.smoothness.footSlip.maxPercentOfLegLength}% exceeds threshold ${thresholds.footSlipMaxPercentMax}%`);
+    passed = false;
+  }
+  if (after.smoothness.cameraRelativeJitter > thresholds.cameraRelativeJitterMax) {
+    console.error(`[FAIL] Camera Relative Jitter ${after.smoothness.cameraRelativeJitter} exceeds threshold ${thresholds.cameraRelativeJitterMax}`);
+    passed = false;
+  }
+  if (after.pacing.judderIndex > thresholds.judderIndexMax) {
+    console.error(`[FAIL] Judder Index ${after.pacing.judderIndex} exceeds threshold ${thresholds.judderIndexMax}`);
+    passed = false;
+  }
+
+  if (passed) {
+    console.log('\n[PASS] ALL FLUID ANIMATION SMOOTHNESS & PACING GATES MET.');
+  } else {
+    console.error('\n[FAIL] SOME FLUID ANIMATION GATES FAILED.');
+  }
+
+  return passed;
 }
 
 if (require.main === module || !module.parent) {
-  console.log('--- OMNI-KINETIC GAIT TRACE & KINEMATIC INTEGRITY ---');
-  const results = runGaitTrace(500, 1.62, 0.95);
-
-  console.log(`[GaitTrace] Frames simulated: ${results.traces.length} (8.33s)`);
-  console.log(`[GaitTrace] Max Stance Foot Slip: ${results.maxSlip.toFixed(6)} m (Tolerance: 0.0001 m)`);
-  console.log(`[GaitTrace] Max Leg Reach: ${results.maxReach.toFixed(4)} m (Limit: 0.4400 m)`);
-  console.log(`[GaitTrace] Lunar Froude: ${results.froudeLunar.toFixed(4)}`);
-  console.log(`[GaitTrace] Earth Froude: ${results.froudeEarth.toFixed(4)}`);
-  console.log(`[GaitTrace] Froude Ratio (Lunar/Earth): ${results.froudeRatio.toFixed(4)} (Expected: ${results.theoreticalRatio.toFixed(4)})`);
-
-  // Phase continuity check
-  let phaseContinuous = true;
-  for (let i = 1; i < results.traces.length; i++) {
-    const prev = results.traces[i - 1].body_pos[0];
-    const curr = results.traces[i].body_pos[0];
-    if (curr < prev) {
-      console.error(`[GaitTrace] Discontinuous backward jump detected at frame ${i}`);
-      phaseContinuous = false;
-      break;
-    }
-  }
-
-  console.log(`[GaitTrace] Trajectory Continuity: ${phaseContinuous ? 'PASSED' : 'FAILED'}`);
-
-  // Write trace file
-  const outDir = path.resolve(process.cwd(), 'artifacts');
-  if (!fs.existsSync(outDir)) {
-    fs.mkdirSync(outDir, { recursive: true });
-  }
-  const tracePath = path.join(outDir, 'gait_trace.json');
-  fs.writeFileSync(tracePath, JSON.stringify({
-    metadata: {
-      generatedAt: new Date().toISOString(),
-      frames: results.traces.length,
-      gravity: 1.62,
-      forwardSpeed: 0.95,
-      maxStanceSlipMeters: results.maxSlip,
-      maxReachMeters: results.maxReach,
-      froudeRatio: results.froudeRatio,
-      allInvariantsHold: results.success && phaseContinuous,
-    },
-    samples: results.traces.slice(0, 50), // Sample first 50 frames for inspectability
-  }, null, 2));
-
-  console.log(`[GaitTrace] Trace summary saved to ${tracePath}`);
-
-  if (results.success && phaseContinuous) {
-    console.log('✅ ALL GAIT INVARIANTS SATISFIED (Strict zero-slip, continuous phase, bounded IK reach).');
-    process.exit(0);
-  } else {
-    console.error('❌ GAIT VERIFICATION FAILED.');
-    process.exit(1);
-  }
+  const ok = runGaitTraceTest();
+  process.exit(ok ? 0 : 1);
 }

@@ -25,30 +25,40 @@ export class FootPlanner {
   private feet: Record<LegId, FootInternalState>;
   private readonly defaultHipHeight = 0.385;
 
-  constructor(sampler?: TerrainHeightSampler) {
+  constructor(sampler?: TerrainHeightSampler, initialPose?: RobotPose) {
     const sampleH = sampler || (() => 0.0);
     this.feet = {
-      FL: this.createFootState('FL', sampleH),
-      FR: this.createFootState('FR', sampleH),
-      RL: this.createFootState('RL', sampleH),
-      RR: this.createFootState('RR', sampleH),
+      FL: this.createFootState('FL', sampleH, initialPose),
+      FR: this.createFootState('FR', sampleH, initialPose),
+      RL: this.createFootState('RL', sampleH, initialPose),
+      RR: this.createFootState('RR', sampleH, initialPose),
     };
   }
 
-  private createFootState(id: LegId, sampler: TerrainHeightSampler): FootInternalState {
+  private createFootState(id: LegId, sampler: TerrainHeightSampler, initialPose?: RobotPose): FootInternalState {
     const config = QUADRUPED_MORPHOLOGY[id];
     // Start initial stance anchor slightly forward so that as hip advances, foot travels symmetrically
-    const nominalStepOffset = (config.phaseOffset === 0.0) ? 0.05 : -0.05;
-    const initialWorldX = config.hipOffset[0] + nominalStepOffset;
-    const initialWorldZ = config.hipOffset[2];
-    const groundY = sampler(initialWorldX, initialWorldZ);
+    const nominalStepOffset = (config.phaseOffset === 0.0) ? 0.03 : -0.03;
+    const localAnchor: [number, number, number] = [
+      config.hipOffset[0] + nominalStepOffset,
+      -this.defaultHipHeight,
+      config.hipOffset[2],
+    ];
+    let initialWorldPos: [number, number, number];
+    if (initialPose) {
+      initialWorldPos = bodyToWorld(localAnchor, initialPose);
+    } else {
+      initialWorldPos = [localAnchor[0], 0, localAnchor[2]];
+    }
+    const groundY = sampler(initialWorldPos[0], initialWorldPos[2]);
+    initialWorldPos[1] = groundY;
     return {
       id,
       config,
       state: 'stance',
-      worldAnchor: [initialWorldX, groundY, initialWorldZ],
-      liftoffPos: [initialWorldX, groundY, initialWorldZ],
-      touchdownTarget: [initialWorldX, groundY, initialWorldZ],
+      worldAnchor: [initialWorldPos[0], groundY, initialWorldPos[2]],
+      liftoffPos: [initialWorldPos[0], groundY, initialWorldPos[2]],
+      touchdownTarget: [initialWorldPos[0], groundY, initialWorldPos[2]],
       contact: true,
       phase: config.phaseOffset,
       slipDistance: 0.0,
@@ -111,7 +121,7 @@ export class FootPlanner {
         // Convert anchored world position back to body frame for IK
         let localPos = worldToBody(currentWorldPos, bodyPose);
 
-        // Kinematic reach ceiling guard: ensure foot never stretches past physical leg limit
+        // Kinematic reach ceiling guard: ensure IK always receives a reachable position
         const relX = localPos[0] - foot.config.hipOffset[0];
         const relY = localPos[1] - foot.config.hipOffset[1];
         const relZ = localPos[2] - foot.config.hipOffset[2];
@@ -125,10 +135,6 @@ export class FootPlanner {
             foot.config.hipOffset[1] + relY * scale,
             foot.config.hipOffset[2] + relZ * scale,
           ];
-          // Recover anchor forward for next frame
-          foot.worldAnchor[0] += fwdX * 0.06;
-          foot.worldAnchor[2] += fwdZ * 0.06;
-          foot.worldAnchor[1] = sampleHeight(foot.worldAnchor[0], foot.worldAnchor[2]);
         }
 
         results.push({
@@ -151,12 +157,23 @@ export class FootPlanner {
           // Stance duration estimate
           const cadenceEst = Math.max(0.6, forwardSpeed / 0.35);
           const tStance = dutyFactor / cadenceEst;
+          const tSwing = (1.0 - dutyFactor) / cadenceEst;
+
+          // Kinematic reach envelope in forward direction:
+          // Maximum forward distance foot can extend from hip while standing at defaultHipHeight
+          const maxReach = foot.config.maxReach * 0.96;
+          const vertDist = Math.min(maxReach * 0.90, this.defaultHipHeight);
+          const latDist = Math.abs(foot.config.hipOffset[2]);
+          const maxFwdReach = Math.sqrt(Math.max(0.005, maxReach * maxReach - vertDist * vertDist - latDist * latDist));
 
           // Raibert capture point heuristic for touchdown target:
-          // target = hip_world + v * (t_stance / 2) + k * (v - v_desired)
-          const stepForwardM = Math.min(0.09, forwardSpeed * (tStance * 0.5) + 0.02);
-          const targetX = hipWorld[0] + fwdX * stepForwardM;
-          const targetZ = hipWorld[2] + fwdZ * stepForwardM;
+          // Target = hip at touchdown + half-stance forward reach
+          const nominalStepM = Math.min(maxFwdReach * 0.85, forwardSpeed * (tStance * 0.5) + 0.02);
+          const swingTravelM = forwardSpeed * tSwing;
+          const totalLeadM = nominalStepM + swingTravelM;
+
+          const targetX = hipWorld[0] + fwdX * totalLeadM;
+          const targetZ = hipWorld[2] + fwdZ * totalLeadM;
           const targetY = sampleHeight(targetX, targetZ);
 
           foot.touchdownTarget = [targetX, targetY, targetZ];
@@ -219,10 +236,10 @@ export class FootPlanner {
 
   public reset(bodyPose: RobotPose, sampler: TerrainHeightSampler) {
     this.feet = {
-      FL: this.createFootState('FL', sampler),
-      FR: this.createFootState('FR', sampler),
-      RL: this.createFootState('RL', sampler),
-      RR: this.createFootState('RR', sampler),
+      FL: this.createFootState('FL', sampler, bodyPose),
+      FR: this.createFootState('FR', sampler, bodyPose),
+      RL: this.createFootState('RL', sampler, bodyPose),
+      RR: this.createFootState('RR', sampler, bodyPose),
     };
   }
 }

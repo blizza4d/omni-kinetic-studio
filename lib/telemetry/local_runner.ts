@@ -35,7 +35,15 @@ export class LocalSimulationRunner {
     this.fps = fps;
     this.dt = 1.0 / fps;
     this.iteration = iteration;
-    this.gaitController = new GaitController(0, 0, this.robotHeading);
+    const initialTerrainSampler = (x: number, z: number) => getTerrainHeight(x, z, {
+      seed: 42,
+      width: 40,
+      length: 40,
+      segments: 128,
+      roughness: 0.65,
+      amplitude: 1.8,
+    });
+    this.gaitController = new GaitController(0, 0, this.robotHeading, initialTerrainSampler);
     this.loadBundledFixtures();
   }
 
@@ -77,19 +85,6 @@ export class LocalSimulationRunner {
     const t = stepIndex * this.dt;
 
     // Handle episode reset if previous step triggered out-of-bounds or goal
-    if (this.needsResetNextStep) {
-      this.currentEpisode++;
-      this.episodeStep = 0;
-      this.robotX = this.envSpec?.spawn?.pos?.[0] ?? 0;
-      this.robotZ = this.envSpec?.spawn?.pos?.[2] ?? 0;
-      const initialGoalX = this.envSpec?.goal?.pos?.[0] ?? 14.0;
-      const initialGoalZ = this.envSpec?.goal?.pos?.[2] ?? -10.0;
-      this.robotHeading = Math.atan2(-(initialGoalZ - this.robotZ), initialGoalX - this.robotX);
-      this.needsResetNextStep = false;
-      this.resetReason = null;
-      this.gaitController.reset(this.robotX, this.robotZ, this.robotHeading);
-    }
-
     const terrainConfig: TerrainConfig = {
       seed: this.envSpec?.terrain?.seed ?? 42,
       width: this.envSpec?.terrain?.bounds?.[0] ?? 40,
@@ -100,6 +95,19 @@ export class LocalSimulationRunner {
     };
 
     const terrainSampler = (x: number, z: number) => getTerrainHeight(x, z, terrainConfig);
+
+    if (this.needsResetNextStep) {
+      this.currentEpisode++;
+      this.episodeStep = 0;
+      this.robotX = this.envSpec?.spawn?.pos?.[0] ?? 0;
+      this.robotZ = this.envSpec?.spawn?.pos?.[2] ?? 0;
+      const initialGoalX = this.envSpec?.goal?.pos?.[0] ?? 14.0;
+      const initialGoalZ = this.envSpec?.goal?.pos?.[2] ?? -10.0;
+      this.robotHeading = Math.atan2(-(initialGoalZ - this.robotZ), initialGoalX - this.robotX);
+      this.needsResetNextStep = false;
+      this.resetReason = null;
+      this.gaitController.reset(this.robotX, this.robotZ, this.robotHeading, terrainSampler);
+    }
 
     const isRetrained = this.iteration >= 2 || this.hasDemonstrations;
     const policyBoost = isRetrained ? 1.24 : 1.0;
@@ -205,7 +213,7 @@ export class LocalSimulationRunner {
     // Convert foot targets to TelemetryFrame format
     const feet = kinematicState.feet.map((f) => ({
       id: f.id,
-      pos: [Number(f.worldPos[0].toFixed(4)), Number(f.worldPos[1].toFixed(4)), Number(f.worldPos[2].toFixed(4))] as [number, number, number],
+      pos: [f.worldPos[0], f.worldPos[1], f.worldPos[2]] as [number, number, number],
       contact: f.contact,
     }));
 
@@ -250,7 +258,7 @@ export class LocalSimulationRunner {
       bodies: [
         {
           id: 'torso',
-          pos: [Number(this.robotX.toFixed(4)), Number(y.toFixed(4)), Number(this.robotZ.toFixed(4))],
+          pos: [this.robotX, y, this.robotZ],
           quat: kinematicState.bodyQuat,
           vel: [
             Number((fwdX * forwardSpeed).toFixed(3)),

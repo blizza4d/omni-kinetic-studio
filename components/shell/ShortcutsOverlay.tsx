@@ -18,6 +18,7 @@ export default function ShortcutsOverlay({ isOpen, onClose }: ShortcutsOverlayPr
         { key: 'Ctrl+K / Cmd+K', label: 'Command Palette / Task Prompt input' },
         { key: '?', label: 'Open this keyboard shortcuts cheat sheet' },
         { key: 'P', label: 'Toggle PerfProbe diagnostics panel' },
+        { key: 'G', label: 'Toggle GaitLab procedural animation tuner & A/B comparison' },
         { key: 'Q', label: 'Cycle active Quality Tier (Ultra -> Potato)' },
         { key: 'Ctrl+B', label: 'Toggle left Architect log panel' },
         { key: 'J', label: 'Launch 3-minute scripted Judge Mode tour' },

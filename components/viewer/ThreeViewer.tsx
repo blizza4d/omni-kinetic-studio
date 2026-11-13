@@ -13,6 +13,9 @@ import { parseFeatureToggles } from '@/lib/perf/toggles';
 import { TelemetryStore } from '@/lib/telemetry/store';
 import { formatGravityDisplay } from '@/lib/spec/gravity';
 import { LunarDustSystem } from '@/lib/droid/fx/DustPuffs';
+import { TelemetryJitterBuffer, InterpolatedFrame } from '@/lib/telemetry/jitter_buffer';
+import { FramePacer } from '@/lib/sim/framePacer';
+import { FollowCameraRig } from '@/lib/camera/follow_camera';
 
 export type CameraPreset = 'chase' | 'top' | 'side' | 'free';
 export type QualityTier = 'ultra' | 'high' | 'medium' | 'low' | 'potato';
@@ -29,6 +32,7 @@ interface ThreeViewerProps {
   showDustParticles?: boolean;
   showGhostComparison?: boolean;
   adaptiveQuality?: boolean;
+  isNewAnimation?: boolean;
   onCollisionDetected?: (collision: any) => void;
   onFpsUpdate?: (fps: number, frameTimeMs: number) => void;
   onBoundaryWarning?: (state: 'soft' | 'hard' | 'out', distToEdge: number) => void;
@@ -47,6 +51,7 @@ export default function ThreeViewer({
   showDustParticles = true,
   showGhostComparison = false,
   adaptiveQuality = true,
+  isNewAnimation = true,
   onCollisionDetected,
   onFpsUpdate,
   onBoundaryWarning,
@@ -97,11 +102,16 @@ export default function ThreeViewer({
   const showGhostComparisonRef = useRef(showGhostComparison);
   const showColliderDebugRef = useRef(showColliderDebug);
   const currentFrameRef = useRef(currentFrame);
+  const isNewAnimationRef = useRef(isNewAnimation);
   const onBoundaryWarningRef = useRef(onBoundaryWarning);
   const onCollisionDetectedRef = useRef(onCollisionDetected);
   const onEpisodeResetRef = useRef(onEpisodeReset);
 
   // Keep references updated with zero React re-render churn
+  useEffect(() => {
+    isNewAnimationRef.current = isNewAnimation;
+  }, [isNewAnimation]);
+
   useEffect(() => {
     latestTeleopRef.current = teleopCommand ?? null;
   }, [teleopCommand]);
@@ -399,13 +409,66 @@ export default function ThreeViewer({
     let radarSweepAngle = 0;
     let shadowUpdateFrame = 0;
 
+    // --- FLUID ANIMATION FOUNDATION INSTANCES ---
+    const pacer = new FramePacer();
+    const jitterBuffer = new TelemetryJitterBuffer();
+    const cameraRig = new FollowCameraRig();
+    const interpFrame: InterpolatedFrame = {
+      time: 0,
+      pos: [0, 0.45, 0],
+      quat: [0, 0, 0, 1],
+      joints: {},
+      feet: [
+        { id: 'FL', pos: [0.24, 0, -0.15], contact: true },
+        { id: 'FR', pos: [0.24, 0, 0.15], contact: true },
+        { id: 'RL', pos: [-0.24, 0, -0.15], contact: true },
+        { id: 'RR', pos: [-0.24, 0, 0.15], contact: true },
+      ],
+      isHold: false,
+    };
+
+    // Pre-populate jitter buffer with historical frames from store
+    const existingHistory = store.getHistory();
+    if (existingHistory && existingHistory.length > 0) {
+      jitterBuffer.pushFrames(existingHistory.slice(-30) as TelemetryFrame[]);
+    }
+
+    // Subscribe to incoming stream batches
+    const unsubStore = store.onBatch((frames) => {
+      jitterBuffer.pushFrames(frames);
+    });
+
+    // Pre-warm shaders
+    try {
+      if ((renderer as any).compileAsync) {
+        (renderer as any).compileAsync(scene, camera).catch(() => {});
+      } else {
+        renderer.compile(scene, camera);
+      }
+    } catch {}
+
+    // Register test hook
+    if (typeof window !== 'undefined') {
+      (window as any).__omniDebug = {
+        getJitterBuffer: () => jitterBuffer,
+        getPacer: () => pacer,
+        getCameraRig: () => cameraRig,
+        toggleAnimation: () => {
+          isNewAnimationRef.current = !isNewAnimationRef.current;
+          return isNewAnimationRef.current;
+        },
+        isNewAnimation: () => isNewAnimationRef.current,
+      };
+    }
+
     // Single Animation Scheduler Loop
     const animate = () => {
       animationFrameId = requestAnimationFrame(animate);
 
       const now = performance.now();
-      const dt = Math.min(0.1, (now - lastTime) / 1000);
+      const rawDt = Math.min(0.1, (now - lastTime) / 1000);
       lastTime = now;
+      const dt = pacer.tick(now);
 
       // Record frame timing in PerfProbe
       probe.recordFrame(now);
@@ -426,146 +489,274 @@ export default function ThreeViewer({
         dustParticlesRef.current.position.y = (now * 0.00018) % 3.0;
       }
 
-      // Read latest frame directly from TelemetryStore (Zero React Re-render!)
-      const frame = store.getLatestFrame() || currentFrameRef.current;
-      const teleop = latestTeleopRef.current;
       const preset = cameraPresetRef.current;
-
+      const isNewAnim = isNewAnimationRef.current;
       const robotPos = new THREE.Vector3(0, 0.45, 0);
+      const robotVel: [number, number, number] = [0, 0, 0];
+      let frameCollisions: any[] | undefined = undefined;
 
-      if (robotGroupRef.current && frame?.bodies && frame.bodies.length > 0) {
-        const torso = frame.bodies.find((b) => b.id === 'torso') || frame.bodies[0];
+      if (isNewAnim) {
+        // --- NEW FLUID ANIMATION PIPELINE ---
+        jitterBuffer.advance(dt, 1.0);
+        const hasInterp = jitterBuffer.sample(interpFrame);
 
-        // 1. Ingestion Sanitization: clamp viewer position to arena envelope
-        const sanitized = sanitizeViewerPosition([torso.pos[0], torso.pos[1], torso.pos[2]], DEFAULT_ARENA);
-        robotGroupRef.current.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
-        robotGroupRef.current.quaternion.set(torso.quat[0], torso.quat[1], torso.quat[2], torso.quat[3]);
-        robotPos.copy(robotGroupRef.current.position);
+        if (robotGroupRef.current && hasInterp) {
+          const sanitized = sanitizeViewerPosition(
+            [interpFrame.pos[0], interpFrame.pos[1], interpFrame.pos[2]],
+            DEFAULT_ARENA
+          );
+          robotGroupRef.current.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
+          robotGroupRef.current.quaternion.set(
+            interpFrame.quat[0],
+            interpFrame.quat[1],
+            interpFrame.quat[2],
+            interpFrame.quat[3]
+          );
+          robotPos.copy(robotGroupRef.current.position);
 
-        // Update terrain rim shader proximity uniform
-        const robotDistToEdge = Math.max(0, DEFAULT_ARENA.halfExtent - Math.max(Math.abs(robotPos.x), Math.abs(robotPos.z)));
-        if (terrainUniformsRef.current) {
-          terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
-        }
-
-        // 2. Articulated joints update (Correct pitch axis along Z; roll along X)
-        const joints = jointMeshesRef.current;
-        for (const j of frame.joints) {
-          const group = joints[j.name];
-          if (group) {
-            if (j.name.includes('hip')) group.rotation.x = j.angle; // Lateral roll
-            if (j.name.includes('thigh')) group.rotation.z = -j.angle; // Sagittal pitch swing forward/back
-            if (j.name.includes('calf')) group.rotation.z = j.angle; // Sagittal pitch knee flexion
+          // Update terrain rim shader proximity uniform
+          const robotDistToEdge = Math.max(
+            0,
+            DEFAULT_ARENA.halfExtent - Math.max(Math.abs(robotPos.x), Math.abs(robotPos.z))
+          );
+          if (terrainUniformsRef.current) {
+            terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
           }
-        }
 
-        // Foot Contact Blobs update (Sage when planted, cream-dim when swinging)
-        if (frame.feet && frame.feet.length > 0 && footBlobsRef.current.length === 4) {
-          for (let fi = 0; fi < frame.feet.length; fi++) {
-            const foot = frame.feet[fi];
-            const blob = footBlobsRef.current[fi];
-            if (blob) {
-              blob.position.set(foot.pos[0], foot.pos[1] + 0.012, foot.pos[2]);
-              const bMat = blob.material as THREE.MeshBasicMaterial;
-              bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
-              bMat.opacity = foot.contact ? 0.85 : 0.22;
-            }
-
-            // Emit ballistic dust puff on touchdown transition
-            const wasContact = prevFootContactsRef.current[fi];
-            if (foot.contact && !wasContact && lunarDustRef.current) {
-              lunarDustRef.current.emit(foot.pos, 5);
-            }
-            prevFootContactsRef.current[fi] = foot.contact;
-          }
-        }
-
-        // 3. Translucent Ghost comparison
-        if (showGhostComparisonRef.current && ghostRobotGroupRef.current) {
-          ghostRobotGroupRef.current.position.set(robotPos.x * 0.86, robotPos.y, robotPos.z);
-          for (const j of frame.joints) {
-            const group = ghostJointMeshesRef.current[j.name];
+          // Articulated joints update
+          const joints = jointMeshesRef.current;
+          for (const [name, angle] of Object.entries(interpFrame.joints)) {
+            const group = joints[name];
             if (group) {
-              if (j.name.includes('hip')) group.rotation.x = j.angle * 0.85;
-              if (j.name.includes('thigh')) group.rotation.z = -j.angle * 0.85;
-              if (j.name.includes('calf')) group.rotation.z = j.angle * 0.85;
+              if (name.includes('hip')) group.rotation.x = angle;
+              if (name.includes('thigh')) group.rotation.z = -angle;
+              if (name.includes('calf')) group.rotation.z = angle;
             }
           }
-        }
 
-        // 4. Preallocated Trail update
-        const trailBuf = trailBufferRef.current;
-        const head = trailHeadRef.current;
-        trailBuf[head * 3] = robotPos.x;
-        trailBuf[head * 3 + 1] = robotPos.y + 0.05;
-        trailBuf[head * 3 + 2] = robotPos.z;
-        trailHeadRef.current = (head + 1) % maxTrailPoints;
-        if (trailCountRef.current < maxTrailPoints) trailCountRef.current++;
+          // Feet & Contact Blobs update
+          if (interpFrame.feet && interpFrame.feet.length > 0 && footBlobsRef.current.length === 4) {
+            for (let fi = 0; fi < interpFrame.feet.length; fi++) {
+              const foot = interpFrame.feet[fi];
+              const blob = footBlobsRef.current[fi];
+              if (blob) {
+                blob.position.set(foot.pos[0], foot.pos[1] + 0.012, foot.pos[2]);
+                const bMat = blob.material as THREE.MeshBasicMaterial;
+                bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
+                bMat.opacity = foot.contact ? 0.85 : 0.22;
+              }
 
-        if (trailLineRef.current) {
-          const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
-          attr.needsUpdate = true;
-          trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
-        }
-
-        // 5. Boundary Warning & Rim Pulse
-        const distFromCenter = Math.hypot(robotPos.x, robotPos.z);
-        if (distFromCenter > 16.0 && boundaryRimMatRef.current) {
-          const pulse = (Math.sin(now * 0.005) + 1.0) * 0.5;
-          boundaryRimMatRef.current.color.setRGB(0.72 + pulse * 0.28, 0.23, 0.18); // brick glow
-          if (onBoundaryWarningRef.current) onBoundaryWarningRef.current(distFromCenter > 20.0 ? 'out' : 'soft', Math.max(0, 18.0 - distFromCenter));
-        } else if (boundaryRimMatRef.current) {
-          boundaryRimMatRef.current.color.set(0xfdfbf7); // cream default
-        }
-
-        // 6. Handle Episode Resets
-        if (frame.episodeEvent && onEpisodeResetRef.current) {
-          onEpisodeResetRef.current(frame.episodeEvent);
-        }
-
-        // 7. Collision Flash
-        if (frame.collisions && frame.collisions.length > 0) {
-          const col = frame.collisions[0];
-          if (collisionFlashRef.current) {
-            collisionFlashRef.current.position.set(col.point[0], 0.05, -col.point[1]);
-            (collisionFlashRef.current.material as THREE.MeshBasicMaterial).opacity = 0.95;
+              const wasContact = prevFootContactsRef.current[fi];
+              if (foot.contact && !wasContact && lunarDustRef.current) {
+                lunarDustRef.current.emit(foot.pos, 5);
+              }
+              prevFootContactsRef.current[fi] = foot.contact;
+            }
           }
-          if (onCollisionDetectedRef.current) onCollisionDetectedRef.current(col);
-        } else if (collisionFlashRef.current) {
-          const mat = collisionFlashRef.current.material as THREE.MeshBasicMaterial;
-          mat.opacity = Math.max(0, mat.opacity - dt * 2.8);
+
+          // Translucent Ghost comparison
+          if (showGhostComparisonRef.current && ghostRobotGroupRef.current) {
+            ghostRobotGroupRef.current.position.set(robotPos.x * 0.86, robotPos.y, robotPos.z);
+            for (const [name, angle] of Object.entries(interpFrame.joints)) {
+              const group = ghostJointMeshesRef.current[name];
+              if (group) {
+                if (name.includes('hip')) group.rotation.x = angle * 0.85;
+                if (name.includes('thigh')) group.rotation.z = -angle * 0.85;
+                if (name.includes('calf')) group.rotation.z = angle * 0.85;
+              }
+            }
+          }
+
+          // Preallocated Trail update
+          const trailBuf = trailBufferRef.current;
+          const head = trailHeadRef.current;
+          trailBuf[head * 3] = robotPos.x;
+          trailBuf[head * 3 + 1] = robotPos.y + 0.05;
+          trailBuf[head * 3 + 2] = robotPos.z;
+          trailHeadRef.current = (head + 1) % maxTrailPoints;
+          if (trailCountRef.current < maxTrailPoints) trailCountRef.current++;
+
+          if (trailLineRef.current) {
+            const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
+            attr.needsUpdate = true;
+            trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
+          }
+
+          // Boundary Warning & Rim Pulse
+          const distFromCenter = Math.hypot(robotPos.x, robotPos.z);
+          if (distFromCenter > 16.0 && boundaryRimMatRef.current) {
+            const pulse = (Math.sin(now * 0.005) + 1.0) * 0.5;
+            boundaryRimMatRef.current.color.setRGB(0.72 + pulse * 0.28, 0.23, 0.18);
+            if (onBoundaryWarningRef.current) {
+              onBoundaryWarningRef.current(
+                distFromCenter > 20.0 ? 'out' : 'soft',
+                Math.max(0, 18.0 - distFromCenter)
+              );
+            }
+          } else if (boundaryRimMatRef.current) {
+            boundaryRimMatRef.current.color.set(0xfdfbf7);
+          }
+
+          // Episode Resets
+          if (interpFrame.episodeEvent && onEpisodeResetRef.current) {
+            onEpisodeResetRef.current(interpFrame.episodeEvent);
+          }
+
+          // Collision Flash
+          frameCollisions = interpFrame.collisions;
+          if (frameCollisions && frameCollisions.length > 0) {
+            const col = frameCollisions[0];
+            if (collisionFlashRef.current) {
+              collisionFlashRef.current.position.set(col.point[0], 0.05, -col.point[1]);
+              (collisionFlashRef.current.material as THREE.MeshBasicMaterial).opacity = 0.95;
+            }
+            if (onCollisionDetectedRef.current) onCollisionDetectedRef.current(col);
+          } else if (collisionFlashRef.current) {
+            const mat = collisionFlashRef.current.material as THREE.MeshBasicMaterial;
+            mat.opacity = Math.max(0, mat.opacity - dt * 2.8);
+          }
+        }
+      } else {
+        // --- LEGACY BASELINE PIPELINE (for A/B comparison) ---
+        const frame = store.getLatestFrame() || currentFrameRef.current;
+
+        if (robotGroupRef.current && frame?.bodies && frame.bodies.length > 0) {
+          const torso = frame.bodies.find((b) => b.id === 'torso') || frame.bodies[0];
+
+          const sanitized = sanitizeViewerPosition([torso.pos[0], torso.pos[1], torso.pos[2]], DEFAULT_ARENA);
+          robotGroupRef.current.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
+          robotGroupRef.current.quaternion.set(torso.quat[0], torso.quat[1], torso.quat[2], torso.quat[3]);
+          robotPos.copy(robotGroupRef.current.position);
+
+          const robotDistToEdge = Math.max(0, DEFAULT_ARENA.halfExtent - Math.max(Math.abs(robotPos.x), Math.abs(robotPos.z)));
+          if (terrainUniformsRef.current) {
+            terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
+          }
+
+          const joints = jointMeshesRef.current;
+          for (const j of frame.joints) {
+            const group = joints[j.name];
+            if (group) {
+              if (j.name.includes('hip')) group.rotation.x = j.angle;
+              if (j.name.includes('thigh')) group.rotation.z = -j.angle;
+              if (j.name.includes('calf')) group.rotation.z = j.angle;
+            }
+          }
+
+          if (frame.feet && frame.feet.length > 0 && footBlobsRef.current.length === 4) {
+            for (let fi = 0; fi < frame.feet.length; fi++) {
+              const foot = frame.feet[fi];
+              const blob = footBlobsRef.current[fi];
+              if (blob) {
+                blob.position.set(foot.pos[0], foot.pos[1] + 0.012, foot.pos[2]);
+                const bMat = blob.material as THREE.MeshBasicMaterial;
+                bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
+                bMat.opacity = foot.contact ? 0.85 : 0.22;
+              }
+
+              const wasContact = prevFootContactsRef.current[fi];
+              if (foot.contact && !wasContact && lunarDustRef.current) {
+                lunarDustRef.current.emit(foot.pos, 5);
+              }
+              prevFootContactsRef.current[fi] = foot.contact;
+            }
+          }
+
+          if (showGhostComparisonRef.current && ghostRobotGroupRef.current) {
+            ghostRobotGroupRef.current.position.set(robotPos.x * 0.86, robotPos.y, robotPos.z);
+            for (const j of frame.joints) {
+              const group = ghostJointMeshesRef.current[j.name];
+              if (group) {
+                if (j.name.includes('hip')) group.rotation.x = j.angle * 0.85;
+                if (j.name.includes('thigh')) group.rotation.z = -j.angle * 0.85;
+                if (j.name.includes('calf')) group.rotation.z = j.angle * 0.85;
+              }
+            }
+          }
+
+          const trailBuf = trailBufferRef.current;
+          const head = trailHeadRef.current;
+          trailBuf[head * 3] = robotPos.x;
+          trailBuf[head * 3 + 1] = robotPos.y + 0.05;
+          trailBuf[head * 3 + 2] = robotPos.z;
+          trailHeadRef.current = (head + 1) % maxTrailPoints;
+          if (trailCountRef.current < maxTrailPoints) trailCountRef.current++;
+
+          if (trailLineRef.current) {
+            const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
+            attr.needsUpdate = true;
+            trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
+          }
+
+          const distFromCenter = Math.hypot(robotPos.x, robotPos.z);
+          if (distFromCenter > 16.0 && boundaryRimMatRef.current) {
+            const pulse = (Math.sin(now * 0.005) + 1.0) * 0.5;
+            boundaryRimMatRef.current.color.setRGB(0.72 + pulse * 0.28, 0.23, 0.18);
+            if (onBoundaryWarningRef.current) onBoundaryWarningRef.current(distFromCenter > 20.0 ? 'out' : 'soft', Math.max(0, 18.0 - distFromCenter));
+          } else if (boundaryRimMatRef.current) {
+            boundaryRimMatRef.current.color.set(0xfdfbf7);
+          }
+
+          if (frame.episodeEvent && onEpisodeResetRef.current) {
+            onEpisodeResetRef.current(frame.episodeEvent);
+          }
+
+          frameCollisions = frame.collisions;
+          if (frameCollisions && frameCollisions.length > 0) {
+            const col = frameCollisions[0];
+            if (collisionFlashRef.current) {
+              collisionFlashRef.current.position.set(col.point[0], 0.05, -col.point[1]);
+              (collisionFlashRef.current.material as THREE.MeshBasicMaterial).opacity = 0.95;
+            }
+            if (onCollisionDetectedRef.current) onCollisionDetectedRef.current(col);
+          } else if (collisionFlashRef.current) {
+            const mat = collisionFlashRef.current.material as THREE.MeshBasicMaterial;
+            mat.opacity = Math.max(0, mat.opacity - dt * 2.8);
+          }
         }
       }
 
-      // Camera Rig & Target Clamping (Camera never looks into void!)
+      // Camera Rig & Target Clamping
       const maxCameraEnvelope = DEFAULT_ARENA.halfExtent + 1.0;
       const clampedLookX = Math.max(-maxCameraEnvelope, Math.min(maxCameraEnvelope, robotPos.x));
       const clampedLookZ = Math.max(-maxCameraEnvelope, Math.min(maxCameraEnvelope, robotPos.z));
 
-      camera.up.set(0, 1, 0); // Strict roll lock to World Y-up: horizon is always level
-
-      if (preset === 'top') {
-        camera.position.set(clampedLookX, robotPos.y + 8.5, clampedLookZ);
-        camera.lookAt(clampedLookX, robotPos.y, clampedLookZ);
-      } else if (preset === 'side') {
-        camera.position.set(clampedLookX, robotPos.y + 1.2, clampedLookZ + 4.5);
-        camera.lookAt(clampedLookX, robotPos.y + 0.3, clampedLookZ);
+      if (isNewAnim) {
+        // --- NEW FLUID CAMERA RIG (Critically damped springs, look-ahead, terrain clearance, roll-locked) ---
+        cameraRig.update(
+          camera,
+          [clampedLookX, robotPos.y, clampedLookZ],
+          robotVel,
+          preset === 'side' ? 'side' : preset === 'top' ? 'top' : 'chase',
+          canonicalFieldRef.current,
+          dt,
+          targetCameraAngle
+        );
       } else {
-        // Chase & Orbit
-        currentCameraAngle.yaw += (targetCameraAngle.yaw - currentCameraAngle.yaw) * 0.12;
-        currentCameraAngle.pitch += (targetCameraAngle.pitch - currentCameraAngle.pitch) * 0.12;
-        currentCameraAngle.dist += (targetCameraAngle.dist - currentCameraAngle.dist) * 0.12;
+        // --- LEGACY CAMERA LERP ---
+        camera.up.set(0, 1, 0);
 
-        const camX = clampedLookX + Math.sin(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
-        const rawCamY = robotPos.y + Math.sin(currentCameraAngle.pitch) * currentCameraAngle.dist + 0.4;
-        const camZ = clampedLookZ + Math.cos(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
-        
-        // Terrain clearance clamping (never clip through ground)
-        const groundAtCam = canonicalFieldRef.current ? canonicalFieldRef.current.sampleHeight(camX, camZ) : 0;
-        const clampedCamY = Math.max(groundAtCam + 0.45, rawCamY);
+        if (preset === 'top') {
+          camera.position.set(clampedLookX, robotPos.y + 8.5, clampedLookZ);
+          camera.lookAt(clampedLookX, robotPos.y, clampedLookZ);
+        } else if (preset === 'side') {
+          camera.position.set(clampedLookX, robotPos.y + 1.2, clampedLookZ + 4.5);
+          camera.lookAt(clampedLookX, robotPos.y + 0.3, clampedLookZ);
+        } else {
+          currentCameraAngle.yaw += (targetCameraAngle.yaw - currentCameraAngle.yaw) * 0.12;
+          currentCameraAngle.pitch += (targetCameraAngle.pitch - currentCameraAngle.pitch) * 0.12;
+          currentCameraAngle.dist += (targetCameraAngle.dist - currentCameraAngle.dist) * 0.12;
 
-        camera.position.set(camX, clampedCamY, camZ);
-        camera.lookAt(clampedLookX, robotPos.y + 0.2, clampedLookZ);
+          const camX = clampedLookX + Math.sin(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
+          const rawCamY = robotPos.y + Math.sin(currentCameraAngle.pitch) * currentCameraAngle.dist + 0.4;
+          const camZ = clampedLookZ + Math.cos(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
+          
+          const groundAtCam = canonicalFieldRef.current ? canonicalFieldRef.current.sampleHeight(camX, camZ) : 0;
+          const clampedCamY = Math.max(groundAtCam + 0.45, rawCamY);
+
+          camera.position.set(camX, clampedCamY, camZ);
+          camera.lookAt(clampedLookX, robotPos.y + 0.2, clampedLookZ);
+        }
       }
 
       // Tight Following Shadow Camera updates (Throttled to 30 Hz)
@@ -592,7 +783,7 @@ export default function ThreeViewer({
           robotPos,
           debrisDataRef.current,
           radarSweepAngle,
-          frame?.collisions
+          frameCollisions
         );
         probe.recordSubsystemTime('radar', Number((performance.now() - radarStart).toFixed(2)));
         lastRadarUpdate = now;
@@ -614,6 +805,10 @@ export default function ThreeViewer({
 
     return () => {
       cancelAnimationFrame(animationFrameId);
+      unsubStore();
+      if (typeof window !== 'undefined' && (window as any).__omniDebug) {
+        delete (window as any).__omniDebug;
+      }
       window.removeEventListener('resize', handleResize);
       container.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('mousemove', onMouseMove);

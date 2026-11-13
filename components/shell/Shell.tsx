@@ -30,6 +30,7 @@ import DatasetPanel from '@/components/teleop/DatasetPanel';
 import DeltaComparisonCard from '@/components/teleop/DeltaComparisonCard';
 import FpsBadge from '@/components/shell/FpsBadge';
 import PerfPanel from '@/components/shell/PerfPanel';
+import GaitLab from '@/components/debug/GaitLab';
 import { getBuildStamp } from '@/lib/build_stamp';
 import {
   EnvironmentSpec,
@@ -104,6 +105,8 @@ export default function Shell() {
   const [isTeleopOpen, setIsTeleopOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [isTokenSpendOpen, setIsTokenSpendOpen] = useState(false);
+  const [isNewAnimation, setIsNewAnimation] = useState(true);
+  const [showGaitLab, setShowGaitLab] = useState(false);
 
   // Architect Stream State
   const [logs, setLogs] = useState<LogItem[]>([
@@ -278,6 +281,11 @@ export default function Shell() {
         const history = TelemetryStore.getInstance().getHistory();
         setPlaybackIndex((prev) => Math.min(history.length - 1, prev + 1));
       }
+      // G: Toggle GaitLab Tuning Panel
+      if (e.key.toLowerCase() === 'g' && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setShowGaitLab((prev) => !prev);
+      }
       // Speed multipliers [ and ]
       if (e.key === '[') setPlaybackSpeed((s) => Math.max(0.25, s * 0.5));
       if (e.key === ']') setPlaybackSpeed((s) => Math.min(4.0, s * 2.0));
@@ -288,6 +296,7 @@ export default function Shell() {
         setIsShortcutsOpen(false);
         setIsTokenSpendOpen(false);
         setIsPerfPanelOpen(false);
+        setShowGaitLab(false);
       }
     };
 
@@ -679,6 +688,7 @@ export default function Shell() {
             showDustParticles={layoutSettings.showDustParticles}
             showGhostComparison={iteration >= 2 || isDeltaComparisonOpen}
             adaptiveQuality={layoutSettings.adaptiveQuality}
+            isNewAnimation={isNewAnimation}
             onCollisionDetected={handleCollision}
           />
 
@@ -787,6 +797,9 @@ export default function Shell() {
         onToggleSimMode={() => setSimMode(simMode === 'cloud_nebius' ? 'local_demo' : 'cloud_nebius')}
         currentMode={simMode}
         onToggleTeleop={() => setIsTeleopOpen((prev) => !prev)}
+        onToggleAnimation={() => setIsNewAnimation((prev) => !prev)}
+        isNewAnimation={isNewAnimation}
+        onOpenGaitLab={() => setShowGaitLab(true)}
       />
 
       <ShortcutsOverlay
@@ -824,6 +837,18 @@ export default function Shell() {
           onClose={() => setIsDeltaComparisonOpen(false)}
           episodeCount={collectedEpisodes.length}
           iteration={iteration}
+        />
+      )}
+
+      {showGaitLab && (
+        <GaitLab
+          isOpen={showGaitLab}
+          isNewAnimation={isNewAnimation}
+          onToggleAnimation={() => setIsNewAnimation((prev) => !prev)}
+          gravity={Math.abs(envSpec.gravity?.[1] ?? 1.62)}
+          speed={playbackSpeed}
+          onSpeedChange={setPlaybackSpeed}
+          onClose={() => setShowGaitLab(false)}
         />
       )}
     </div>

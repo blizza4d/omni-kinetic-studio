@@ -29,6 +29,7 @@ export class TelemetryStore {
 
   // Subscribers for throttled UI reads (e.g. 10 Hz)
   private subscribers = new Set<StoreSubscriber>();
+  private batchListeners = new Set<(frames: TelemetryFrame[]) => void>();
   private notifyScheduled = false;
 
   private constructor() {}
@@ -44,10 +45,23 @@ export class TelemetryStore {
   }
 
   /**
+   * Subscribe to instantaneous frame batch ingestion for real-time sub-frame interpolation buffers.
+   */
+  public onBatch(cb: (frames: TelemetryFrame[]) => void): () => void {
+    this.batchListeners.add(cb);
+    return () => {
+      this.batchListeners.delete(cb);
+    };
+  }
+
+  /**
    * Ingest new frame directly into store without React re-render.
    */
   public ingestFrame(frame: TelemetryFrame) {
     this.ingestFrameInternal(frame);
+    for (const cb of this.batchListeners) {
+      cb([frame]);
+    }
     this.scheduleNotify();
   }
 
@@ -57,6 +71,9 @@ export class TelemetryStore {
   public ingestBatch(frames: TelemetryFrame[]) {
     for (const f of frames) {
       this.ingestFrameInternal(f);
+    }
+    for (const cb of this.batchListeners) {
+      cb(frames);
     }
     this.scheduleNotify();
   }

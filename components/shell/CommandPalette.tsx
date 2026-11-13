@@ -10,6 +10,9 @@ interface CommandPaletteProps {
   onToggleSimMode: () => void;
   currentMode: 'cloud_nebius' | 'local_demo';
   onToggleTeleop: () => void;
+  onToggleAnimation?: () => void;
+  isNewAnimation?: boolean;
+  onOpenGaitLab?: () => void;
 }
 
 export default function CommandPalette({
@@ -19,6 +22,9 @@ export default function CommandPalette({
   onToggleSimMode,
   currentMode,
   onToggleTeleop,
+  onToggleAnimation,
+  isNewAnimation = true,
+  onOpenGaitLab,
 }: CommandPaletteProps) {
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -154,6 +160,45 @@ export default function CommandPalette({
                   <div className="text-[9px] text-cream-dim">NVIDIA L40S GPU, S3 telemetry relay</div>
                 </div>
                 {currentMode === 'cloud_nebius' && <span className="text-[9px] px-1 py-0.5 rounded bg-sage/20 text-sage">ACTIVE</span>}
+              </button>
+            </div>
+          </div>
+
+          {/* Fluid Motion & Gait Controls */}
+          <div className="pt-2 border-t border-cream/10 space-y-2 text-xs font-mono">
+            <div className="text-[10px] text-cream-dim uppercase tracking-wider flex items-center justify-between">
+              <span>Motion & Gait Engine (Live A/B)</span>
+              <span className="text-sage">{isNewAnimation ? '[FLUID ENGINE]' : '[LEGACY BASELINE]'}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  onToggleAnimation?.();
+                  onClose();
+                }}
+                className="p-2 rounded border border-cream/10 bg-charcoal-deep/60 hover:bg-charcoal hover:border-sage/40 text-left flex items-center justify-between transition-colors"
+              >
+                <div>
+                  <div className="font-semibold text-[11px] text-cream">Toggle Fluid Animation</div>
+                  <div className="text-[9px] text-cream-dim">{isNewAnimation ? 'Switch to legacy baseline' : 'Switch to new fluid engine'}</div>
+                </div>
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-charcoal text-cream-dim border border-cream/10">A/B</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenGaitLab?.();
+                  onClose();
+                }}
+                className="p-2 rounded border border-cream/10 bg-charcoal-deep/60 hover:bg-charcoal hover:border-sage/40 text-left flex items-center justify-between transition-colors"
+              >
+                <div>
+                  <div className="font-semibold text-[11px] text-cream">Open GaitLab Tuner</div>
+                  <div className="text-[9px] text-cream-dim">Live Froude, sliders & telemetry [G]</div>
+                </div>
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-sage/20 text-sage border border-sage/30">G</span>
               </button>
             </div>
           </div>

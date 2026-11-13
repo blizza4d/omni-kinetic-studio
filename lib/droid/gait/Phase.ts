@@ -41,6 +41,20 @@ export class GaitPhaseTracker {
     return this.advance(turnDist, 0.25);
   }
 
+  /**
+   * Settle toward the nearest double-support stance when speed drops to ~0.
+   */
+  public settleToStand(dt: number, halfLife = 0.12): void {
+    if (dt <= 0) return;
+    const a = 1.0 - Math.exp((-Math.LN2 * dt) / halfLife);
+    const twoPi = 2.0 * Math.PI;
+    const norm = (this.masterPhase / twoPi) % 1.0;
+    const targetNorm = norm < 0.25 || norm >= 0.75 ? (norm >= 0.75 ? 1.0 : 0.0) : 0.5;
+    const targetPhase = targetNorm * twoPi;
+    this.masterPhase += (targetPhase - this.masterPhase) * a;
+    this.masterPhase = (this.masterPhase + twoPi) % twoPi;
+  }
+
   public getMasterPhase(): number {
     return this.masterPhase;
   }

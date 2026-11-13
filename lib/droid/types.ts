@@ -5,7 +5,7 @@
 
 export type LegId = 'FL' | 'FR' | 'RL' | 'RR';
 
-export type GaitState = 'stand' | 'walk' | 'bound' | 'turnInPlace' | 'stop' | 'stumbleRecover';
+export type GaitState = 'stand' | 'startWalk' | 'walk' | 'bound' | 'turnInPlace' | 'stop' | 'stumbleRecover' | 'fallen';
 
 export type FootPhaseState = 'stance' | 'swing';
 

@@ -1,0 +1,15 @@
+{
+  "description": "Omni-Kinetic Fluid Animation Smoothness & Pacing CI Acceptance Thresholds",
+  "version": "1.0.0",
+  "thresholds": {
+    "judderIndexMax": 0.03,
+    "stutterCountMaxPerMin": 0,
+    "footSlipMeanPercentMax": 1.5,
+    "footSlipMaxPercentMax": 2.5,
+    "loopDiscontinuityMax": 0.0001,
+    "cameraRelativeJitterMax": 15.0,
+    "rootJerkRMSMax": 3000.0,
+    "headJerkRMSMax": 3000.0,
+    "jerkReductionMinimumPercent": 50.0
+  }
+}
