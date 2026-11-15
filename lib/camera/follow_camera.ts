@@ -24,7 +24,7 @@ export interface CameraFollowOptions {
 }
 
 export class FollowCameraRig {
-  private readonly posSpring: Spring3 = new Spring3(0, 1.6, 5.0);
+  private readonly posSpring: Spring3 = new Spring3(0, 1.4, 3.5);
   private readonly lookSpring: Spring3 = new Spring3(0, 0.4, 0);
 
   // Scratch vectors for zero allocation
@@ -32,10 +32,10 @@ export class FollowCameraRig {
   private readonly _targetLook = new Vector3();
   private readonly _lastStablePos = new Vector3();
 
-  // Angular state for orbit/chase
+  // Angular state for orbit/chase: calibrated for 18% robot height and 24% horizon position
   private currentYaw = 0;
-  private currentPitch = 0.45;
-  private currentDist = 5.0;
+  private currentPitch = 0.32;
+  private currentDist = 3.5;
 
   constructor(private readonly opts: CameraFollowOptions = {}) {
     this.opts.posHalfLife = opts.posHalfLife ?? 0.18;
@@ -82,12 +82,12 @@ export class FollowCameraRig {
 
     // 2. Velocity Look-Ahead (lead motion by up to 0.25s)
     const forwardSpeed = Math.hypot(droidVel[0], droidVel[2]);
-    const lookAheadSpan = Math.min(1.2, forwardSpeed * (this.opts.lookAheadSec ?? 0.25));
+    const lookAheadSpan = Math.min(1.0, forwardSpeed * (this.opts.lookAheadSec ?? 0.25));
     const lookDirX = forwardSpeed > 0.05 ? droidVel[0] / forwardSpeed : 0;
     const lookDirZ = forwardSpeed > 0.05 ? droidVel[2] / forwardSpeed : 0;
 
     const goalLookX = stableX + lookDirX * lookAheadSpan;
-    const goalLookY = stableY + 0.35;
+    const goalLookY = stableY + 0.30;
     const goalLookZ = stableZ + lookDirZ * lookAheadSpan;
 
     // 3. Critically Damped Spring on Look-At Target
@@ -108,9 +108,9 @@ export class FollowCameraRig {
     } else if (preset === 'side') {
       this._targetPos.set(look.x, stableY + 1.2, look.z + 4.5);
     } else {
-      // Chase / Orbit mode with dynamic speed-adaptive distance
-      const targetDist = (userOrbit?.dist ?? 5.0) + Math.min(1.5, forwardSpeed * 0.4);
-      const targetPitch = userOrbit?.pitch ?? 0.45;
+      // Chase / Orbit mode with calibrated 3.5m distance and rule-of-thirds pitch
+      const targetDist = (userOrbit?.dist ?? 3.5) + Math.min(1.0, forwardSpeed * 0.3);
+      const targetPitch = userOrbit?.pitch ?? 0.32;
       const targetYaw = userOrbit?.yaw ?? 0.0;
 
       // Smooth angular controls with halfLife
@@ -120,7 +120,7 @@ export class FollowCameraRig {
       this.currentDist += (targetDist - this.currentDist) * alphaRot;
 
       const camX = look.x + Math.sin(this.currentYaw) * Math.cos(this.currentPitch) * this.currentDist;
-      let rawCamY = look.y + Math.sin(this.currentPitch) * this.currentDist + 0.4;
+      let rawCamY = look.y + Math.sin(this.currentPitch) * this.currentDist + 0.35;
       const camZ = look.z + Math.cos(this.currentYaw) * Math.cos(this.currentPitch) * this.currentDist;
 
       // 5. Terrain Clearance (never clip through ground/crater slopes)
@@ -152,10 +152,10 @@ export class FollowCameraRig {
 
   public reset(x = 0, y = 0.4, z = 0): void {
     this._lastStablePos.set(x, y, z);
-    this.posSpring.set(x, y + 1.6, z + 5.0);
-    this.lookSpring.set(x, y + 0.35, z);
+    this.posSpring.set(x, y + 1.4, z + 3.5);
+    this.lookSpring.set(x, y + 0.30, z);
     this.currentYaw = 0;
-    this.currentPitch = 0.45;
-    this.currentDist = 5.0;
+    this.currentPitch = 0.32;
+    this.currentDist = 3.5;
   }
 }

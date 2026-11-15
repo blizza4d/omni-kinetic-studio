@@ -11,13 +11,13 @@ interface FpsBadgeProps {
 
 export default function FpsBadge({ onTogglePanel, tier = 'high' }: FpsBadgeProps) {
   const [metrics, setMetrics] = useState(() => PerfProbe.getInstance().getMetrics());
-  const [longTasks, setLongTasks] = useState(0);
+  const [steadyLongTasks, setSteadyLongTasks] = useState(0);
 
   useEffect(() => {
     const interval = setInterval(() => {
       const probe = PerfProbe.getInstance();
       setMetrics(probe.getMetrics());
-      setLongTasks(probe.getSnapshot().longTaskCount);
+      setSteadyLongTasks(probe.getSnapshot().steadyStateLongTaskCount);
     }, 500); // 2 Hz update rate for readable text
     return () => clearInterval(interval);
   }, []);
@@ -60,14 +60,14 @@ export default function FpsBadge({ onTogglePanel, tier = 'high' }: FpsBadgeProps
         </>
       )}
 
-      {/* Long task indicator if any with descriptive label and tooltip */}
-      {longTasks > 0 && (
+      {/* Steady-state long task indicator if any (>50ms after 5s startup window in rolling 60s) */}
+      {steadyLongTasks > 0 && (
         <span
-          title={`${longTasks} long task${longTasks > 1 ? 's' : ''} (>50ms) detected in main thread. Click to open P panel diagnostics.`}
+          title={`${steadyLongTasks} steady-state long task${steadyLongTasks > 1 ? 's' : ''} (>50ms in rolling 60s) detected in main thread. Click to open P panel diagnostics.`}
           className="flex items-center space-x-1 text-brick text-[10px] font-bold px-1.5 py-0.5 rounded bg-brick/15 border border-brick/30"
         >
           <AlertTriangle className="w-3 h-3 text-brick" />
-          <span>{longTasks} long task{longTasks > 1 ? 's' : ''}</span>
+          <span>{steadyLongTasks} long task{steadyLongTasks > 1 ? 's' : ''}</span>
         </span>
       )}
 

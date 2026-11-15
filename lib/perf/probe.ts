@@ -19,6 +19,7 @@ export interface LongTaskRecord {
   duration: number;
   startTime: number;
   name: string;
+  category: 'startup' | 'steady-state';
 }
 
 export interface RendererInfoSnapshot {
@@ -90,10 +91,12 @@ export class PerfProbe {
     try {
       this.observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
+          const category = entry.startTime < 5000 ? 'startup' : 'steady-state';
           this.longTasks.push({
             duration: entry.duration,
             startTime: entry.startTime,
             name: entry.name,
+            category,
           });
           // Retain last 50 long tasks
           if (this.longTasks.length > 50) this.longTasks.shift();
@@ -209,6 +212,16 @@ export class PerfProbe {
     };
   }
 
+  /**
+   * Returns steady-state long tasks (>50ms occurring after 5s) within a rolling window (default 60s).
+   */
+  public getSteadyStateLongTasks(windowMs = 60000): LongTaskRecord[] {
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    return this.longTasks.filter(
+      (t) => t.category === 'steady-state' && (now - t.startTime) <= windowMs
+    );
+  }
+
   public getSnapshot() {
     const metrics = this.getMetrics();
     const meanPhysics = this.physicsTimes.length ? (this.physicsTimes.reduce((s, v) => s + v, 0) / this.physicsTimes.length).toFixed(2) : '0.00';
@@ -222,10 +235,15 @@ export class PerfProbe {
         }
       : null;
 
+    const steadyTasks = this.getSteadyStateLongTasks(60000);
+    const startupTasks = this.longTasks.filter((t) => t.category === 'startup');
+
     return {
       ...metrics,
       tier: this.currentTier,
-      longTaskCount: this.longTasks.length,
+      longTaskCount: steadyTasks.length, // Honest steady-state 60s rolling window
+      steadyStateLongTaskCount: steadyTasks.length,
+      startupLongTaskCount: startupTasks.length,
       longTasks: this.longTasks.slice(-5),
       rendererInfo: this.rendererInfo,
       gpu: {

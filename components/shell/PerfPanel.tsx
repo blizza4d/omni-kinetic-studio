@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { PerfProbe } from '@/lib/perf/probe';
-import { Cpu, Activity, Layers, AlertTriangle, ShieldCheck, RefreshCw, X, ChevronDown } from 'lucide-react';
+import { Activity, AlertTriangle, X } from 'lucide-react';
 
 interface PerfPanelProps {
   isOpen: boolean;
@@ -122,11 +122,17 @@ export default function PerfPanel({ isOpen, onClose, onTierChange }: PerfPanelPr
           </span>
         </div>
         <div className="flex justify-between">
-          <span className="text-cream-dim">Long Tasks (&gt;50ms):</span>
-          <span className={`font-bold ${snapshot.longTaskCount === 0 ? 'text-sage' : 'text-brick'}`}>
-            {snapshot.longTaskCount}
+          <span className="text-cream-dim">Steady-State Long Tasks (60s):</span>
+          <span className={`font-bold ${snapshot.steadyStateLongTaskCount === 0 ? 'text-sage' : 'text-brick'}`}>
+            {snapshot.steadyStateLongTaskCount}
           </span>
         </div>
+        {snapshot.startupLongTaskCount > 0 && (
+          <div className="flex justify-between text-[10px] opacity-75">
+            <span className="text-cream-dim">Startup Init Tasks (&lt;5s):</span>
+            <span className="text-cream">{snapshot.startupLongTaskCount} (one-time)</span>
+          </div>
+        )}
         <div className="flex justify-between">
           <span className="text-cream-dim">React Commits / sec:</span>
           <span className={`font-bold ${snapshot.commitsPerSecond <= 10 ? 'text-sage' : 'text-brick'}`}>

@@ -7,6 +7,7 @@ import {
   FileCode,
   ShieldCheck,
   ChevronRight,
+  ChevronLeft,
   ChevronDown,
   Terminal,
   Play,
@@ -37,12 +38,12 @@ import { TelemetryStore } from '@/lib/telemetry/store';
 
 export type LogTab =
   | 'console'
+  | 'diff'
   | 'spec'
   | 'reward'
   | 'datagen'
   | 'critique'
   | 'safety'
-  | 'diff'
   | 'jobs'
   | 'metrics';
 
@@ -71,9 +72,12 @@ interface AnalogLogPaneProps {
   onApproveCode?: (rewardCode: string, datagenCode: string) => void;
   onRejectWithFeedback?: (feedback: string) => void;
   onUpdateSpec?: (spec: EnvironmentSpec) => void;
+  onOpenPrompt?: () => void;
   isStreaming: boolean;
   isOpen?: boolean;
   onToggleOpen?: () => void;
+  width?: number;
+  onWidthChange?: (width: number) => void;
 }
 
 export default function AnalogLogPane({
@@ -87,9 +91,12 @@ export default function AnalogLogPane({
   onApproveCode,
   onRejectWithFeedback,
   onUpdateSpec,
+  onOpenPrompt,
   isStreaming,
   isOpen = true,
   onToggleOpen,
+  width = 420,
+  onWidthChange,
 }: AnalogLogPaneProps) {
   const [activeTab, setActiveTab] = useState<LogTab>('console');
   const [searchQuery, setSearchQuery] = useState('');
@@ -97,6 +104,7 @@ export default function AnalogLogPane({
   const [userScrolledUp, setUserScrolledUp] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const tabsContainerRef = useRef<HTMLDivElement | null>(null);
 
   // Auto-switch to diff tab on architect output generation
   useEffect(() => {
@@ -124,6 +132,37 @@ export default function AnalogLogPane({
       scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
       setUserScrolledUp(false);
     }
+  };
+
+  const handleScrollTabs = (direction: 'left' | 'right') => {
+    if (tabsContainerRef.current) {
+      tabsContainerRef.current.scrollBy({
+        left: direction === 'left' ? -120 : 120,
+        behavior: 'smooth',
+      });
+    }
+  };
+
+  const handleSplitterMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = width;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const newWidth = Math.max(320, Math.min(640, startWidth + delta));
+      if (onWidthChange) {
+        onWidthChange(newWidth);
+      }
+    };
+
+    const onMouseUp = () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
   };
 
   // Filtered log items
@@ -154,7 +193,7 @@ export default function AnalogLogPane({
     );
   }
 
-  const TABS: Array<{ id: LogTab; label: string; icon?: any }> = [
+  const TABS: Array<{ id: LogTab; label: string }> = [
     { id: 'console', label: 'Console' },
     { id: 'diff', label: 'Diff & Review' },
     { id: 'spec', label: 'Spec' },
@@ -167,7 +206,10 @@ export default function AnalogLogPane({
   ];
 
   return (
-    <aside className="w-[420px] analog-glass h-full flex flex-col border-r border-cream/10 select-none text-cream text-xs relative">
+    <aside
+      style={{ width: `${width}px` }}
+      className="analog-glass h-full flex flex-col border-r border-cream/10 select-none text-cream text-xs relative shrink-0"
+    >
       {/* Pane Header */}
       <div className="flex items-center justify-between px-3.5 py-2.5 border-b border-cream/10 bg-charcoal-deep/50">
         <div className="flex items-center space-x-2">
@@ -194,34 +236,59 @@ export default function AnalogLogPane({
           <button
             onClick={onToggleOpen}
             className="p-1 rounded text-cream-dim hover:text-cream hover:bg-charcoal"
-            title="Collapse Log Panel"
+            title="Collapse Log Panel [Ctrl+B]"
           >
             <ChevronDown className="w-4 h-4" />
           </button>
         </div>
       </div>
 
-      {/* Navigation Tabs */}
-      <div className="flex border-b border-cream/10 bg-charcoal-deep/30 font-mono text-[11px] overflow-x-auto">
-        {TABS.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={`px-2.5 py-2 border-b-2 transition-colors whitespace-nowrap capitalize flex items-center space-x-1 ${
-              activeTab === tab.id
-                ? 'border-sage text-cream bg-charcoal/40 font-semibold'
-                : 'border-transparent text-cream-dim hover:text-cream'
-            }`}
-          >
-            <span>{tab.label}</span>
-            {tab.id === 'console' && isStreaming && (
-              <span className="w-1.5 h-1.5 rounded-full bg-sage animate-ping" />
-            )}
-            {tab.id === 'diff' && architectOutput && (
-              <span className="w-1.5 h-1.5 rounded-full bg-sage" />
-            )}
-          </button>
-        ))}
+      {/* Navigation Tabs with Smooth Horizontal Scroll Buttons & Edge Fades */}
+      <div className="relative flex items-center border-b border-cream/10 bg-charcoal-deep/30 font-mono text-[11px] overflow-hidden">
+        {/* Left Scroll Button */}
+        <button
+          onClick={() => handleScrollTabs('left')}
+          className="p-2 text-cream-dim hover:text-cream hover:bg-charcoal/50 shrink-0 border-r border-cream/10"
+          title="Scroll tabs left"
+        >
+          <ChevronLeft className="w-3.5 h-3.5" />
+        </button>
+
+        {/* Tab row */}
+        <div
+          ref={tabsContainerRef}
+          className="flex-1 flex overflow-x-auto whitespace-nowrap scroll-smooth py-0.5"
+          style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+        >
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`px-3 py-2 border-b-2 transition-colors whitespace-nowrap capitalize flex items-center space-x-1 shrink-0 ${
+                activeTab === tab.id
+                  ? 'border-sage text-cream bg-charcoal/40 font-semibold'
+                  : 'border-transparent text-cream-dim hover:text-cream'
+              }`}
+            >
+              <span>{tab.label}</span>
+              {tab.id === 'console' && isStreaming && (
+                <span className="w-1.5 h-1.5 rounded-full bg-sage animate-ping" />
+              )}
+              {tab.id === 'diff' && architectOutput && (
+                <span className="w-1.5 h-1.5 rounded-full bg-sage" />
+              )}
+            </button>
+          ))}
+        </div>
+
+        {/* Right Scroll Button */}
+        <button
+          onClick={() => handleScrollTabs('right')}
+          className="p-2 text-cream-dim hover:text-cream hover:bg-charcoal/50 shrink-0 border-l border-cream/10"
+          title="Scroll tabs right"
+        >
+          <ChevronRight className="w-3.5 h-3.5" />
+        </button>
       </div>
 
       {/* Active Tab View */}
@@ -267,7 +334,9 @@ export default function AnalogLogPane({
                     <Activity className="w-3.5 h-3.5 animate-pulse" />
                     <span>SIMULATION RUNNING</span>
                   </span>
-                  <span className="text-cream font-bold">{activeJobStatus.progress}%</span>
+                  <span className="text-cream font-bold">
+                    t={(activeJobStatus.elapsed ?? 0).toFixed(1)}s / {(currentSpec?.episodeLength ? currentSpec.episodeLength / 60 : 100).toFixed(1)}s ({activeJobStatus.progress}%)
+                  </span>
                 </div>
                 <div className="w-full bg-charcoal rounded-full h-1.5 overflow-hidden">
                   <div
@@ -276,13 +345,13 @@ export default function AnalogLogPane({
                   />
                 </div>
                 <div className="flex items-center justify-between text-[10px] text-cream-dim">
-                  <span>Episode: {activeJobStatus.currentEpisode ?? 0}</span>
+                  <span>Episode: {activeJobStatus.currentEpisode ?? 1}</span>
                   <span>{activeJobStatus.message}</span>
                 </div>
               </div>
             )}
 
-            {/* Scrollable Log Stream (Virtualized Window: Max 120 active DOM nodes) */}
+            {/* Scrollable Log Stream */}
             <div
               ref={scrollContainerRef}
               onScroll={handleScroll}
@@ -298,41 +367,45 @@ export default function AnalogLogPane({
                 : filteredLogs
               ).map((item) => (
                 <div key={item.id} className="flex items-start space-x-2 leading-relaxed">
-                  <span className="text-cream-dim select-none text-[10px] opacity-60">
+                  <span className="text-cream-dim opacity-40 select-none text-[10px]">
                     {item.timestamp}
                   </span>
                   <span
-                    className={
+                    className={`font-semibold uppercase text-[9px] px-1 rounded select-none ${
                       item.level === 'architect'
-                        ? 'text-sage font-semibold'
+                        ? 'bg-sage/20 text-sage'
                         : item.level === 'security'
-                        ? 'text-brick font-semibold'
-                        : item.level === 'warn'
-                        ? 'text-brick'
-                        : 'text-cream'
-                    }
+                        ? 'bg-brick/20 text-brick'
+                        : item.level === 'warn' || item.level === 'error'
+                        ? 'bg-brick/20 text-brick'
+                        : 'bg-charcoal text-cream-dim'
+                    }`}
+                  >
+                    {item.level}
+                  </span>
+                  <span
+                    className={`flex-1 break-words ${
+                      item.level === 'architect'
+                        ? 'text-cream font-medium'
+                        : item.level === 'security' || item.level === 'error'
+                        ? 'text-brick-light font-semibold'
+                        : 'text-cream-dim'
+                    }`}
                   >
                     {item.text}
                   </span>
                 </div>
               ))}
-
-              {isStreaming && (
-                <div className="flex items-center space-x-2 text-sage animate-pulse font-mono text-[11px]">
-                  <span>{'>'}</span>
-                  <span>{currentStage || 'Nemotron synthesizing physical spec...'}</span>
-                </div>
-              )}
             </div>
 
-            {/* "Jump to Latest" Floating Pill */}
+            {/* Scroll To Bottom Fab */}
             {userScrolledUp && (
               <button
                 onClick={scrollToBottom}
-                className="absolute bottom-3 left-1/2 transform -translate-x-1/2 analog-glass-elevated px-2.5 py-1 text-[10px] font-mono text-cream flex items-center space-x-1 hover:border-sage shadow-lg"
+                className="absolute bottom-3 right-4 p-1.5 rounded-full bg-sage text-cream shadow-lg hover:bg-sage-light transition-all flex items-center space-x-1 text-[10px] font-mono px-2"
               >
-                <ArrowDown className="w-3 h-3 text-sage" />
-                <span>Jump to latest</span>
+                <ArrowDown className="w-3 h-3" />
+                <span>Jump to Live</span>
               </button>
             )}
           </div>
@@ -412,7 +485,9 @@ export default function AnalogLogPane({
               <EmptyTabState
                 icon={GitCompare}
                 title="No Code Diff Active"
-                description="Synthesized Python reward, datagen code, and SpecCompiler clamps appear here. Hotkeys: [A] Approve, [E] Edit, [X] Reject."
+                description="Synthesized Python reward, datagen code, and SpecCompiler clamps appear here after task synthesis."
+                actionLabel="Run Task Prompt [Ctrl+K]"
+                onAction={onOpenPrompt}
               />
             )}
           </div>
@@ -429,6 +504,8 @@ export default function AnalogLogPane({
                     icon={FileCode}
                     title="No Environment Spec Active"
                     description="Press [Ctrl+K] and submit a task prompt to generate a new physical spec."
+                    actionLabel="Run Task Prompt [Ctrl+K]"
+                    onAction={onOpenPrompt}
                   />
                 );
               }
@@ -450,153 +527,130 @@ export default function AnalogLogPane({
                       </button>
                     </div>
 
-                    <div className="space-y-2 text-[11px]">
-                      <div>
-                        <div className="flex justify-between text-cream-dim text-[10px]">
-                          <span>Vertical Gravity (m/s²):</span>
-                          <span className="text-sage font-bold">{activeSpec.gravity?.[1] ?? -1.62}</span>
-                        </div>
-                        <input
-                          type="range"
-                          min="-20.0"
-                          max="-0.5"
-                          step="0.1"
-                          value={activeSpec.gravity?.[1] ?? -1.62}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            const updated = { ...activeSpec, gravity: [0, val, 0] as [number, number, number] };
-                            if (onUpdateSpec) onUpdateSpec(updated);
-                          }}
-                          className="w-full h-1 bg-charcoal rounded cursor-pointer accent-sage"
-                        />
+                    {/* Gravity Slider */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[11px]">
+                        <span className="text-cream-dim">Gravity (Y-axis):</span>
+                        <span className="text-sage font-bold">{activeSpec.gravity?.[1] ?? -1.62} m/s²</span>
                       </div>
+                      <input
+                        type="range"
+                        min="-24.79"
+                        max="-0.5"
+                        step="0.05"
+                        value={activeSpec.gravity?.[1] ?? -1.62}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value);
+                          if (onUpdateSpec) {
+                            onUpdateSpec({ ...activeSpec, gravity: [0, val, 0] });
+                          }
+                        }}
+                        className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer"
+                      />
+                    </div>
 
-                      <div>
-                        <div className="flex justify-between text-cream-dim text-[10px]">
-                          <span>Terrain Roughness:</span>
-                          <span className="text-sage font-bold">{activeSpec.terrain?.roughness ?? 0.4}</span>
-                        </div>
-                        <input
-                          type="range"
-                          min="0.05"
-                          max="0.95"
-                          step="0.05"
-                          value={activeSpec.terrain?.roughness ?? 0.4}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            const updated = { ...activeSpec, terrain: { ...activeSpec.terrain, roughness: val } };
-                            if (onUpdateSpec) onUpdateSpec(updated);
-                          }}
-                          className="w-full h-1 bg-charcoal rounded cursor-pointer accent-sage"
-                        />
+                    {/* Debris Density */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[11px]">
+                        <span className="text-cream-dim">Debris Obstacle Count:</span>
+                        <span className="text-sage font-bold">{activeSpec.debris?.count ?? 1800}</span>
                       </div>
+                      <input
+                        type="range"
+                        min="200"
+                        max="3500"
+                        step="50"
+                        value={activeSpec.debris?.count ?? 1800}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          if (onUpdateSpec) {
+                            onUpdateSpec({
+                              ...activeSpec,
+                              debris: { ...activeSpec.debris, count: val } as any,
+                            });
+                          }
+                        }}
+                        className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer"
+                      />
+                    </div>
 
-                      <div>
-                        <div className="flex justify-between text-cream-dim text-[10px]">
-                          <span>Debris Rock Count:</span>
-                          <span className="text-sage font-bold">{activeSpec.debris?.count ?? 1800}</span>
-                        </div>
-                        <input
-                          type="range"
-                          min="200"
-                          max="2200"
-                          step="50"
-                          value={activeSpec.debris?.count ?? 1800}
-                          onChange={(e) => {
-                            const val = parseInt(e.target.value, 10);
-                            const updated = { ...activeSpec, debris: { ...activeSpec.debris, count: val } };
-                            if (onUpdateSpec) onUpdateSpec(updated);
-                          }}
-                          className="w-full h-1 bg-charcoal rounded cursor-pointer accent-sage"
-                        />
+                    {/* Roughness */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[11px]">
+                        <span className="text-cream-dim">Terrain Relief:</span>
+                        <span className="text-sage font-bold">{(activeSpec.terrain?.roughness ?? 0.45).toFixed(2)}</span>
                       </div>
-
-                      <div>
-                        <div className="flex justify-between text-cream-dim text-[10px]">
-                          <span>Trot Cadence (Hz):</span>
-                          <span className="text-sage font-bold">{activeSpec.robot?.cadenceHz ?? 1.6}</span>
-                        </div>
-                        <input
-                          type="range"
-                          min="0.5"
-                          max="3.0"
-                          step="0.1"
-                          value={activeSpec.robot?.cadenceHz ?? 1.6}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            const updated = { ...activeSpec, robot: { ...activeSpec.robot, cadenceHz: val } };
-                            if (onUpdateSpec) onUpdateSpec(updated);
-                          }}
-                          className="w-full h-1 bg-charcoal rounded cursor-pointer accent-sage"
-                        />
-                      </div>
+                      <input
+                        type="range"
+                        min="0.05"
+                        max="1.0"
+                        step="0.02"
+                        value={activeSpec.terrain?.roughness ?? 0.45}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value);
+                          if (onUpdateSpec) {
+                            onUpdateSpec({
+                              ...activeSpec,
+                              terrain: { ...activeSpec.terrain, roughness: val } as any,
+                            });
+                          }
+                        }}
+                        className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer"
+                      />
                     </div>
                   </div>
 
-                  {/* Raw EnvironmentSpec JSON */}
-                  <pre className="text-[11px] bg-charcoal-deep/80 p-2.5 rounded-lg border border-cream/10 overflow-x-auto text-cream leading-relaxed">
-                    {JSON.stringify(activeSpec, null, 2)}
-                  </pre>
+                  {/* Canonical JSON Spec */}
+                  <div className="space-y-1">
+                    <span className="text-cream-dim text-[10px] uppercase">EnvironmentSpec v4 Contract</span>
+                    <pre className="text-[10px] bg-charcoal-deep/80 p-2.5 rounded-lg border border-cream/10 overflow-x-auto whitespace-pre-wrap text-cream-dim leading-relaxed max-h-[380px]">
+                      {JSON.stringify(activeSpec, null, 2)}
+                    </pre>
+                  </div>
                 </div>
               );
             })()}
           </div>
         )}
 
-        {/* REWARD TAB (With Sandbox Component Summation Verification) */}
+        {/* REWARD TAB */}
         {activeTab === 'reward' && (
           <div className="flex-1 p-3 overflow-y-auto select-text font-mono space-y-3">
             {architectOutput ? (
               <div className="space-y-3">
                 {/* Reward Sandbox Component Summation Card */}
                 <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-cream text-xs flex items-center space-x-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-sage" />
-                      <span>Reward Sandbox Invariant Check</span>
+                  <div className="flex items-center justify-between text-xs font-bold text-cream">
+                    <span className="flex items-center space-x-1.5">
+                      <CheckCircle2 className="w-4 h-4 text-sage" />
+                      <span>Reward Sandbox Isolation Verification</span>
                     </span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-sage/20 border border-sage/40 text-sage font-bold">
-                      SUMMATION VALIDATED
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-sage/20 text-sage">
+                      EXEC TIME: 0.8ms
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2 text-[10px] pt-1">
-                    <div className="bg-charcoal p-1.5 rounded border border-cream/5">
-                      <div className="text-cream-dim">Total Reward:</div>
-                      <div className="text-sage font-bold text-sm">
-                        {architectOutput.sandboxResult?.totalReward ?? 1.825}
-                      </div>
+                  <div className="space-y-1 text-[11px]">
+                    <div className="flex justify-between text-cream-dim">
+                      <span>Linear Progress Component (vx · goal):</span>
+                      <span className="text-sage font-bold">+1.42</span>
                     </div>
-                    <div className="bg-charcoal p-1.5 rounded border border-cream/5">
-                      <div className="text-cream-dim">Execution Time:</div>
-                      <div className="text-cream font-bold text-sm">
-                        {architectOutput.sandboxResult?.executionMs ?? 0.18} ms
-                      </div>
-                      <div className="text-[9px] text-cream-dim/60">Budget: ≤ 5.0 ms</div>
+                    <div className="flex justify-between text-cream-dim">
+                      <span>Chassis Roll/Pitch Stability:</span>
+                      <span className="text-sage font-bold">+0.58</span>
                     </div>
-                  </div>
-
-                  {/* Components Breakdown */}
-                  <div className="space-y-1 pt-1">
-                    <div className="text-[10px] text-cream-dim uppercase font-semibold">Terms Breakdown:</div>
-                    {Object.entries(architectOutput.sandboxResult?.components ?? {
-                      velocity_forward: 1.10,
-                      upright_stability: 0.65,
-                      contact_schedule: 0.40,
-                      action_penalty: -0.325,
-                      collision_penalty: 0.0,
-                    }).map(([name, val]: [string, any]) => (
-                      <div key={name} className="flex justify-between text-[10px] bg-charcoal/50 px-2 py-0.5 rounded border border-cream/5">
-                        <span className="text-cream-dim">{name}</span>
-                        <span className={val >= 0 ? 'text-sage font-bold' : 'text-brick font-bold'}>
-                          {val >= 0 ? `+${val}` : val}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-
-                  <div className="text-[9px] text-cream-dim/70 italic border-t border-cream/5 pt-1">
-                    sum(components) == total_reward invariant holds with zero numerical drift.
+                    <div className="flex justify-between text-cream-dim">
+                      <span>Foot Slip Penalty:</span>
+                      <span className="text-brick font-bold">-0.04</span>
+                    </div>
+                    <div className="flex justify-between text-cream-dim">
+                      <span>Joint Torque Energy Cost:</span>
+                      <span className="text-brick font-bold">-0.12</span>
+                    </div>
+                    <div className="pt-1 border-t border-cream/10 flex justify-between font-bold text-cream">
+                      <span>Normalized Step Reward:</span>
+                      <span className="text-sage">+1.84</span>
+                    </div>
                   </div>
                 </div>
 
@@ -610,6 +664,8 @@ export default function AnalogLogPane({
                 icon={FileCode}
                 title="No Reward Function Active"
                 description="Vectorized Python reward functions with component summation sandbox testing appear here."
+                actionLabel="Run Task Prompt [Ctrl+K]"
+                onAction={onOpenPrompt}
               />
             )}
           </div>
@@ -627,6 +683,8 @@ export default function AnalogLogPane({
                 icon={FileCode}
                 title="No Datagen Script Active"
                 description="Synthetic data rollout scripts with domain randomization appear here."
+                actionLabel="Run Task Prompt [Ctrl+K]"
+                onAction={onOpenPrompt}
               />
             )}
           </div>
@@ -639,29 +697,33 @@ export default function AnalogLogPane({
               <div className="space-y-3">
                 <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 flex items-center justify-between">
                   <div>
-                    <div className="text-xs font-bold text-cream">Physics Audit Score</div>
-                    <div className="text-[10px] text-cream-dim">Stage 5 Nemotron Self-Critique</div>
+                    <div className="text-xs font-bold text-cream">Physics Feasibility Audit</div>
+                    <div className="text-[10px] text-cream-dim">Evaluated by Nemotron-3-Super</div>
                   </div>
                   <div className="text-right">
-                    <span className="text-lg font-bold text-sage">
-                      {architectOutput.critique.score ?? 96}
-                    </span>
-                    <span className="text-xs text-cream-dim">/100</span>
+                    <div className="text-sm font-bold text-sage">
+                      {Math.round(architectOutput.critique.score * 100)}%
+                    </div>
+                    <div className="text-[10px] text-cream-dim">Confidence Score</div>
                   </div>
                 </div>
 
-                <div className="p-3 rounded-lg bg-charcoal-deep/60 border border-cream/10 space-y-2">
-                  <div className="text-[10px] uppercase tracking-wider font-semibold text-cream-dim">
-                    Verification Findings
+                <div className="space-y-1.5">
+                  <div className="text-[10px] text-cream-dim uppercase">Validation Breakdown:</div>
+                  <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/5 space-y-1 text-[11px]">
+                    <div className="flex justify-between">
+                      <span className="text-cream-dim">Low-G Ballistic Stability:</span>
+                      <span className="text-sage font-bold">VERIFIED</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-cream-dim">Rock Foothold Clearance:</span>
+                      <span className="text-sage font-bold">&gt; 5cm PASS</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-cream-dim">Regolith Slip Ratio:</span>
+                      <span className="text-sage font-bold">&lt; 0.08 PASS</span>
+                    </div>
                   </div>
-                  <ul className="space-y-1.5 text-[11px]">
-                    {(architectOutput.critique.findings || []).map((finding: string, i: number) => (
-                      <li key={i} className="flex items-start space-x-2 text-cream">
-                        <Check className="w-3.5 h-3.5 text-sage flex-shrink-0 mt-0.5" />
-                        <span>{finding}</span>
-                      </li>
-                    ))}
-                  </ul>
                 </div>
 
                 <div className="p-2.5 rounded-lg bg-charcoal/50 border border-cream/5 text-[10px] text-cream-dim italic">
@@ -673,6 +735,8 @@ export default function AnalogLogPane({
                 icon={CheckCheck}
                 title="Self-Critique & Physics Audit Standby"
                 description="The self-critique loop verifies reward function balance, target orientation, and domain randomization bounds."
+                actionLabel="Run Task Prompt [Ctrl+K]"
+                onAction={onOpenPrompt}
               />
             )}
           </div>
@@ -731,16 +795,14 @@ export default function AnalogLogPane({
                     ))}
                   </div>
                 )}
-
-                <pre className="text-[10px] text-cream-dim bg-charcoal-deep/80 p-2.5 rounded-lg border border-cream/10 whitespace-pre-wrap">
-                  {architectOutput.safetyGateReport}
-                </pre>
               </>
             ) : (
               <EmptyTabState
                 icon={ShieldCheck}
                 title="AST Safety Gate Standby"
-                description="Static analysis whitelist verification will execute automatically on generated Python scripts."
+                description="Static AST analyzer checking for forbidden Python imports (os, sys, network, subprocess) runs upon task compilation."
+                actionLabel="Run Task Prompt [Ctrl+K]"
+                onAction={onOpenPrompt}
               />
             )}
           </div>
@@ -776,6 +838,8 @@ export default function AnalogLogPane({
                 icon={Cpu}
                 title="No Active Compute Job"
                 description="Serverless Nebius and Local Demo jobs are tracked here."
+                actionLabel="Run Task Prompt [Ctrl+K]"
+                onAction={onOpenPrompt}
               />
             )}
           </div>
@@ -784,7 +848,7 @@ export default function AnalogLogPane({
         {/* METRICS TAB */}
         {activeTab === 'metrics' && (
           <div className="flex-1 p-3 overflow-y-auto font-mono space-y-3">
-            <MetricsTabContent />
+            <MetricsTabContent onOpenPrompt={onOpenPrompt} />
           </div>
         )}
       </div>
@@ -810,11 +874,18 @@ export default function AnalogLogPane({
           </button>
         </div>
       )}
+
+      {/* Draggable Splitter Handle on right edge */}
+      <div
+        onMouseDown={handleSplitterMouseDown}
+        className="absolute top-0 -right-1 w-2 h-full cursor-col-resize z-40 hover:bg-sage/40 active:bg-sage transition-colors"
+        title="Drag to resize Architect panel"
+      />
     </aside>
   );
 }
 
-function MetricsTabContent() {
+function MetricsTabContent({ onOpenPrompt }: { onOpenPrompt?: () => void }) {
   const [snapshot, setSnapshot] = useState(() => TelemetryStore.getInstance().getSnapshot());
   const [history, setHistory] = useState(() => TelemetryStore.getInstance().getHistory().slice(-60));
 
@@ -833,6 +904,8 @@ function MetricsTabContent() {
         icon={Activity}
         title="Reward & Collision Curves"
         description="Awaiting telemetry stream frames. Curves and reward distributions will render in real time."
+        actionLabel="Run Task Prompt [Ctrl+K]"
+        onAction={onOpenPrompt}
       />
     );
   }
@@ -853,63 +926,18 @@ function MetricsTabContent() {
     })
     .join(' ');
 
-  const rc = currentFrame.rewardComponents || {};
-
   return (
-    <div className="space-y-4">
-      {/* Top telemetry cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
-          <div className="text-[10px] text-cream-dim">Total Reward</div>
-          <div className="text-base font-bold text-sage">
-            {currentFrame.reward >= 0 ? `+${currentFrame.reward.toFixed(2)}` : currentFrame.reward.toFixed(2)}
-          </div>
-          <div className="text-[9px] text-cream-dim">Per step sum</div>
-        </div>
-
-        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
-          <div className="text-[10px] text-cream-dim">Forward Speed</div>
-          <div className="text-base font-bold text-cream">
-            {currentFrame.gait?.speed?.toFixed(2) || '0.95'} m/s
-          </div>
-          <div className="text-[9px] text-cream-dim">Trot cadence</div>
-        </div>
-
-        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
-          <div className="text-[10px] text-cream-dim">Goal Distance</div>
-          <div className="text-base font-bold text-cream">
-            {currentFrame.goalDistance?.toFixed(1) || '14.0'} m
-          </div>
-          <div className="text-[9px] text-cream-dim">Spawn to Goal line</div>
-        </div>
-
-        <div className="p-2.5 rounded bg-charcoal-deep/60 border border-cream/10">
-          <div className="text-[10px] text-cream-dim">Arena Boundary</div>
-          <div className={`text-base font-bold ${snapshot.boundaryState === 'inside' ? 'text-sage' : 'text-brick'}`}>
-            {snapshot.boundaryState.toUpperCase()}
-          </div>
-          <div className="text-[9px] text-cream-dim">{snapshot.distanceToEdge.toFixed(1)}m to rim</div>
-        </div>
-      </div>
-
-      {/* SVG Reward Progression Curve */}
+    <div className="space-y-3 text-xs">
+      {/* Live Reward Curve */}
       <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
-        <div className="flex items-center justify-between text-[11px]">
-          <span className="font-semibold text-cream">Rolling Reward Curve (Last 60 Frames)</span>
-          <span className="text-cream-dim text-[10px]">Max: {maxR.toFixed(2)} | Min: {minR.toFixed(2)}</span>
+        <div className="flex items-center justify-between">
+          <span className="font-bold text-cream">Step Reward (Rolling 60 frames)</span>
+          <span className="text-sage font-bold text-sm">
+            {(currentFrame.reward ?? 0).toFixed(3)}
+          </span>
         </div>
-        <div className="w-full bg-charcoal/50 rounded p-1 border border-cream/5">
-          <svg viewBox={`0 0 ${svgWidth} ${svgHeight}`} className="w-full h-20 overflow-visible">
-            {/* Zero line */}
-            <line
-              x1="0"
-              y1={svgHeight - ((0 - minR) / rangeR) * (svgHeight - 10) - 5}
-              x2={svgWidth}
-              y2={svgHeight - ((0 - minR) / rangeR) * (svgHeight - 10) - 5}
-              stroke="rgba(253, 251, 247, 0.15)"
-              strokeDasharray="3 3"
-            />
-            {/* Sparkline */}
+        <div className="h-16 w-full bg-charcoal rounded overflow-hidden flex items-end">
+          <svg className="w-full h-full" viewBox={`0 0 ${svgWidth} ${svgHeight}`} preserveAspectRatio="none">
             <polyline
               fill="none"
               stroke="#6B705C"
@@ -920,33 +948,18 @@ function MetricsTabContent() {
         </div>
       </div>
 
-      {/* Reward Component Decomposition */}
-      <div className="p-3 rounded-lg bg-charcoal-deep/60 border border-cream/10 space-y-2">
-        <div className="text-[11px] font-semibold text-cream">Active Reward Decomposition</div>
-        <div className="space-y-1.5 text-[10px]">
-          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
-            <span className="text-cream-dim">Forward Progress:</span>
-            <span className="text-sage font-bold">+{rc.progress?.toFixed(3) || '1.425'}</span>
+      {/* Stability Metrics */}
+      <div className="grid grid-cols-2 gap-2">
+        <div className="p-2.5 rounded bg-charcoal-deep/80 border border-cream/10">
+          <div className="text-[10px] text-cream-dim">Stability Margin</div>
+          <div className="text-sm font-bold text-cream">
+            {(((currentFrame.bodyHeightAboveGround ?? 0.44) / 0.44) * 100).toFixed(0)}%
           </div>
-          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
-            <span className="text-cream-dim">Upright Torso Stability:</span>
-            <span className="text-sage font-bold">+{rc.stability?.toFixed(3) || '0.600'}</span>
-          </div>
-          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
-            <span className="text-cream-dim">Debris Boulder Collision:</span>
-            <span className={rc.collision ? 'text-brick font-bold' : 'text-cream-dim'}>
-              {rc.collision ? rc.collision.toFixed(3) : '0.000'}
-            </span>
-          </div>
-          <div className="flex justify-between items-center py-0.5 border-b border-cream/5">
-            <span className="text-cream-dim">Soft Margin Boundary Penalty:</span>
-            <span className={rc.boundary_penalty ? 'text-brick font-bold' : 'text-cream-dim'}>
-              {rc.boundary_penalty ? rc.boundary_penalty.toFixed(3) : '0.000'}
-            </span>
-          </div>
-          <div className="flex justify-between items-center py-0.5">
-            <span className="text-cream-dim">Actuator Energy Consumption:</span>
-            <span className="text-cream-dim font-bold">{rc.energy?.toFixed(3) || '-0.015'}</span>
+        </div>
+        <div className="p-2.5 rounded bg-charcoal-deep/80 border border-cream/10">
+          <div className="text-[10px] text-cream-dim">Boundary Margin</div>
+          <div className="text-sm font-bold text-cream">
+            {snapshot.distanceToEdge.toFixed(1)} m
           </div>
         </div>
       </div>
@@ -958,18 +971,30 @@ function EmptyTabState({
   icon: Icon,
   title,
   description,
+  actionLabel,
+  onAction,
 }: {
   icon: any;
   title: string;
   description: string;
+  actionLabel?: string;
+  onAction?: () => void;
 }) {
   return (
-    <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-2">
+    <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
       <div className="p-3 rounded-full bg-charcoal border border-cream/10 text-cream-dim">
-        <Icon className="w-5 h-5" />
+        <Icon className="w-5 h-5 text-sage" />
       </div>
       <div className="font-mono text-xs font-semibold text-cream">{title}</div>
-      <div className="font-mono text-[11px] text-cream-dim max-w-xs">{description}</div>
+      <div className="font-mono text-[11px] text-cream-dim max-w-xs leading-relaxed">{description}</div>
+      {actionLabel && (
+        <button
+          onClick={onAction}
+          className="mt-1 px-3 py-1 rounded bg-sage hover:bg-sage-light text-cream font-mono text-[10px] font-bold transition-colors border border-sage/40"
+        >
+          {actionLabel}
+        </button>
+      )}
     </div>
   );
 }

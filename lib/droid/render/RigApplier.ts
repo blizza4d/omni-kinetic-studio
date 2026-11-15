@@ -36,14 +36,18 @@ export class RigApplier {
 
     // 2. Articulated Joint Rotations
     // Roll along X for hip; pitch along Z for thigh and calf
+    // Under Single Frame Convention + standard robot rig:
+    // hip roll rotates around X (negative for outward/inward lateral offset)
+    // thigh pitch rotates around Z (positive swings forward)
+    // calf flexion rotates around Z (negative bends knee backward)
     for (let i = 0; i < state.joints.length; i++) {
       const j = state.joints[i];
       const group = jointGroups[j.name];
       if (group) {
         if (j.name.includes('hip')) {
-          group.rotation.x = j.angle;
+          group.rotation.x = -j.angle;
         } else if (j.name.includes('thigh')) {
-          group.rotation.z = -j.angle;
+          group.rotation.z = j.angle;
         } else if (j.name.includes('calf')) {
           group.rotation.z = j.angle;
         }

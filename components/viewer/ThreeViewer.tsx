@@ -83,11 +83,11 @@ export default function ThreeViewer({
   const canonicalFieldRef = useRef<TerrainField | null>(null);
   const terrainUniformsRef = useRef<{ uEdgeDistance: { value: number } } | null>(null);
 
-  // Preallocated trail buffer (max 180 points)
-  const maxTrailPoints = 180;
+  // Preallocated contiguous trail buffer (max 300 points sampled on distance traveled)
+  const maxTrailPoints = 300;
   const trailBufferRef = useRef<Float32Array>(new Float32Array(maxTrailPoints * 3));
   const trailCountRef = useRef(0);
-  const trailHeadRef = useRef(0);
+  const lastRecordedTrailPosRef = useRef<[number, number, number] | null>(null);
 
   // Dynamic references
   const latestTeleopRef = useRef<TeleopCommand | null>(teleopCommand ?? null);
@@ -158,7 +158,6 @@ export default function ThreeViewer({
     PerfProbe.getInstance().setTier(qualityTier);
   }, [qualityTier]);
 
-
   useEffect(() => {
     if (dustParticlesRef.current) {
       dustParticlesRef.current.visible = showDustParticles && qualityTier !== 'potato';
@@ -201,7 +200,7 @@ export default function ThreeViewer({
     const shadowsEnabled = effectiveTier !== 'low' && effectiveTier !== 'potato';
     const newField = generateCanonicalTerrain(terrainSeed);
     canonicalFieldRef.current = newField;
-    buildCanonicalTerrainMesh(scene, newField, effectiveTier);
+    buildCanonicalTerrainMesh(scene, newField, effectiveTier, terrainUniformsRef);
 
     const debrisCount = envSpec.debris?.count ?? (effectiveTier === 'ultra' ? 1800 : 1200);
     const debris = generateDebrisField(
@@ -212,6 +211,18 @@ export default function ThreeViewer({
     );
     debrisDataRef.current = debris;
     debrisChunksRef.current = buildChunkedDebris(scene, debris, shadowsEnabled);
+
+    // Rebuild goal beacon with accurate terrain clamping
+    if (goalBeaconRef.current) {
+      scene.remove(goalBeaconRef.current);
+    }
+    const goalY = newField.sampleHeight(14.0, -10.0);
+    const newBeacon = buildGoalMarker(scene, [14.0, goalY, -10.0]);
+    goalBeaconRef.current = newBeacon;
+    newBeacon.visible = showOverlaysRef.current;
+
+    // Refresh radar
+    initOffscreenRadar(offscreenRadarRef, debris, 18.0, newField);
   }, [envSpec.terrain?.seed, envSpec.taskId, envSpec.debris?.count]);
 
   // Main Three.js Scene Setup & Loop
@@ -226,14 +237,18 @@ export default function ThreeViewer({
     const width = container.clientWidth || window.innerWidth;
     const height = container.clientHeight || window.innerHeight;
 
-    // 1. Scene, Camera, Renderer
+    // 1. Scene, Camera, Renderer (Authentic Lunar Space Background & Tone Mapping)
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x2a2a2a);
-    scene.fog = new THREE.FogExp2(0x2a2a2a, 0.022);
+    scene.background = new THREE.Color(0x0c0c0c); // Deep lunar space
+    scene.fog = new THREE.Fog(0x0c0c0c, 45, 95); // Linear distance fog
     sceneRef.current = scene;
 
+    // Distant Starfield in Lunar Sky
+    const starfield = buildStarfield();
+    scene.add(starfield);
+
     const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 120);
-    camera.position.set(-3.2, 2.4, 3.8);
+    camera.position.set(-2.5, 1.8, 3.2);
     cameraRef.current = camera;
 
     const effectiveTier = qualityTierRef.current;
@@ -251,6 +266,8 @@ export default function ThreeViewer({
     renderer.shadowMap.enabled = shadowsEnabled;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
     rendererRef.current = renderer;
     container.appendChild(renderer.domElement);
 
@@ -263,12 +280,13 @@ export default function ThreeViewer({
       }
     } catch {}
 
-    // 2. Lighting (24m expanded shadow frustum & calibrated contrast)
-    const ambientLight = new THREE.AmbientLight(0xfdfbf7, 0.35);
+    // 2. Calibrated Lighting (Low-angle directional key + regolith bounce hemisphere fill)
+    const ambientLight = new THREE.AmbientLight(0xfdfbf7, 0.25);
     scene.add(ambientLight);
 
+    // Key directional light: ~22 deg elevation
     const dirLight = new THREE.DirectionalLight(0xfdfbf7, 1.55);
-    dirLight.position.set(8, 16, 10);
+    dirLight.position.set(8, 14, 10);
     dirLight.castShadow = shadowsEnabled;
     dirLight.shadow.mapSize.width = effectiveTier === 'ultra' ? 2048 : effectiveTier === 'high' ? 1024 : 512;
     dirLight.shadow.mapSize.height = dirLight.shadow.mapSize.width;
@@ -279,30 +297,34 @@ export default function ThreeViewer({
     dirLight.shadow.camera.right = 12.0;
     dirLight.shadow.camera.top = 12.0;
     dirLight.shadow.camera.bottom = -12.0;
-    dirLight.shadow.bias = -0.0006;
+    dirLight.shadow.bias = -0.0004;
     dirLight.shadow.normalBias = 0.02;
     scene.add(dirLight);
     scene.add(dirLight.target);
     dirLightRef.current = dirLight;
 
-    const fillLight = new THREE.DirectionalLight(0x6b705c, 0.30);
+    // Regolith bounce light: cool sky + charcoal ground bounce
+    const hemiLight = new THREE.HemisphereLight(0x6b705c, 0x2a2a2a, 0.45);
+    scene.add(hemiLight);
+
+    const fillLight = new THREE.DirectionalLight(0x6b705c, 0.25);
     fillLight.position.set(-14, 8, -12);
     scene.add(fillLight);
 
-    // 3. Canonical TerrainField v1 (257x257 Int16 grid with regolith shading, contours, and shader rim)
+    // 3. Canonical TerrainField v1 (257x257 Int16 grid with regolith shading, contours, and anti-aliased rim)
     const terrainSeed = latestSpecRef.current.terrain.seed || 42;
     const terrainField = generateCanonicalTerrain(terrainSeed);
     canonicalFieldRef.current = terrainField;
     buildCanonicalTerrainMesh(scene, terrainField, effectiveTier, terrainUniformsRef);
 
-    // 4. Ground Contact Blobs for quadruped feet (Sage when planted, cream-dim when swinging)
+    // 4. Ground Contact Blobs for quadruped feet (Clamped to terrain, polygon-offset, sage when planted)
     const footBlobs = buildFootContactBlobs(scene);
     footBlobsRef.current = footBlobs;
 
     // 5. Fallback Floor Catch Plane at y = -5.0m
-    const catchPlane = buildFloorCatchPlane(scene, 48, 48, -5.0);
+    buildFloorCatchPlane(scene, 48, 48, -5.0);
 
-    // 6. 4x4 Chunked Instanced Debris Boulders (with accurate chunk bounding spheres & zero pyramids)
+    // 6. 4x4 Chunked Instanced Debris Boulders (with accurate chunk bounding spheres, pure white base, zero pyramids)
     const targetDebrisCount = effectiveTier === 'ultra' ? 1800 : effectiveTier === 'high' ? 1200 : effectiveTier === 'medium' ? 800 : 400;
     const debris = generateDebrisField(
       targetDebrisCount,
@@ -314,7 +336,7 @@ export default function ThreeViewer({
     const chunks = buildChunkedDebris(scene, debris, shadowsEnabled);
     debrisChunksRef.current = chunks;
 
-    // 7. Low-Gravity Drifting Dust (Static drift buffer, 0 CPU mutations)
+    // 7. Low-Gravity Drifting Dust
     if (effectiveTier !== 'potato') {
       const dust = buildDustParticles(scene, 40, 40);
       dustParticlesRef.current = dust;
@@ -324,9 +346,11 @@ export default function ThreeViewer({
       lunarDustRef.current = lunarDust;
     }
 
-    // 8. Goal Marker (V4: Ground ring + soft column of light)
-    const beacon = buildGoalMarker(scene, [14.0, 0, -10.0]);
+    // 8. Goal Marker (Base raycasted directly onto terrain surface, compact 0.6m ring)
+    const goalY = terrainField.sampleHeight(14.0, -10.0);
+    const beacon = buildGoalMarker(scene, [14.0, goalY, -10.0]);
     goalBeaconRef.current = beacon;
+    beacon.visible = showOverlaysRef.current;
 
     // 9. Articulated 12-DOF Quadruped
     const { robotGroup, jointGroups, colliderSphere } = build12DOFQuadruped(false);
@@ -343,18 +367,20 @@ export default function ThreeViewer({
     ghostRobotGroupRef.current = ghostGroup;
     ghostJointMeshesRef.current = ghostJoints;
 
-    // 10. Motion Trail Ribbon (Preallocated Buffer)
+    // 10. Motion Trail Ribbon (Draped on terrain surface, distance-sampled, zero wrap jumps)
     const trailGeometry = new THREE.BufferGeometry();
     trailGeometry.setAttribute('position', new THREE.BufferAttribute(trailBufferRef.current, 3));
     const trailMaterial = new THREE.LineBasicMaterial({
-      color: 0x6b705c,
+      color: 0x6b705c, // Sage
       transparent: true,
-      opacity: 0.7,
+      opacity: 0.45,
       linewidth: 2,
     });
     const trailLine = new THREE.Line(trailGeometry, trailMaterial);
+    trailLine.frustumCulled = false;
     scene.add(trailLine);
     trailLineRef.current = trailLine;
+    trailLine.visible = showOverlaysRef.current;
 
     // 11. Collision Flash Ring
     const flashGeo = new THREE.RingGeometry(0.2, 0.6, 24);
@@ -369,14 +395,14 @@ export default function ThreeViewer({
     scene.add(flashMesh);
     collisionFlashRef.current = flashMesh;
 
-    // 12. Pre-render Static Radar Canvas Layer (with Canonical Terrain Hillshade & Square Arena Outline)
+    // 12. Pre-render Static Radar Canvas Layer (with Canonical Terrain Hillshade & Filtered Obstacles)
     initOffscreenRadar(offscreenRadarRef, debris, 18.0, terrainField);
 
-    // Camera Rig angles (Framed with pitch ~30 deg, robot in lower-center third)
+    // Camera Rig angles (Default framed for rule-of-thirds: dist 3.5m, pitch ~18 deg)
     let isMouseDown = false;
     let prevMouseX = 0;
     let prevMouseY = 0;
-    let targetCameraAngle = { yaw: -0.85, pitch: 0.52, dist: 4.5 };
+    let targetCameraAngle = { yaw: -0.40, pitch: 0.32, dist: 3.5 };
     let currentCameraAngle = { ...targetCameraAngle };
 
     const onMouseDown = (e: MouseEvent) => {
@@ -395,7 +421,7 @@ export default function ThreeViewer({
     };
     const onMouseUp = () => { isMouseDown = false; };
     const onWheel = (e: WheelEvent) => {
-      targetCameraAngle.dist = Math.max(1.8, Math.min(14.0, targetCameraAngle.dist + e.deltaY * 0.005));
+      targetCameraAngle.dist = Math.max(1.8, Math.min(10.0, targetCameraAngle.dist + e.deltaY * 0.005));
     };
 
     container.addEventListener('mousedown', onMouseDown);
@@ -466,7 +492,6 @@ export default function ThreeViewer({
       animationFrameId = requestAnimationFrame(animate);
 
       const now = performance.now();
-      const rawDt = Math.min(0.1, (now - lastTime) / 1000);
       lastTime = now;
       const dt = pacer.tick(now);
 
@@ -493,6 +518,7 @@ export default function ThreeViewer({
       const isNewAnim = isNewAnimationRef.current;
       const robotPos = new THREE.Vector3(0, 0.45, 0);
       const robotVel: [number, number, number] = [0, 0, 0];
+      let robotYaw = 0;
       let frameCollisions: any[] | undefined = undefined;
 
       if (isNewAnim) {
@@ -514,6 +540,10 @@ export default function ThreeViewer({
           );
           robotPos.copy(robotGroupRef.current.position);
 
+          // Compute yaw from quaternion for radar alignment
+          const q = robotGroupRef.current.quaternion;
+          robotYaw = Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z));
+
           // Update terrain rim shader proximity uniform
           const robotDistToEdge = Math.max(
             0,
@@ -523,27 +553,31 @@ export default function ThreeViewer({
             terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
           }
 
-          // Articulated joints update
+          // Articulated joints update (Corrected signs for Single Frame Convention)
           const joints = jointMeshesRef.current;
           for (const [name, angle] of Object.entries(interpFrame.joints)) {
             const group = joints[name];
             if (group) {
-              if (name.includes('hip')) group.rotation.x = angle;
-              if (name.includes('thigh')) group.rotation.z = -angle;
+              if (name.includes('hip')) group.rotation.x = -angle;
+              if (name.includes('thigh')) group.rotation.z = angle;
               if (name.includes('calf')) group.rotation.z = angle;
             }
           }
 
-          // Feet & Contact Blobs update
+          // Feet & Contact Blobs update (Clamped directly to terrain surface)
           if (interpFrame.feet && interpFrame.feet.length > 0 && footBlobsRef.current.length === 4) {
             for (let fi = 0; fi < interpFrame.feet.length; fi++) {
               const foot = interpFrame.feet[fi];
               const blob = footBlobsRef.current[fi];
               if (blob) {
-                blob.position.set(foot.pos[0], foot.pos[1] + 0.012, foot.pos[2]);
+                const groundY = canonicalFieldRef.current
+                  ? canonicalFieldRef.current.sampleHeight(foot.pos[0], foot.pos[2])
+                  : foot.pos[1];
+                blob.position.set(foot.pos[0], groundY + 0.003, foot.pos[2]);
+                const clearance = Math.max(0, foot.pos[1] - groundY);
                 const bMat = blob.material as THREE.MeshBasicMaterial;
                 bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
-                bMat.opacity = foot.contact ? 0.85 : 0.22;
+                bMat.opacity = foot.contact ? 0.85 : Math.max(0, Math.min(0.25, 0.25 * (1 - clearance / 0.12)));
               }
 
               const wasContact = prevFootContactsRef.current[fi];
@@ -560,26 +594,33 @@ export default function ThreeViewer({
             for (const [name, angle] of Object.entries(interpFrame.joints)) {
               const group = ghostJointMeshesRef.current[name];
               if (group) {
-                if (name.includes('hip')) group.rotation.x = angle * 0.85;
-                if (name.includes('thigh')) group.rotation.z = -angle * 0.85;
+                if (name.includes('hip')) group.rotation.x = -angle * 0.85;
+                if (name.includes('thigh')) group.rotation.z = angle * 0.85;
                 if (name.includes('calf')) group.rotation.z = angle * 0.85;
               }
             }
           }
 
-          // Preallocated Trail update
-          const trailBuf = trailBufferRef.current;
-          const head = trailHeadRef.current;
-          trailBuf[head * 3] = robotPos.x;
-          trailBuf[head * 3 + 1] = robotPos.y + 0.05;
-          trailBuf[head * 3 + 2] = robotPos.z;
-          trailHeadRef.current = (head + 1) % maxTrailPoints;
-          if (trailCountRef.current < maxTrailPoints) trailCountRef.current++;
+          // Draped Terrain Trail update (Distance sampled, zero wrap jumps)
+          const lastPos = lastRecordedTrailPosRef.current;
+          const distMoved = lastPos ? Math.hypot(robotPos.x - lastPos[0], robotPos.z - lastPos[2]) : 1.0;
+          if (distMoved >= 0.10 && trailCountRef.current < maxTrailPoints) {
+            const trailBuf = trailBufferRef.current;
+            const idx = trailCountRef.current;
+            const groundY = canonicalFieldRef.current
+              ? canonicalFieldRef.current.sampleHeight(robotPos.x, robotPos.z)
+              : robotPos.y;
+            trailBuf[idx * 3] = robotPos.x;
+            trailBuf[idx * 3 + 1] = groundY + 0.012;
+            trailBuf[idx * 3 + 2] = robotPos.z;
+            trailCountRef.current++;
+            lastRecordedTrailPosRef.current = [robotPos.x, robotPos.y, robotPos.z];
 
-          if (trailLineRef.current) {
-            const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
-            attr.needsUpdate = true;
-            trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
+            if (trailLineRef.current) {
+              const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
+              attr.needsUpdate = true;
+              trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
+            }
           }
 
           // Boundary Warning & Rim Pulse
@@ -617,7 +658,7 @@ export default function ThreeViewer({
           }
         }
       } else {
-        // --- LEGACY BASELINE PIPELINE (for A/B comparison) ---
+        // --- LEGACY BASELINE PIPELINE ---
         const frame = store.getLatestFrame() || currentFrameRef.current;
 
         if (robotGroupRef.current && frame?.bodies && frame.bodies.length > 0) {
@@ -628,6 +669,9 @@ export default function ThreeViewer({
           robotGroupRef.current.quaternion.set(torso.quat[0], torso.quat[1], torso.quat[2], torso.quat[3]);
           robotPos.copy(robotGroupRef.current.position);
 
+          const q = robotGroupRef.current.quaternion;
+          robotYaw = Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z));
+
           const robotDistToEdge = Math.max(0, DEFAULT_ARENA.halfExtent - Math.max(Math.abs(robotPos.x), Math.abs(robotPos.z)));
           if (terrainUniformsRef.current) {
             terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
@@ -637,8 +681,8 @@ export default function ThreeViewer({
           for (const j of frame.joints) {
             const group = joints[j.name];
             if (group) {
-              if (j.name.includes('hip')) group.rotation.x = j.angle;
-              if (j.name.includes('thigh')) group.rotation.z = -j.angle;
+              if (j.name.includes('hip')) group.rotation.x = -j.angle;
+              if (j.name.includes('thigh')) group.rotation.z = j.angle;
               if (j.name.includes('calf')) group.rotation.z = j.angle;
             }
           }
@@ -648,10 +692,14 @@ export default function ThreeViewer({
               const foot = frame.feet[fi];
               const blob = footBlobsRef.current[fi];
               if (blob) {
-                blob.position.set(foot.pos[0], foot.pos[1] + 0.012, foot.pos[2]);
+                const groundY = canonicalFieldRef.current
+                  ? canonicalFieldRef.current.sampleHeight(foot.pos[0], foot.pos[2])
+                  : foot.pos[1];
+                blob.position.set(foot.pos[0], groundY + 0.003, foot.pos[2]);
+                const clearance = Math.max(0, foot.pos[1] - groundY);
                 const bMat = blob.material as THREE.MeshBasicMaterial;
                 bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
-                bMat.opacity = foot.contact ? 0.85 : 0.22;
+                bMat.opacity = foot.contact ? 0.85 : Math.max(0, Math.min(0.25, 0.25 * (1 - clearance / 0.12)));
               }
 
               const wasContact = prevFootContactsRef.current[fi];
@@ -667,25 +715,32 @@ export default function ThreeViewer({
             for (const j of frame.joints) {
               const group = ghostJointMeshesRef.current[j.name];
               if (group) {
-                if (j.name.includes('hip')) group.rotation.x = j.angle * 0.85;
-                if (j.name.includes('thigh')) group.rotation.z = -j.angle * 0.85;
+                if (j.name.includes('hip')) group.rotation.x = -j.angle * 0.85;
+                if (j.name.includes('thigh')) group.rotation.z = j.angle * 0.85;
                 if (j.name.includes('calf')) group.rotation.z = j.angle * 0.85;
               }
             }
           }
 
-          const trailBuf = trailBufferRef.current;
-          const head = trailHeadRef.current;
-          trailBuf[head * 3] = robotPos.x;
-          trailBuf[head * 3 + 1] = robotPos.y + 0.05;
-          trailBuf[head * 3 + 2] = robotPos.z;
-          trailHeadRef.current = (head + 1) % maxTrailPoints;
-          if (trailCountRef.current < maxTrailPoints) trailCountRef.current++;
+          const lastPos = lastRecordedTrailPosRef.current;
+          const distMoved = lastPos ? Math.hypot(robotPos.x - lastPos[0], robotPos.z - lastPos[2]) : 1.0;
+          if (distMoved >= 0.10 && trailCountRef.current < maxTrailPoints) {
+            const trailBuf = trailBufferRef.current;
+            const idx = trailCountRef.current;
+            const groundY = canonicalFieldRef.current
+              ? canonicalFieldRef.current.sampleHeight(robotPos.x, robotPos.z)
+              : robotPos.y;
+            trailBuf[idx * 3] = robotPos.x;
+            trailBuf[idx * 3 + 1] = groundY + 0.012;
+            trailBuf[idx * 3 + 2] = robotPos.z;
+            trailCountRef.current++;
+            lastRecordedTrailPosRef.current = [robotPos.x, robotPos.y, robotPos.z];
 
-          if (trailLineRef.current) {
-            const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
-            attr.needsUpdate = true;
-            trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
+            if (trailLineRef.current) {
+              const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
+              attr.needsUpdate = true;
+              trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
+            }
           }
 
           const distFromCenter = Math.hypot(robotPos.x, robotPos.z);
@@ -722,7 +777,7 @@ export default function ThreeViewer({
       const clampedLookZ = Math.max(-maxCameraEnvelope, Math.min(maxCameraEnvelope, robotPos.z));
 
       if (isNewAnim) {
-        // --- NEW FLUID CAMERA RIG (Critically damped springs, look-ahead, terrain clearance, roll-locked) ---
+        // --- NEW FLUID CAMERA RIG (Critically damped springs, rule-of-thirds framing, roll-locked) ---
         cameraRig.update(
           camera,
           [clampedLookX, robotPos.y, clampedLookZ],
@@ -748,21 +803,21 @@ export default function ThreeViewer({
           currentCameraAngle.dist += (targetCameraAngle.dist - currentCameraAngle.dist) * 0.12;
 
           const camX = clampedLookX + Math.sin(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
-          const rawCamY = robotPos.y + Math.sin(currentCameraAngle.pitch) * currentCameraAngle.dist + 0.4;
+          const rawCamY = robotPos.y + Math.sin(currentCameraAngle.pitch) * currentCameraAngle.dist + 0.35;
           const camZ = clampedLookZ + Math.cos(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
           
           const groundAtCam = canonicalFieldRef.current ? canonicalFieldRef.current.sampleHeight(camX, camZ) : 0;
           const clampedCamY = Math.max(groundAtCam + 0.45, rawCamY);
 
           camera.position.set(camX, clampedCamY, camZ);
-          camera.lookAt(clampedLookX, robotPos.y + 0.2, clampedLookZ);
+          camera.lookAt(clampedLookX, robotPos.y + 0.25, clampedLookZ);
         }
       }
 
       // Tight Following Shadow Camera updates (Throttled to 30 Hz)
       shadowUpdateFrame++;
       if (dirLightRef.current && shadowsEnabled && shadowUpdateFrame % 2 === 0) {
-        dirLightRef.current.position.set(robotPos.x + 8, robotPos.y + 16, robotPos.z + 10);
+        dirLightRef.current.position.set(robotPos.x + 8, robotPos.y + 14, robotPos.z + 10);
         dirLightRef.current.target.position.set(robotPos.x, robotPos.y, robotPos.z);
         dirLightRef.current.target.updateMatrixWorld();
       }
@@ -781,6 +836,7 @@ export default function ThreeViewer({
           radarCanvasRef.current,
           offscreenRadarRef.current,
           robotPos,
+          robotYaw,
           debrisDataRef.current,
           radarSweepAngle,
           frameCollisions
@@ -877,6 +933,32 @@ export default function ThreeViewer({
 }
 
 /**
+ * Builds distant background starfield points for airless lunar sky.
+ */
+function buildStarfield(): THREE.Points {
+  const count = 350;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(Math.random() * 0.85); // Upper hemisphere only
+    const r = 90.0;
+    pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+    pos[i * 3 + 1] = r * Math.cos(phi) + 10.0;
+    pos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0xfdfbf7,
+    size: 1.2,
+    transparent: true,
+    opacity: 0.55,
+    sizeAttenuation: false,
+  });
+  return new THREE.Points(geo, mat);
+}
+
+/**
  * Creates subdivided noise-perturbed icosahedron boulder (>= 80 triangles, zero pyramids).
  */
 function createDisplacedIcosahedron(radius: number, detail = 1, seed = 0): THREE.BufferGeometry {
@@ -895,7 +977,7 @@ function createDisplacedIcosahedron(radius: number, detail = 1, seed = 0): THREE
 }
 
 /**
- * Builds canonical 257x257 TerrainField mesh with slope tinting, contours, and surface-draped rim.
+ * Builds canonical 257x257 TerrainField mesh with slope tinting, contours, and anti-aliased surface-draped rim.
  */
 function buildCanonicalTerrainMesh(
   scene: THREE.Scene,
@@ -953,8 +1035,7 @@ function buildCanonicalTerrainMesh(
        uniform float uEdgeDistance;`
     );
 
-    // Pre-fog injection: Shading, contours, and proximity rim are evaluated before fog,
-    // ensuring natural atmospheric fog falloff toward the horizon
+    // Pre-fog injection: Shading, contours, and anti-aliased proximity rim
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <fog_fragment>',
       `// 1. Slope-tinted shading (sage for flat plains, darker charcoal for steep slopes)
@@ -979,39 +1060,39 @@ function buildCanonicalTerrainMesh(
          }
        }
 
-       // 4. Square Arena Boundary Rim (Surface-Draped at 18m)
+       // 4. Square Arena Boundary Rim (Surface-draped, anti-aliased fwidth, distance fade, <= 35% opacity)
        float distArena = max(abs(vWorldPos.x), abs(vWorldPos.z));
-       if (distArena >= 17.88 && distArena <= 18.08) {
-         float dash = fract((vWorldPos.x + vWorldPos.z) * 0.75);
-         if (dash > 0.35) {
-           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.75);
-         }
+       float rimDist = abs(distArena - 18.0);
+       float rimWidth = max(0.04, fwidth(distArena) * 1.5);
+       float rimAlpha = 1.0 - smoothstep(0.0, rimWidth, rimDist);
+       float rimFade = 1.0 - smoothstep(18.0, 32.0, camDist);
+       float dash = fract((vWorldPos.x + vWorldPos.z) * 1.0); // 0.5m on / 0.5m off
+       if (dash < 0.5 && rimAlpha > 0.01 && rimFade > 0.01) {
+         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.28 * rimAlpha * rimFade);
        }
 
-       // 5. Soft margin proximity warning: brick red glow band ONLY when robot is close (uEdgeDistance <= 2.5m)
-       float robotProximity = smoothstep(2.5, 0.0, uEdgeDistance);
-       if (robotProximity > 0.001 && distArena >= 16.5 && distArena < 17.88) {
-         float warnT = smoothstep(16.5, 17.88, distArena);
-         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.72, 0.23, 0.18), warnT * robotProximity * 0.45);
+       // 5. Proximity boundary alert glow (Gated strictly by uEdgeDistance < 2.5m)
+       if (uEdgeDistance < 2.5) {
+         float alertIntensity = smoothstep(2.5, 0.0, uEdgeDistance) * 0.45;
+         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.72, 0.23, 0.18), alertIntensity);
        }
-
        #include <fog_fragment>`
     );
   };
 
-  const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
-  terrainMesh.name = 'canonical_terrain_mesh';
-  terrainMesh.receiveShadow = true;
-  scene.add(terrainMesh);
-  return terrainMesh;
+  const mesh = new THREE.Mesh(terrainGeo, terrainMat);
+  mesh.name = 'canonical_terrain_mesh';
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
 }
 
 /**
- * Builds ground contact blob shadows under quadruped feet (Sage when planted, cream-dim when swinging).
+ * Builds ground contact shadow blobs under planted quadruped feet with polygon offset.
  */
 function buildFootContactBlobs(scene: THREE.Scene): THREE.Mesh[] {
   const blobs: THREE.Mesh[] = [];
-  const geo = new THREE.CircleGeometry(0.08, 16);
+  const geo = new THREE.CircleGeometry(0.07, 16);
   geo.rotateX(-Math.PI / 2);
 
   for (let i = 0; i < 4; i++) {
@@ -1020,6 +1101,9 @@ function buildFootContactBlobs(scene: THREE.Scene): THREE.Mesh[] {
       transparent: true,
       opacity: 0.85,
       depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(0, -10, 0); // initial off-screen
@@ -1048,10 +1132,9 @@ function buildFloorCatchPlane(scene: THREE.Scene, width: number, length: number,
 }
 
 /**
- * Builds 4x4 spatial chunked instanced debris boulders with accurate chunk bounding spheres & zero pyramids.
+ * Builds 4x4 spatial chunked instanced debris boulders with pure white base material and authentic geological tones.
  */
 function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enableShadows = true): THREE.InstancedMesh[] {
-  // Partition debris by 4x4 chunkId (0 to 15)
   const chunks: DebrisInstance[][] = Array.from({ length: 16 }, () => []);
   for (const d of debris) {
     const cid = d.chunkId ?? 0;
@@ -1064,19 +1147,20 @@ function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enable
   const boulderGeo3 = createDisplacedIcosahedron(0.20, 1, 303);
   const sharedGeos = [boulderGeo1, boulderGeo2, boulderGeo3];
 
+  // Base material MUST be pure white (0xffffff) so instanceColor applies true luminance
   const debrisMat = new THREE.MeshStandardMaterial({
-    color: 0x4a4a44, // Token --rock-top
-    roughness: 0.82,
-    metalness: 0.15,
-    flatShading: true,
+    color: 0xffffff,
+    roughness: 0.90,
+    metalness: 0.05,
+    flatShading: false,
   });
 
   const colorVariation = [
+    new THREE.Color(0x52524b),
     new THREE.Color(0x4a4a44),
-    new THREE.Color(0x56564e),
     new THREE.Color(0x3e3e38),
-    new THREE.Color(0x50524a),
-    new THREE.Color(0x42443e),
+    new THREE.Color(0x56564e),
+    new THREE.Color(0x44443e),
   ];
 
   const dummy = new THREE.Object3D();
@@ -1110,7 +1194,6 @@ function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enable
       instancedMesh.instanceColor.needsUpdate = true;
     }
 
-    // Accurate spatial chunk bounding sphere for reliable frustum culling
     const chunkSphere = new THREE.Sphere();
     chunkBox.getBoundingSphere(chunkSphere);
     chunkSphere.radius += 0.8;
@@ -1127,7 +1210,7 @@ function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enable
 }
 
 /**
- * Builds low-gravity drifting dust particles with soft circular alpha mask (zero square artifacts).
+ * Builds low-gravity drifting dust particles with soft circular alpha mask.
  */
 function buildDustParticles(scene: THREE.Scene, width: number, length: number): THREE.Points {
   const particleCount = 400;
@@ -1141,7 +1224,6 @@ function buildDustParticles(scene: THREE.Scene, width: number, length: number): 
   }
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
-  // Circular particle texture eliminates square gl_PointSize artifacts
   const canvas = document.createElement('canvas');
   canvas.width = 32;
   canvas.height = 32;
@@ -1171,29 +1253,37 @@ function buildDustParticles(scene: THREE.Scene, width: number, length: number): 
 }
 
 /**
- * Builds goal marker: ring on the ground plus soft column of light (V4).
+ * Builds goal marker: terrain-grounded ring (0.6m radius) plus soft column of light (height 2.5m).
  */
 function buildGoalMarker(scene: THREE.Scene, position: [number, number, number]): THREE.Group {
   const beaconGroup = new THREE.Group();
-  beaconGroup.position.set(position[0], position[1] + 0.05, position[2]);
+  beaconGroup.position.set(position[0], position[1] + 0.02, position[2]);
 
-  // Ground ring
-  const ringGeo = new THREE.TorusGeometry(1.2, 0.04, 8, 32);
+  // Ground ring: cream-dim, 0.6m radius
+  const ringGeo = new THREE.TorusGeometry(0.6, 0.03, 8, 32);
   ringGeo.rotateX(-Math.PI / 2);
-  const ringMat = new THREE.MeshBasicMaterial({ color: 0x6b705c, transparent: true, opacity: 0.9 });
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0xfdfbf7,
+    transparent: true,
+    opacity: 0.60,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+  });
   const ring = new THREE.Mesh(ringGeo, ringMat);
   beaconGroup.add(ring);
 
-  // Soft translucent light column
-  const beamGeo = new THREE.CylinderGeometry(0.8, 1.2, 3.5, 16, 1, true);
+  // Soft translucent light column (height 2.5m)
+  const beamGeo = new THREE.CylinderGeometry(0.45, 0.65, 2.5, 16, 1, true);
   const beamMat = new THREE.MeshBasicMaterial({
     color: 0x6b705c,
     transparent: true,
-    opacity: 0.2,
+    opacity: 0.22,
     side: THREE.DoubleSide,
+    depthWrite: false,
   });
   const beam = new THREE.Mesh(beamGeo, beamMat);
-  beam.position.y = 1.75;
+  beam.position.y = 1.25;
   beaconGroup.add(beam);
 
   scene.add(beaconGroup);
@@ -1245,7 +1335,6 @@ function build12DOFQuadruped(isGhost = false) {
   const thighLen = 0.22;
   const calfLen = 0.22;
 
-  // Cream-dim bones (#E8E6E0) and sage joint markers (#6B705C)
   const boneMat = isGhost
     ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.35, roughness: 0.5 })
     : new THREE.MeshStandardMaterial({ color: 0xe8e6e0, roughness: 0.42, metalness: 0.4 });
@@ -1295,7 +1384,7 @@ function build12DOFQuadruped(isGhost = false) {
 }
 
 /**
- * Initializes offscreen cached background for Radar (Canonical hillshade, square arena outline, debris dots).
+ * Initializes offscreen cached background for Radar (Canonical hillshade, square arena outline, filtered obstacles).
  */
 function initOffscreenRadar(
   offscreenRef: React.MutableRefObject<HTMLCanvasElement | null>,
@@ -1329,11 +1418,11 @@ function initOffscreenRadar(
         const hz = field.sampleHeight(wx, wz + 0.3);
         const gx = (hx - h0) / 0.3;
         const gz = (hz - h0) / 0.3;
-        const shade = Math.max(0, Math.min(255, Math.floor(38 + (gx * 38 - gz * 25))));
+        const shade = Math.max(0, Math.min(255, Math.floor(34 + (gx * 32 - gz * 20))));
         imgData.data[idx] = shade;
-        imgData.data[idx + 1] = shade + 3;
+        imgData.data[idx + 1] = shade + 2;
         imgData.data[idx + 2] = shade;
-        imgData.data[idx + 3] = 160;
+        imgData.data[idx + 3] = 140;
       }
     }
     ctx.putImageData(imgData, cx - 58, cy - 58);
@@ -1341,34 +1430,30 @@ function initOffscreenRadar(
 
   // 2. Square Arena Boundary Outline (18m x 18m)
   const sqHalf = (18.0 / 20.0) * rangeRadius;
-  ctx.strokeStyle = 'rgba(253, 251, 247, 0.45)';
-  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = 'rgba(253, 251, 247, 0.40)';
+  ctx.lineWidth = 1.0;
   ctx.setLineDash([4, 3]);
   ctx.strokeRect(cx - sqHalf, cy - sqHalf, sqHalf * 2, sqHalf * 2);
-
-  // Soft Margin Alert Boundary (16m x 16m)
-  const softHalf = (16.0 / 20.0) * rangeRadius;
-  ctx.strokeStyle = 'rgba(184, 59, 47, 0.35)';
-  ctx.strokeRect(cx - softHalf, cy - softHalf, softHalf * 2, softHalf * 2);
   ctx.setLineDash([]);
 
-  // 3. Range Rings (Subtle reference circles)
+  // 3. Range Rings (Subtle reference circles at 5m and 10m)
   ctx.strokeStyle = 'rgba(253, 251, 247, 0.08)';
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.arc(cx, cy, rangeRadius * 0.65, 0, Math.PI * 2);
-  ctx.arc(cx, cy, rangeRadius * 0.35, 0, Math.PI * 2);
+  ctx.arc(cx, cy, (10.0 / 20.0) * rangeRadius, 0, Math.PI * 2);
+  ctx.arc(cx, cy, (5.0 / 20.0) * rangeRadius, 0, Math.PI * 2);
   ctx.stroke();
 
-  // 4. Debris Dots (Bold obstacles, faint pebbles)
-  for (const d of debris) {
+  // 4. Debris Dots: Filtered to prominent hazard boulders (scale >= 0.44) to prevent white-noise clutter
+  const obstacles = debris.filter((d) => d.scale >= 0.44);
+  for (const d of obstacles) {
     const dx = cx + d.x * scale;
     const dy = cy + d.z * scale;
     const dist = Math.hypot(dx - cx, dy - cy);
     if (dist <= rangeRadius) {
-      ctx.fillStyle = d.scale > 0.35 ? 'rgba(253, 251, 247, 0.45)' : 'rgba(107, 112, 92, 0.35)';
+      ctx.fillStyle = 'rgba(253, 251, 247, 0.40)';
       ctx.beginPath();
-      ctx.arc(dx, dy, d.scale > 0.35 ? 1.5 : 1.0, 0, Math.PI * 2);
+      ctx.arc(dx, dy, 1.2, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -1382,16 +1467,29 @@ function initOffscreenRadar(
   ctx.lineTo(cx + rangeRadius, cy);
   ctx.stroke();
 
+  // 5. 10m Scale Bar Legend in corner
+  const scaleBarPx = 10.0 * scale;
+  ctx.strokeStyle = 'rgba(253, 251, 247, 0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(12, 120);
+  ctx.lineTo(12 + scaleBarPx, 120);
+  ctx.stroke();
+  ctx.font = '8px monospace';
+  ctx.fillStyle = 'rgba(253, 251, 247, 0.45)';
+  ctx.fillText('10m', 14, 116);
+
   offscreenRef.current = canvas;
 }
 
 /**
- * Fast 2-Layer Radar Rendering (Cached static background + dynamic sweep line & arrow).
+ * 2-Layer Radar Rendering (Robot-centered, real heading rotation, goal indicator).
  */
 function renderCachedTerrainRadar(
   canvas: HTMLCanvasElement | null,
   offscreenBg: HTMLCanvasElement | null,
   robotPos: THREE.Vector3,
+  robotYaw: number,
   debris: DebrisInstance[],
   sweepAngle: number,
   collisions?: any[]
@@ -1409,31 +1507,42 @@ function renderCachedTerrainRadar(
 
   ctx.clearRect(0, 0, w, h);
 
-  // 1. Draw pre-rendered static background
+  // 1. Draw pre-rendered static background offset relative to robot position
   if (offscreenBg) {
-    ctx.drawImage(offscreenBg, 0, 0);
+    const offsetX = -robotPos.x * scale;
+    const offsetY = -robotPos.z * scale;
+    ctx.save();
+    // Clip to radar circular aperture
+    ctx.beginPath();
+    ctx.arc(cx, cy, rangeRadius, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(offscreenBg, offsetX, offsetY);
+    ctx.restore();
   }
 
   // 2. Rotating sweep line
   ctx.strokeStyle = 'rgba(107, 112, 92, 0.35)';
-  ctx.lineWidth = 1.5;
+  ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.moveTo(cx, cy);
   ctx.lineTo(cx + Math.cos(sweepAngle) * rangeRadius, cy + Math.sin(sweepAngle) * rangeRadius);
   ctx.stroke();
 
-  // 3. Goal Marker at (14m, -10m)
+  // 3. Goal Marker at (14m, -10m) relative to robot
   const gx = cx + (14.0 - robotPos.x) * scale;
   const gy = cy + (-10.0 - robotPos.z) * scale;
   const distToGoal = Math.hypot(gx - cx, gy - cy);
 
-  if (distToGoal < rangeRadius) {
+  if (distToGoal < rangeRadius - 4) {
     ctx.fillStyle = '#6B705C';
     ctx.beginPath();
     ctx.arc(gx, gy, 3, 0, Math.PI * 2);
     ctx.fill();
+    ctx.strokeStyle = '#FDFBF7';
+    ctx.lineWidth = 1;
+    ctx.stroke();
   } else {
-    // Off-screen edge arrow
+    // Off-screen edge arrow indicator
     const angleToGoal = Math.atan2(gy - cy, gx - cx);
     const edgeX = cx + Math.cos(angleToGoal) * (rangeRadius - 4);
     const edgeY = cy + Math.sin(angleToGoal) * (rangeRadius - 4);
@@ -1443,16 +1552,25 @@ function renderCachedTerrainRadar(
     ctx.fill();
   }
 
-  // 4. Robot Heading Arrow at Center
+  // 4. Robot Heading Arrow at Center (Rotates truthfully with robotYaw, size >= 14px)
   ctx.save();
   ctx.translate(cx, cy);
+  // In Single Frame Convention: yaw angle from +X (East). Canvas: -Y is North.
+  // rot = atan2(vz, vx) + PI/2 = -yaw + PI/2 (with Three.js yaw)
+  ctx.rotate(-robotYaw + Math.PI / 2);
   ctx.fillStyle = '#FDFBF7';
   ctx.beginPath();
-  ctx.moveTo(0, -5);
-  ctx.lineTo(3.5, 3.5);
-  ctx.lineTo(0, 1.5);
-  ctx.lineTo(-3.5, 3.5);
+  ctx.moveTo(0, -8);
+  ctx.lineTo(5, 6);
+  ctx.lineTo(0, 3);
+  ctx.lineTo(-5, 6);
   ctx.closePath();
+  ctx.fill();
+
+  // Sage center position indicator dot
+  ctx.fillStyle = '#6B705C';
+  ctx.beginPath();
+  ctx.arc(0, 1, 1.8, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 

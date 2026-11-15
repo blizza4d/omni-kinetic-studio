@@ -25,7 +25,7 @@ export function getBuildStamp(): BuildStamp {
   return BuildStampSchema.parse({
     sha: gitSha.substring(0, 8),
     branch,
-    iterationTag: isProd ? 'v1.0.0-production' : 'v1.0.0-dev',
+    iterationTag: isProd ? 'v1.0.0' : 'v1.0.0-dev',
     buildType: isProd ? 'production' : 'development',
     contractVersions: {
       EnvironmentSpec: 'v4',
