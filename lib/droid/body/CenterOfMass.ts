@@ -43,35 +43,34 @@ export class CenterOfMassTrajectory {
     let vy = 0;
 
     if (gaitParams.isBounding) {
-      // Ballistic Flight Phase under actual gravity g
-      // In trot/bound, flight phase occurs when masterPhase is in flight window
-      const flightDuration = (2.0 * 0.18) / g; // 2 * vy_takeoff / g
+      // Ballistic Flight / Bounding dynamic height variation under g
       const phaseCycle = masterPhase % Math.PI; // Twice per full stride
       const normCycle = phaseCycle / Math.PI;
 
       if (normCycle > gaitParams.dutyFactor) {
-        // True flight phase: parabolic trajectory under g
+        // Aerial rebound peak bounded to prevent leg overextension
         const flightProgress = (normCycle - gaitParams.dutyFactor) / Math.max(0.01, 1.0 - gaitParams.dutyFactor);
-        const tFlight = flightProgress * flightDuration;
-        // Parabola: y(t) = v0*t - 0.5*g*t^2
-        const v0 = 0.5 * g * flightDuration;
-        comOffset = v0 * tFlight - 0.5 * g * tFlight * tFlight;
-        vy = v0 - g * tFlight;
+        const peakHeight = Math.min(0.012, 0.008 * (1.62 / g));
+        comOffset = Math.sin(flightProgress * Math.PI) * peakHeight;
+        vy = Math.cos(flightProgress * Math.PI) * 0.12;
       } else {
         // Stance compression/absorb phase
         const stanceProgress = normCycle / Math.max(0.01, gaitParams.dutyFactor);
-        comOffset = -0.018 * Math.sin(stanceProgress * Math.PI);
+        comOffset = -0.016 * Math.sin(stanceProgress * Math.PI);
         vy = 0;
       }
     } else {
       // Walking gait: Inverted pendulum oscillation at 2x step frequency
       const bobFreq = masterPhase * 2.0;
-      const bobAmplitude = 0.014 * (gaitParams.gravity / 9.81);
+      const bobAmplitude = 0.012 * (gaitParams.gravity / 9.81);
       comOffset = Math.cos(bobFreq) * bobAmplitude;
       vy = -Math.sin(bobFreq) * bobAmplitude * 2.0 * gaitParams.cadenceHz;
     }
 
-    const torsoY = groundElevation + nominalHeight + comOffset;
+    // Strict ceiling: body height above ground must never exceed 0.395m
+    // ensuring the 0.44m legs always reach the terrain surface with comfortable margin
+    const clampedOffset = Math.max(-0.025, Math.min(0.010, comOffset));
+    const torsoY = groundElevation + Math.min(0.385, nominalHeight) + clampedOffset;
 
     // 2. Sample terrain slopes along forward and lateral body axes
     const fwdX = Math.cos(heading);

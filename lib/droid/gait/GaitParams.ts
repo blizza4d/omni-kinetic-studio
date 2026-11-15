@@ -50,16 +50,17 @@ export class GaitParamsCalculator {
     strideLength = Math.max(0.12, Math.min(0.24, strideLength));
 
     // 5. Duty factor (fraction in stance)
-    // Walk (Fr <= 0.5): 0.65 down to 0.50
-    // Bound (Fr > 0.5): 0.50 down to 0.36
+    // Stable quadruped trot maintains double-support overlap: dutyFactor >= 0.52
+    // Monotonically decreases as speed increases from 0.65 down to 0.525
     let dutyFactor: number;
     if (froudeNumber <= 0.5) {
       const t = Math.min(1.0, froudeNumber / 0.5);
-      dutyFactor = 0.65 - 0.15 * t;
+      dutyFactor = 0.65 - 0.08 * t;
     } else {
       const t = Math.min(1.0, (froudeNumber - 0.5) / 1.5);
-      dutyFactor = 0.50 - 0.14 * t;
+      dutyFactor = 0.57 - 0.045 * t;
     }
+    dutyFactor = Math.max(0.525, Math.min(0.65, dutyFactor));
 
     const flightFraction = Math.max(0.0, 1.0 - dutyFactor);
 

@@ -33,22 +33,39 @@ test('Screenshot Invariants: S-13 Steady-state long task probe isolates startup 
   assert.strictEqual(filtered[0].name, 'steady-task');
 });
 
-test('Screenshot Invariants: S-01 & S-02 at t=2.0s droid feet are grounded on lunar terrain', () => {
+test('Screenshot Invariants: S-01 & S-02 at t=2.0s and t=3.0s droid maintains ground contact and relaxed stance angles', () => {
   const runner = new LocalSimulationRunner();
-  // t = 2.0s -> 120 steps at 60 Hz
-  const frameAt2s = runner.generateFrame(120);
+  // t = 2.0s -> 120 steps, t = 3.0s -> 180 steps
+  for (const step of [120, 180]) {
+    const frame = runner.generateFrame(step);
+    assert.ok(frame, `Must generate telemetry frame at step ${step}`);
+    assert.ok(frame.feet && frame.feet.length === 4, 'Frame must contain 4 feet');
 
-  assert.ok(frameAt2s, 'Must generate telemetry frame at t=2.0s');
-  assert.ok(frameAt2s.feet && frameAt2s.feet.length === 4, 'Frame must contain 4 feet');
-
-  // Verify that all feet are positioned near the terrain surface (within 0.15m of ground, not floating > 0.25m)
-  for (const foot of frameAt2s.feet) {
-    const groundH = getTerrainHeight(foot.pos[0], foot.pos[2]);
-    const clearance = foot.pos[1] - groundH;
+    const contactFeet = frame.feet.filter((f) => f.contact);
     assert.ok(
-      clearance >= -0.05 && clearance <= 0.15,
-      `Foot ${foot.id} at t=2.0s clearance (${clearance.toFixed(3)}m) must be physically grounded near terrain (y=${groundH.toFixed(3)}m)`
+      contactFeet.length >= 2,
+      `At t=${frame.t}s, expected at least 2 contact feet in stance, got ${contactFeet.length}`
     );
+
+    for (const foot of contactFeet) {
+      const groundH = getTerrainHeight(foot.pos[0], foot.pos[2]);
+      const clearance = Math.abs(foot.pos[1] - groundH);
+      assert.ok(
+        clearance <= 0.005,
+        `Stance foot ${foot.id} at t=${frame.t}s clearance (${clearance.toFixed(4)}m) must be on terrain surface (<= 5mm)`
+      );
+    }
+
+    // Verify stance thighs are relaxed and natural (not jutting out at > 45 deg)
+    for (const foot of contactFeet) {
+      const thighJoint = frame.joints.find((j) => j.name === `${foot.id}_thigh_joint`);
+      if (thighJoint) {
+        assert.ok(
+          Math.abs(thighJoint.angle) <= 0.70,
+          `Stance thigh ${foot.id} angle (${(thighJoint.angle * 180 / Math.PI).toFixed(1)} deg) must be relaxed (<= 40.0 deg)`
+        );
+      }
+    }
   }
 });
 

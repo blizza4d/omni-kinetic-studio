@@ -129,12 +129,24 @@ export class FootPlanner {
         const maxAllowed = foot.config.maxReach * 0.98; // ~0.4312m
 
         if (reach > maxAllowed) {
-          const scale = maxAllowed / reach;
-          localPos = [
-            foot.config.hipOffset[0] + relX * scale,
-            foot.config.hipOffset[1] + relY * scale,
-            foot.config.hipOffset[2] + relZ * scale,
-          ];
+          // In stance, ground contact must be preserved: clamp horizontal displacement without pulling foot upward
+          const horizDistSq = relX * relX + relZ * relZ;
+          const maxHorizSq = maxAllowed * maxAllowed - relY * relY;
+          if (maxHorizSq > 0 && horizDistSq > maxHorizSq) {
+            const horizScale = Math.sqrt(maxHorizSq / horizDistSq);
+            localPos = [
+              foot.config.hipOffset[0] + relX * horizScale,
+              localPos[1], // Strictly preserve ground elevation!
+              foot.config.hipOffset[2] + relZ * horizScale,
+            ];
+          } else {
+            const scale = maxAllowed / reach;
+            localPos = [
+              foot.config.hipOffset[0] + relX * scale,
+              foot.config.hipOffset[1] + relY * scale,
+              foot.config.hipOffset[2] + relZ * scale,
+            ];
+          }
         }
 
         results.push({
@@ -167,10 +179,9 @@ export class FootPlanner {
           const maxFwdReach = Math.sqrt(Math.max(0.005, maxReach * maxReach - vertDist * vertDist - latDist * latDist));
 
           // Raibert capture point heuristic for touchdown target:
-          // Target = hip at touchdown + half-stance forward reach
-          const nominalStepM = Math.min(maxFwdReach * 0.85, forwardSpeed * (tStance * 0.5) + 0.02);
-          const swingTravelM = forwardSpeed * tSwing;
-          const totalLeadM = nominalStepM + swingTravelM;
+          // Clamped strictly within the forward reachable envelope to prevent airborne overreach
+          const nominalStepM = Math.min(maxFwdReach * 0.70, forwardSpeed * (tStance * 0.5));
+          const totalLeadM = Math.min(maxFwdReach * 0.82, nominalStepM + forwardSpeed * tSwing * 0.40);
 
           const targetX = hipWorld[0] + fwdX * totalLeadM;
           const targetZ = hipWorld[2] + fwdZ * totalLeadM;
