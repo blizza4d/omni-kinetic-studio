@@ -1,11 +1,22 @@
 /**
- * Omni-Kinetic Droid Morphology and Kinematic Contracts
+ * Omni-Kinetic Droid Morphology and Kinematic Contracts (v2)
  * 12-DOF Quadruped Specification under Varying Gravitational Regimes
  */
 
 export type LegId = 'FL' | 'FR' | 'RL' | 'RR';
 
-export type GaitState = 'stand' | 'startWalk' | 'walk' | 'bound' | 'turnInPlace' | 'stop' | 'stumbleRecover' | 'fallen';
+export type GaitPattern = 'walk' | 'trot' | 'bound' | 'pronk';
+
+export type GaitState =
+  | 'stand'
+  | 'startWalk'
+  | 'walk'
+  | 'bound'
+  | 'hop'
+  | 'turnInPlace'
+  | 'stop'
+  | 'stumbleRecover'
+  | 'fallen';
 
 export type FootPhaseState = 'stance' | 'swing';
 
@@ -44,18 +55,30 @@ export interface DroidKinematicState {
   bodyLinearVel: [number, number, number];
   bodyAngularVel: [number, number, number];
   gaitState: GaitState;
+  gaitPattern?: GaitPattern;
   froudeNumber: number;
   cadenceHz: number;
   dutyFactor: number;
   joints: JointState[];
   feet: FootTarget[];
+  hopActive?: boolean;
+  hopAltitude?: number;
+  justLanded?: boolean;
+  landingImpactSpeed?: number;
+  antennaAngles?: [number, number]; // pitch, roll secondary motion
+  stabilityMargin?: number;
 }
 
 export interface LocomotionCommand {
   vx: number; // Forward velocity (m/s)
-  vy?: number; // Vertical velocity (m/s)
-  vz?: number; // Lateral velocity (m/s)
+  vy?: number; // Lateral velocity (m/s, +Z right)
+  vz?: number; // Legacy lateral alias (m/s)
   yawRate: number; // Turn rate (rad/s)
+  bodyHeight?: number; // 0..1 crouch to tall (default 0.5)
+  gait?: 'auto' | GaitPattern;
+  hop?: boolean;
+  hopCharge?: number; // 0..1
+  stop?: boolean;
   mode?: 'policy' | 'teleop' | 'stumble_recovery';
 }
 

@@ -33,7 +33,7 @@ class JobStoreManager {
       mode,
       message: mode === 'cloud_nebius'
         ? 'Provisioning NVIDIA L40S GPU node on Nebius Serverless Jobs...'
-        : 'Authoritative local simulation active [DEMO: LOCAL RUNNER]',
+        : 'Local fixed-step simulation active',
       elapsed: 0,
       costSoFar: 0,
       estimatedRange: mode === 'cloud_nebius' ? [0.02, 0.05] : [0, 0],

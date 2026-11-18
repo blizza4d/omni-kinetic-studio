@@ -73,7 +73,7 @@ export default function RunSummaryCard({
               <Cpu className="w-3.5 h-3.5 text-sage" />
               <span className="text-cream-dim">Execution Provider:</span>
               <span className="font-bold text-cream uppercase">
-                {summary.mode === 'cloud_nebius' ? 'CLOUD: NEBIUS L40S' : 'DEMO: LOCAL RUNNER'}
+                {summary.mode === 'cloud_nebius' ? 'CLOUD STREAM (NEBIUS L40S)' : 'LOCAL SIMULATION'}
               </span>
             </div>
             <span className="text-[9px] text-cream-dim px-2 py-0.5 rounded bg-charcoal border border-cream/5 uppercase">

@@ -1,468 +1,399 @@
 'use client';
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { EnvironmentSpec, TelemetryFrame, TeleopCommand } from '@/contracts';
-import { getTerrainHeight, DEFAULT_TERRAIN_CONFIG } from '@/lib/world/terrain';
-import { generateCanonicalTerrain } from '@/lib/world/terrain/generator';
 import { TerrainField } from '@/lib/world/terrain/field';
-import { generateDebrisField, DebrisInstance } from '@/lib/world/debris';
-import { evaluateBoundary, sanitizeViewerPosition, DEFAULT_ARENA } from '@/lib/world/bounds';
+import { DebrisInstance } from '@/lib/world/debris';
+import { sanitizeViewerPosition, DEFAULT_ARENA } from '@/lib/world/bounds';
 import { PerfProbe } from '@/lib/perf/probe';
-import { parseFeatureToggles } from '@/lib/perf/toggles';
-import { TelemetryStore } from '@/lib/telemetry/store';
 import { formatGravityDisplay } from '@/lib/spec/gravity';
 import { LunarDustSystem } from '@/lib/droid/fx/DustPuffs';
-import { TelemetryJitterBuffer, InterpolatedFrame } from '@/lib/telemetry/jitter_buffer';
 import { FramePacer } from '@/lib/sim/framePacer';
 import { FollowCameraRig } from '@/lib/camera/follow_camera';
+import { minJerk } from '@/lib/anim/math/minJerk';
+import { SimEngine, InterpolatedDroidRenderState } from '@/lib/sim/SimEngine';
+import { CameraMode, RadarSize } from '@/lib/storage/settings';
+import { SensorOverlayFlags } from '@/components/control/ControlHUD';
+import { EditorToolMode } from '@/components/missions/MissionPanels';
+import RadarPanel from '@/components/radar/RadarPanel';
+import { MissionMarker } from '@/lib/missions/missions';
+import { Waypoint } from '@/lib/control/types';
 
 export type CameraPreset = 'chase' | 'top' | 'side' | 'free';
 export type QualityTier = 'ultra' | 'high' | 'medium' | 'low' | 'potato';
 
 interface ThreeViewerProps {
+  engine: SimEngine;
   envSpec: EnvironmentSpec;
   currentFrame?: TelemetryFrame | null;
   teleopCommand?: TeleopCommand | null;
   cameraPreset?: CameraPreset;
+  cameraMode?: CameraMode;
   qualityTier?: QualityTier;
+  fov?: number;
+  sunElevationDeg?: number;
+  sunAzimuthDeg?: number;
   showColliderDebug?: boolean;
   showOverlays?: boolean;
   showRadar?: boolean;
+  radarSize?: RadarSize;
+  onRadarSizeChange?: (size: RadarSize) => void;
   showDustParticles?: boolean;
   showGhostComparison?: boolean;
-  adaptiveQuality?: boolean;
-  isNewAnimation?: boolean;
+  showContours?: boolean;
+  showTrail?: boolean;
+  pipEnabled?: boolean;
+  sensors?: SensorOverlayFlags;
+  cameraShakeEnabled?: boolean;
+  autoRecenterOrbit?: boolean;
+  reducedMotion?: boolean;
+  colorblindSafe?: boolean;
+  editorTool?: EditorToolMode;
+  terrainVersion?: number;
+  frameTrigger?: number;
+  missionMarkers?: readonly MissionMarker[];
+  completedMarkerIds?: readonly string[];
+  waypoints?: readonly Waypoint[];
+  onTerrainClick?: (x: number, z: number, shiftKey: boolean, altKey: boolean) => void;
+  onPointerDriveUpdate?: (active: boolean, x: number, z: number) => void;
+  onCanvasReady?: (canvas: HTMLCanvasElement | null) => void;
+  onUiSync?: () => void;
   onCollisionDetected?: (collision: any) => void;
   onFpsUpdate?: (fps: number, frameTimeMs: number) => void;
   onBoundaryWarning?: (state: 'soft' | 'hard' | 'out', distToEdge: number) => void;
   onEpisodeReset?: (reason: string) => void;
+  isNewAnimation?: boolean;
+  adaptiveQuality?: boolean;
 }
 
+const DEFAULT_SENSORS: SensorOverlayFlags = {
+  lidar: false,
+  contacts: false,
+  stability: false,
+  path: false,
+};
+
 export default function ThreeViewer({
+  engine,
   envSpec,
-  currentFrame,
-  teleopCommand,
-  cameraPreset = 'chase',
+  cameraMode = 'follow',
   qualityTier = 'high',
+  fov = 55,
+  sunElevationDeg = 22,
+  sunAzimuthDeg = 52,
   showColliderDebug = false,
   showOverlays = true,
   showRadar = true,
+  radarSize = 'medium',
+  onRadarSizeChange = () => {},
   showDustParticles = true,
   showGhostComparison = false,
-  adaptiveQuality = true,
-  isNewAnimation = true,
-  onCollisionDetected,
-  onFpsUpdate,
+  showContours = true,
+  showTrail = true,
+  pipEnabled = false,
+  sensors = DEFAULT_SENSORS,
+  cameraShakeEnabled = true,
+  autoRecenterOrbit = true,
+  reducedMotion = false,
+  colorblindSafe = false,
+  editorTool = 'none',
+  terrainVersion = 1,
+  frameTrigger = 0,
+  missionMarkers = [],
+  completedMarkerIds = [],
+  waypoints = [],
+  onTerrainClick,
+  onPointerDriveUpdate,
+  onCanvasReady,
+  onUiSync,
   onBoundaryWarning,
-  onEpisodeReset,
 }: ThreeViewerProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
-  const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const offscreenRadarRef = useRef<HTMLCanvasElement | null>(null);
+  const [contextLost, setContextLost] = useState(false);
 
-  // References for imperative Three.js lifecycle
+  // Throttled radar pose state (15 Hz) to avoid per-frame React commits
+  const [radarState, setRadarState] = useState<{
+    pos: [number, number, number];
+    yaw: number;
+    trail: [number, number][];
+  }>({ pos: [0, 0.385, 0], yaw: 0.62, trail: [] });
+
+  // Live imperative refs
+  const engineRef = useRef(engine);
+  engineRef.current = engine;
+  const cameraModeRef = useRef<CameraMode>(cameraMode);
+  const prevCameraModeRef = useRef<CameraMode>(cameraMode);
+  const cameraBlendRef = useRef({ active: false, elapsed: 0, duration: 0.35, fromPos: new THREE.Vector3(), fromLook: new THREE.Vector3() });
+
+  const fovRef = useRef(fov);
+  fovRef.current = fov;
+  const sunRef = useRef({ elev: sunElevationDeg, azim: sunAzimuthDeg });
+  sunRef.current = { elev: sunElevationDeg, azim: sunAzimuthDeg };
+  const showContoursRef = useRef(showContours);
+  showContoursRef.current = showContours;
+  const showTrailRef = useRef(showTrail);
+  showTrailRef.current = showTrail;
+  const pipEnabledRef = useRef(pipEnabled);
+  pipEnabledRef.current = pipEnabled;
+  const sensorsRef = useRef(sensors);
+  sensorsRef.current = sensors;
+  const shakeEnabledRef = useRef(cameraShakeEnabled);
+  shakeEnabledRef.current = cameraShakeEnabled;
+  const autoRecenterRef = useRef(autoRecenterOrbit);
+  autoRecenterRef.current = autoRecenterOrbit;
+  const reducedMotionRef = useRef(reducedMotion);
+  reducedMotionRef.current = reducedMotion;
+  const colorblindRef = useRef(colorblindSafe);
+  colorblindRef.current = colorblindSafe;
+  const showGhostRef = useRef(showGhostComparison);
+  showGhostRef.current = showGhostComparison;
+  const showColliderRef = useRef(showColliderDebug);
+  showColliderRef.current = showColliderDebug;
+  const showOverlaysRef = useRef(showOverlays);
+  showOverlaysRef.current = showOverlays;
+  const showDustRef = useRef(showDustParticles);
+  showDustRef.current = showDustParticles;
+  const editorToolRef = useRef(editorTool);
+  editorToolRef.current = editorTool;
+  const missionMarkersRef = useRef(missionMarkers);
+  missionMarkersRef.current = missionMarkers;
+  const completedIdsRef = useRef(completedMarkerIds);
+  completedIdsRef.current = completedMarkerIds;
+  const waypointsRef = useRef(waypoints);
+  waypointsRef.current = waypoints;
+
+  const onTerrainClickRef = useRef(onTerrainClick);
+  onTerrainClickRef.current = onTerrainClick;
+  const onPointerDriveRef = useRef(onPointerDriveUpdate);
+  onPointerDriveRef.current = onPointerDriveUpdate;
+  const onUiSyncRef = useRef(onUiSync);
+  onUiSyncRef.current = onUiSync;
+  const onBoundaryWarnRef = useRef(onBoundaryWarning);
+  onBoundaryWarnRef.current = onBoundaryWarning;
+  const onCanvasReadyRef = useRef(onCanvasReady);
+  onCanvasReadyRef.current = onCanvasReady;
+
+  // Three.js scene objects refs
+  const terrainMeshRef = useRef<THREE.Mesh | null>(null);
+  const terrainUniformsRef = useRef<{
+    uEdgeDistance: { value: number };
+    uShowContours: { value: number };
+  } | null>(null);
+  const debrisMeshesRef = useRef<THREE.InstancedMesh[]>([]);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const dirLightRef = useRef<THREE.DirectionalLight | null>(null);
-  const robotGroupRef = useRef<THREE.Group | null>(null);
-  const ghostRobotGroupRef = useRef<THREE.Group | null>(null);
-  const ghostJointMeshesRef = useRef<Record<string, THREE.Group>>({});
-  const colliderSphereRef = useRef<THREE.Mesh | null>(null);
-  const jointMeshesRef = useRef<Record<string, THREE.Group>>({});
-  const debrisChunksRef = useRef<THREE.InstancedMesh[]>([]);
-  const debrisDataRef = useRef<DebrisInstance[]>([]);
-  const dustParticlesRef = useRef<THREE.Points | null>(null);
-  const trailLineRef = useRef<THREE.Line | null>(null);
-  const collisionFlashRef = useRef<THREE.Mesh | null>(null);
-  const goalBeaconRef = useRef<THREE.Group | null>(null);
-  const boundaryRimRef = useRef<THREE.Line | null>(null);
-  const boundaryRimMatRef = useRef<THREE.LineDashedMaterial | null>(null);
-  const footBlobsRef = useRef<THREE.Mesh[]>([]);
-  const canonicalFieldRef = useRef<TerrainField | null>(null);
-  const terrainUniformsRef = useRef<{ uEdgeDistance: { value: number } } | null>(null);
+  const orbitAnglesRef = useRef({ theta: 0.72, phi: 0.34, dist: 3.6, offsetYaw: 0, lastDragSec: -10 });
 
-  // Preallocated contiguous trail buffer (max 300 points sampled on distance traveled)
-  const maxTrailPoints = 300;
-  const trailBufferRef = useRef<Float32Array>(new Float32Array(maxTrailPoints * 3));
-  const trailCountRef = useRef(0);
-  const lastRecordedTrailPosRef = useRef<[number, number, number] | null>(null);
-
-  // Dynamic references
-  const latestTeleopRef = useRef<TeleopCommand | null>(teleopCommand ?? null);
-  const latestSpecRef = useRef<EnvironmentSpec>(envSpec);
-  const currentTerrainSeedRef = useRef<number>(envSpec.terrain?.seed ?? 42);
-  const cameraPresetRef = useRef<CameraPreset>(cameraPreset);
-  const qualityTierRef = useRef<QualityTier>(qualityTier);
-  const lunarDustRef = useRef<LunarDustSystem | null>(null);
-  const prevFootContactsRef = useRef<boolean[]>([true, true, true, true]);
-  const showRadarRef = useRef(showRadar);
-  const showOverlaysRef = useRef(showOverlays);
-  const showGhostComparisonRef = useRef(showGhostComparison);
-  const showColliderDebugRef = useRef(showColliderDebug);
-  const currentFrameRef = useRef(currentFrame);
-  const isNewAnimationRef = useRef(isNewAnimation);
-  const onBoundaryWarningRef = useRef(onBoundaryWarning);
-  const onCollisionDetectedRef = useRef(onCollisionDetected);
-  const onEpisodeResetRef = useRef(onEpisodeReset);
-
-  // Keep references updated with zero React re-render churn
+  // Trigger smooth 0.35s min-jerk blend on camera mode switch
   useEffect(() => {
-    isNewAnimationRef.current = isNewAnimation;
-  }, [isNewAnimation]);
-
-  useEffect(() => {
-    latestTeleopRef.current = teleopCommand ?? null;
-  }, [teleopCommand]);
-
-  useEffect(() => {
-    latestSpecRef.current = envSpec;
-  }, [envSpec]);
-
-  useEffect(() => {
-    cameraPresetRef.current = cameraPreset;
-  }, [cameraPreset]);
-
-  useEffect(() => {
-    currentFrameRef.current = currentFrame;
-  }, [currentFrame]);
-
-  useEffect(() => {
-    showRadarRef.current = showRadar;
-  }, [showRadar]);
-
-  useEffect(() => {
-    showOverlaysRef.current = showOverlays;
-  }, [showOverlays]);
-
-  useEffect(() => {
-    showGhostComparisonRef.current = showGhostComparison;
-  }, [showGhostComparison]);
-
-  useEffect(() => {
-    showColliderDebugRef.current = showColliderDebug;
-    if (colliderSphereRef.current) {
-      colliderSphereRef.current.visible = showColliderDebug;
+    if (cameraMode !== prevCameraModeRef.current && cameraRef.current) {
+      cameraBlendRef.current.active = !reducedMotionRef.current;
+      cameraBlendRef.current.elapsed = 0;
+      cameraBlendRef.current.fromPos.copy(cameraRef.current.position);
+      prevCameraModeRef.current = cameraMode;
     }
-  }, [showColliderDebug]);
+    cameraModeRef.current = cameraMode;
+  }, [cameraMode]);
 
+  // Frame droid hotkey [F] resets orbit offset
   useEffect(() => {
-    onBoundaryWarningRef.current = onBoundaryWarning;
-    onCollisionDetectedRef.current = onCollisionDetected;
-    onEpisodeResetRef.current = onEpisodeReset;
-  }, [onBoundaryWarning, onCollisionDetected, onEpisodeReset]);
-
-  useEffect(() => {
-    qualityTierRef.current = qualityTier;
-    PerfProbe.getInstance().setTier(qualityTier);
-  }, [qualityTier]);
-
-  useEffect(() => {
-    if (dustParticlesRef.current) {
-      dustParticlesRef.current.visible = showDustParticles && qualityTier !== 'potato';
+    if (frameTrigger > 0) {
+      orbitAnglesRef.current.offsetYaw = 0;
+      orbitAnglesRef.current.phi = 0.34;
+      orbitAnglesRef.current.dist = 3.6;
     }
-  }, [showDustParticles, qualityTier]);
+  }, [frameTrigger]);
 
+  // Synchronize live terrain mesh + boulders whenever terrainVersion increments (seed change or terrain brush)
   useEffect(() => {
-    if (ghostRobotGroupRef.current) {
-      ghostRobotGroupRef.current.visible = Boolean(showGhostComparison);
-    }
-  }, [showGhostComparison]);
-
-  useEffect(() => {
-    if (trailLineRef.current) trailLineRef.current.visible = showOverlays;
-    if (goalBeaconRef.current) goalBeaconRef.current.visible = showOverlays;
-    if (boundaryRimRef.current) boundaryRimRef.current.visible = showOverlays;
-  }, [showOverlays]);
-
-  // Dynamic World Rebuild when EnvironmentSpec changes (e.g. Moon vs Mars approved)
-  useEffect(() => {
-    if (!sceneRef.current) return;
-    const terrainSeed = envSpec.terrain?.seed ?? 42;
-    if (canonicalFieldRef.current && currentTerrainSeedRef.current === terrainSeed) {
-      return;
-    }
-    currentTerrainSeedRef.current = terrainSeed;
+    const mesh = terrainMeshRef.current;
     const scene = sceneRef.current;
-    const oldTerrain = scene.getObjectByName('canonical_terrain_mesh');
-    if (oldTerrain) {
-      scene.remove(oldTerrain);
-      if ((oldTerrain as any).geometry) (oldTerrain as any).geometry.dispose();
+    if (!mesh || !scene) return;
+    const field = engineRef.current.terrain.getField();
+    const posAttr = mesh.geometry.attributes.position as THREE.BufferAttribute;
+    for (let i = 0; i < posAttr.count; i++) {
+      const x = posAttr.getX(i);
+      const z = posAttr.getZ(i);
+      posAttr.setY(i, field.sampleHeight(x, z));
     }
-    debrisChunksRef.current.forEach((mesh) => {
-      scene.remove(mesh);
-      if (mesh.geometry) mesh.geometry.dispose();
-    });
-    debrisChunksRef.current = [];
+    posAttr.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
 
-    const effectiveTier = qualityTierRef.current;
-    const shadowsEnabled = effectiveTier !== 'low' && effectiveTier !== 'potato';
-    const newField = generateCanonicalTerrain(terrainSeed);
-    canonicalFieldRef.current = newField;
-    buildCanonicalTerrainMesh(scene, newField, effectiveTier, terrainUniformsRef);
-
-    const debrisCount = envSpec.debris?.count ?? (effectiveTier === 'ultra' ? 1800 : 1200);
-    const debris = generateDebrisField(
-      debrisCount,
-      [40, 40],
-      terrainSeed,
-      (x, z) => newField.sampleHeight(x, z)
+    // Rebuild instanced boulders on updated heightfield
+    for (const dm of debrisMeshesRef.current) {
+      scene.remove(dm);
+      dm.geometry.dispose();
+    }
+    debrisMeshesRef.current = buildChunkedDebris(
+      scene,
+      engineRef.current.getDebris(),
+      qualityTier !== 'low' && qualityTier !== 'potato'
     );
-    debrisDataRef.current = debris;
-    debrisChunksRef.current = buildChunkedDebris(scene, debris, shadowsEnabled);
+  }, [terrainVersion, qualityTier]);
 
-    // Rebuild goal beacon with accurate terrain clamping
-    if (goalBeaconRef.current) {
-      scene.remove(goalBeaconRef.current);
-    }
-    const goalY = newField.sampleHeight(14.0, -10.0);
-    const newBeacon = buildGoalMarker(scene, [14.0, goalY, -10.0]);
-    goalBeaconRef.current = newBeacon;
-    newBeacon.visible = showOverlaysRef.current;
-
-    // Refresh radar
-    initOffscreenRadar(offscreenRadarRef, debris, 18.0, newField);
-  }, [envSpec.terrain?.seed, envSpec.taskId, envSpec.debris?.count]);
-
-  // Main Three.js Scene Setup & Loop
   useEffect(() => {
+    if (!mountRef.current) return;
     const container = mountRef.current;
-    if (!container) return;
-
-    const toggles = parseFeatureToggles();
-    const probe = PerfProbe.getInstance();
-    const store = TelemetryStore.getInstance();
-
     const width = container.clientWidth || window.innerWidth;
     const height = container.clientHeight || window.innerHeight;
 
-    // 1. Scene, Camera, Renderer (Authentic Lunar Space Background & Tone Mapping)
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0c0c0c); // Deep lunar space
-    scene.fog = new THREE.Fog(0x0c0c0c, 45, 95); // Linear distance fog
+    scene.background = new THREE.Color(0x0c0c0c); // Dark airless lunar sky (Lock-In W0)
+    scene.fog = new THREE.Fog(0x0c0c0c, 48, 100);
     sceneRef.current = scene;
 
-    // Distant Starfield in Lunar Sky
+    const camera = new THREE.PerspectiveCamera(fovRef.current, width / height, 0.1, 200);
+    camera.up.set(0, 1, 0);
+    camera.position.set(-2.6, 2.0, 2.6);
+    cameraRef.current = camera;
+
+    // PiP droid camera (first-person stabilized head cam)
+    const pipCamera = new THREE.PerspectiveCamera(68, 16 / 9, 0.08, 120);
+    pipCamera.up.set(0, 1, 0);
+
+    const isLow = qualityTier === 'low' || qualityTier === 'potato';
+    const shadowsEnabled = !isLow;
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: !isLow,
+      powerPreference: 'high-performance',
+      preserveDrawingBuffer: true, // Required for crisp 2x screenshot capture
+    });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, isLow ? 1 : 2));
+    renderer.shadowMap.enabled = shadowsEnabled;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.18;
+    container.appendChild(renderer.domElement);
+    onCanvasReadyRef.current?.(renderer.domElement);
+
+    // WebGL Context Loss & Restore Handlers (Phase W12.3)
+    const handleContextLost = (e: Event) => {
+      e.preventDefault();
+      setContextLost(true);
+    };
+    const handleContextRestored = () => {
+      setContextLost(false);
+    };
+    renderer.domElement.addEventListener('webglcontextlost', handleContextLost, false);
+    renderer.domElement.addEventListener('webglcontextrestored', handleContextRestored, false);
+
+    // Lighting: HemisphereLight ambient fill + Low-angle Directional key light + Rim light
+    const hemiLight = new THREE.HemisphereLight(0x888d7c, 0x262624, 0.55);
+    scene.add(hemiLight);
+
+    const dirLight = new THREE.DirectionalLight(0xfdfbf7, 2.3);
+    dirLight.castShadow = shadowsEnabled;
+    dirLight.shadow.mapSize.width = qualityTier === 'ultra' ? 2048 : 1024;
+    dirLight.shadow.mapSize.height = qualityTier === 'ultra' ? 2048 : 1024;
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 50;
+    dirLight.shadow.camera.left = -12;
+    dirLight.shadow.camera.right = 12;
+    dirLight.shadow.camera.top = 12;
+    dirLight.shadow.camera.bottom = -12;
+    dirLight.shadow.bias = -0.0005;
+    dirLight.shadow.normalBias = 0.025;
+    scene.add(dirLight);
+    scene.add(dirLight.target);
+
+    const rimLight = new THREE.DirectionalLight(0x9ca3af, 0.45);
+    rimLight.position.set(-10, 6, -12);
+    scene.add(rimLight);
+
+    // Starfield
     const starfield = buildStarfield();
     scene.add(starfield);
 
-    const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 120);
-    camera.position.set(-2.5, 1.8, 3.2);
-    cameraRef.current = camera;
+    // Canonical Terrain Mesh directly from engine.terrain (ZERO height divergence!)
+    const terrainField = engineRef.current.terrain.getField();
+    const terrainMesh = buildCanonicalTerrainMesh(scene, terrainField, qualityTier, terrainUniformsRef);
+    terrainMeshRef.current = terrainMesh;
 
-    const effectiveTier = qualityTierRef.current;
-    const dprCap = effectiveTier === 'potato' || effectiveTier === 'low' ? 1.0 : toggles.dpr;
+    // Instanced Debris Boulders (white base material 0xffffff for true lit/shadow shading)
+    debrisMeshesRef.current = buildChunkedDebris(scene, engineRef.current.getDebris(), shadowsEnabled);
 
-    const renderer = new THREE.WebGLRenderer({
-      antialias: effectiveTier !== 'potato',
-      powerPreference: 'high-performance',
-      precision: effectiveTier === 'potato' ? 'mediump' : 'highp',
-    });
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, dprCap));
-
-    const shadowsEnabled = toggles.shadows && effectiveTier !== 'low' && effectiveTier !== 'potato';
-    renderer.shadowMap.enabled = shadowsEnabled;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.05;
-    rendererRef.current = renderer;
-    container.appendChild(renderer.domElement);
-
-    // Query GPU Renderer string
-    try {
-      const gl = renderer.getContext();
-      const ext = gl.getExtension('WEBGL_debug_renderer_info');
-      if (ext) {
-        probe.setGpuInfo(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL), gl.getParameter(ext.UNMASKED_VENDOR_WEBGL));
-      }
-    } catch {}
-
-    // 2. Calibrated Lighting (Low-angle directional key + regolith bounce hemisphere fill)
-    const ambientLight = new THREE.AmbientLight(0xfdfbf7, 0.25);
-    scene.add(ambientLight);
-
-    // Key directional light: ~22 deg elevation
-    const dirLight = new THREE.DirectionalLight(0xfdfbf7, 1.55);
-    dirLight.position.set(8, 14, 10);
-    dirLight.castShadow = shadowsEnabled;
-    dirLight.shadow.mapSize.width = effectiveTier === 'ultra' ? 2048 : effectiveTier === 'high' ? 1024 : 512;
-    dirLight.shadow.mapSize.height = dirLight.shadow.mapSize.width;
-    dirLight.shadow.camera.near = 0.5;
-    dirLight.shadow.camera.far = 48;
-    // 24m shadow frustum envelope around robot
-    dirLight.shadow.camera.left = -12.0;
-    dirLight.shadow.camera.right = 12.0;
-    dirLight.shadow.camera.top = 12.0;
-    dirLight.shadow.camera.bottom = -12.0;
-    dirLight.shadow.bias = -0.0004;
-    dirLight.shadow.normalBias = 0.02;
-    scene.add(dirLight);
-    scene.add(dirLight.target);
-    dirLightRef.current = dirLight;
-
-    // Regolith bounce light: cool sky + charcoal ground bounce
-    const hemiLight = new THREE.HemisphereLight(0x6b705c, 0x2a2a2a, 0.45);
-    scene.add(hemiLight);
-
-    const fillLight = new THREE.DirectionalLight(0x6b705c, 0.25);
-    fillLight.position.set(-14, 8, -12);
-    scene.add(fillLight);
-
-    // 3. Canonical TerrainField v1 (257x257 Int16 grid with regolith shading, contours, and anti-aliased rim)
-    const terrainSeed = latestSpecRef.current.terrain.seed || 42;
-    const terrainField = generateCanonicalTerrain(terrainSeed);
-    canonicalFieldRef.current = terrainField;
-    buildCanonicalTerrainMesh(scene, terrainField, effectiveTier, terrainUniformsRef);
-
-    // 4. Ground Contact Blobs for quadruped feet (Clamped to terrain, polygon-offset, sage when planted)
-    const footBlobs = buildFootContactBlobs(scene);
-    footBlobsRef.current = footBlobs;
-
-    // 5. Fallback Floor Catch Plane at y = -5.0m
-    buildFloorCatchPlane(scene, 48, 48, -5.0);
-
-    // 6. 4x4 Chunked Instanced Debris Boulders (with accurate chunk bounding spheres, pure white base, zero pyramids)
-    const targetDebrisCount = effectiveTier === 'ultra' ? 1800 : effectiveTier === 'high' ? 1200 : effectiveTier === 'medium' ? 800 : 400;
-    const debris = generateDebrisField(
-      targetDebrisCount,
-      [40, 40],
-      terrainSeed,
-      (x, z) => terrainField.sampleHeight(x, z)
-    );
-    debrisDataRef.current = debris;
-    const chunks = buildChunkedDebris(scene, debris, shadowsEnabled);
-    debrisChunksRef.current = chunks;
-
-    // 7. Low-Gravity Drifting Dust
-    if (effectiveTier !== 'potato') {
-      const dust = buildDustParticles(scene, 40, 40);
-      dustParticlesRef.current = dust;
-
-      // 7b. Dynamic Lunar Dust Puffs (Ballistic zero-drag arcs on foot touchdown)
-      const lunarDust = new LunarDustSystem(scene);
-      lunarDustRef.current = lunarDust;
-    }
-
-    // 8. Goal Marker (Base raycasted directly onto terrain surface, compact 0.6m ring)
-    const goalY = terrainField.sampleHeight(14.0, -10.0);
-    const beacon = buildGoalMarker(scene, [14.0, goalY, -10.0]);
-    goalBeaconRef.current = beacon;
-    beacon.visible = showOverlaysRef.current;
-
-    // 9. Articulated 12-DOF Quadruped
-    const { robotGroup, jointGroups, colliderSphere } = build12DOFQuadruped(false);
+    // Upgraded Detailed 12-DOF Quadruped Droid + Ghost Droid
+    const { robotGroup, jointGroups, colliderSphere, antennaGroup, actuatorLeds } = buildDetailedQuadruped(false);
     scene.add(robotGroup);
-    robotGroupRef.current = robotGroup;
-    jointMeshesRef.current = jointGroups;
-    colliderSphereRef.current = colliderSphere;
-    colliderSphere.visible = showColliderDebugRef.current;
-
-    // Ghost Quadruped
-    const { robotGroup: ghostGroup, jointGroups: ghostJoints } = build12DOFQuadruped(true);
-    ghostGroup.visible = Boolean(showGhostComparisonRef.current);
+    const { robotGroup: ghostGroup, jointGroups: ghostJoints } = buildDetailedQuadruped(true);
+    ghostGroup.visible = false;
     scene.add(ghostGroup);
-    ghostRobotGroupRef.current = ghostGroup;
-    ghostJointMeshesRef.current = ghostJoints;
 
-    // 10. Motion Trail Ribbon (Draped on terrain surface, distance-sampled, zero wrap jumps)
-    const trailGeometry = new THREE.BufferGeometry();
-    trailGeometry.setAttribute('position', new THREE.BufferAttribute(trailBufferRef.current, 3));
-    const trailMaterial = new THREE.LineBasicMaterial({
-      color: 0x6b705c, // Sage
+    // Subtle Ground Contact Shadows (shrinking & fading cleanly during flight — R-03 fixed!)
+    const footShadows = buildFootContactShadows(scene);
+
+    // Subtle Fading Trail Line (clamped to canonical terrain)
+    const maxTrailPoints = 240;
+    const trailPositions = new Float32Array(maxTrailPoints * 3);
+    const trailGeo = new THREE.BufferGeometry();
+    trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+    trailGeo.setDrawRange(0, 0);
+    const trailMat = new THREE.LineDashedMaterial({
+      color: 0xfdfbf7,
       transparent: true,
-      opacity: 0.45,
-      linewidth: 2,
+      opacity: 0.28,
+      dashSize: 0.28,
+      gapSize: 0.18,
     });
-    const trailLine = new THREE.Line(trailGeometry, trailMaterial);
+    const trailLine = new THREE.Line(trailGeo, trailMat);
     trailLine.frustumCulled = false;
     scene.add(trailLine);
-    trailLineRef.current = trailLine;
-    trailLine.visible = showOverlaysRef.current;
+    let trailCount = 0;
+    const trailHistory2D: [number, number][] = [];
+    let lastTrailX = 9999;
+    let lastTrailZ = 9999;
 
-    // 11. Collision Flash Ring
-    const flashGeo = new THREE.RingGeometry(0.2, 0.6, 24);
-    flashGeo.rotateX(-Math.PI / 2);
-    const flashMat = new THREE.MeshBasicMaterial({
-      color: 0xb83b2f,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0,
-    });
-    const flashMesh = new THREE.Mesh(flashGeo, flashMat);
-    scene.add(flashMesh);
-    collisionFlashRef.current = flashMesh;
+    // Mission Objective Beacons & User Waypoint Marker Group
+    const markerGroup = new THREE.Group();
+    scene.add(markerGroup);
+    let lastMarkerSig = '';
 
-    // 12. Pre-render Static Radar Canvas Layer (with Canonical Terrain Hillshade & Filtered Obstacles)
-    initOffscreenRadar(offscreenRadarRef, debris, 18.0, terrainField);
+    // Sensor Overlays Group (LiDAR rays, GRF arrows, Support Polygon, Planned Path — Phase W9.1)
+    const lidarMaxVerts = 64;
+    const lidarPositions = new Float32Array(lidarMaxVerts * 3);
+    const lidarColors = new Float32Array(lidarMaxVerts * 3);
+    const lidarGeo = new THREE.BufferGeometry();
+    lidarGeo.setAttribute('position', new THREE.BufferAttribute(lidarPositions, 3));
+    lidarGeo.setAttribute('color', new THREE.BufferAttribute(lidarColors, 3));
+    const lidarMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.72 });
+    const lidarLines = new THREE.LineSegments(lidarGeo, lidarMat);
+    lidarLines.visible = false;
+    lidarLines.frustumCulled = false;
+    scene.add(lidarLines);
 
-    // Camera Rig angles (Default framed for rule-of-thirds: dist 3.5m, pitch ~18 deg)
-    let isMouseDown = false;
-    let prevMouseX = 0;
-    let prevMouseY = 0;
-    let targetCameraAngle = { yaw: -0.40, pitch: 0.32, dist: 3.5 };
-    let currentCameraAngle = { ...targetCameraAngle };
+    const grfPositions = new Float32Array(4 * 2 * 3);
+    const grfGeo = new THREE.BufferGeometry();
+    grfGeo.setAttribute('position', new THREE.BufferAttribute(grfPositions, 3));
+    const grfMat = new THREE.LineBasicMaterial({ color: 0x8ea48c, transparent: true, opacity: 0.9 });
+    const grfLines = new THREE.LineSegments(grfGeo, grfMat);
+    grfLines.visible = false;
+    grfLines.frustumCulled = false;
+    scene.add(grfLines);
 
-    const onMouseDown = (e: MouseEvent) => {
-      isMouseDown = true;
-      prevMouseX = e.clientX;
-      prevMouseY = e.clientY;
-    };
-    const onMouseMove = (e: MouseEvent) => {
-      if (!isMouseDown) return;
-      const dx = e.clientX - prevMouseX;
-      const dy = e.clientY - prevMouseY;
-      prevMouseX = e.clientX;
-      prevMouseY = e.clientY;
-      targetCameraAngle.yaw -= dx * 0.006;
-      targetCameraAngle.pitch = Math.max(0.08, Math.min(1.45, targetCameraAngle.pitch + dy * 0.006));
-    };
-    const onMouseUp = () => { isMouseDown = false; };
-    const onWheel = (e: WheelEvent) => {
-      targetCameraAngle.dist = Math.max(1.8, Math.min(10.0, targetCameraAngle.dist + e.deltaY * 0.005));
-    };
+    const polyPositions = new Float32Array(5 * 3);
+    const polyGeo = new THREE.BufferGeometry();
+    polyGeo.setAttribute('position', new THREE.BufferAttribute(polyPositions, 3));
+    const polyMat = new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.85 });
+    const polyLine = new THREE.Line(polyGeo, polyMat);
+    polyLine.visible = false;
+    polyLine.frustumCulled = false;
+    scene.add(polyLine);
 
-    container.addEventListener('mousedown', onMouseDown);
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
-    container.addEventListener('wheel', onWheel);
+    const pathPositions = new Float32Array(32 * 3);
+    const pathGeo = new THREE.BufferGeometry();
+    pathGeo.setAttribute('position', new THREE.BufferAttribute(pathPositions, 3));
+    const pathMat = new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.7 });
+    const pathLine = new THREE.Line(pathGeo, pathMat);
+    pathLine.visible = false;
+    pathLine.frustumCulled = false;
+    scene.add(pathLine);
 
-    let animationFrameId: number;
-    let lastTime = performance.now();
-    let lastRadarUpdate = 0;
-    let radarSweepAngle = 0;
-    let shadowUpdateFrame = 0;
-
-    // --- FLUID ANIMATION FOUNDATION INSTANCES ---
-    const pacer = new FramePacer();
-    const jitterBuffer = new TelemetryJitterBuffer();
-    const cameraRig = new FollowCameraRig();
-    const interpFrame: InterpolatedFrame = {
-      time: 0,
-      pos: [0, 0.45, 0],
-      quat: [0, 0, 0, 1],
-      joints: {},
-      feet: [
-        { id: 'FL', pos: [0.24, 0, -0.15], contact: true },
-        { id: 'FR', pos: [0.24, 0, 0.15], contact: true },
-        { id: 'RL', pos: [-0.24, 0, -0.15], contact: true },
-        { id: 'RR', pos: [-0.24, 0, 0.15], contact: true },
-      ],
-      isHold: false,
-    };
-
-    // Pre-populate jitter buffer with historical frames from store
-    const existingHistory = store.getHistory();
-    if (existingHistory && existingHistory.length > 0) {
-      jitterBuffer.pushFrames(existingHistory.slice(-30) as TelemetryFrame[]);
-    }
-
-    // Subscribe to incoming stream batches
-    const unsubStore = store.onBatch((frames) => {
-      jitterBuffer.pushFrames(frames);
-    });
+    // Ballistic Lunar Dust Puffs (pooled, disabled on lowest tier or reduced motion)
+    const lunarDust = new LunarDustSystem(scene);
+    const prevContacts = [true, true, true, true];
 
     // Pre-warm shaders
     try {
@@ -473,376 +404,522 @@ export default function ThreeViewer({
       }
     } catch {}
 
-    // Register test hook
+    // Pointer Interaction: Click-to-Move Waypoint, Terrain Brush, Orbit Drag, Wheel Zoom, Right-Click Pointer Drive
+    const raycaster = new THREE.Raycaster();
+    const pointerNdc = new THREE.Vector2();
+    let isLeftDragging = false;
+    let isRightDragging = false;
+    let pointerDownPos = { x: 0, y: 0 };
+    let prevPointer = { x: 0, y: 0 };
+
+    const pickTerrainPoint = (clientX: number, clientY: number): THREE.Vector3 | null => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointerNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      pointerNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointerNdc, camera);
+      const hits = raycaster.intersectObject(terrainMesh, false);
+      if (hits.length > 0) return hits[0].point;
+      return null;
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      pointerDownPos = { x: e.clientX, y: e.clientY };
+      prevPointer = { x: e.clientX, y: e.clientY };
+      if (e.button === 0) {
+        isLeftDragging = true;
+      } else if (e.button === 2) {
+        isRightDragging = true;
+        const pt = pickTerrainPoint(e.clientX, e.clientY);
+        if (pt) onPointerDriveRef.current?.(true, pt.x, pt.z);
+      }
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (isLeftDragging) {
+        const dx = e.clientX - prevPointer.x;
+        const dy = e.clientY - prevPointer.y;
+        prevPointer = { x: e.clientX, y: e.clientY };
+        if (Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y) > 4) {
+          orbitAnglesRef.current.theta -= dx * 0.006;
+          orbitAnglesRef.current.offsetYaw -= dx * 0.006;
+          orbitAnglesRef.current.phi = Math.max(0.08, Math.min(1.25, orbitAnglesRef.current.phi + dy * 0.005));
+          orbitAnglesRef.current.lastDragSec = performance.now() / 1000;
+        }
+      } else if (isRightDragging) {
+        const pt = pickTerrainPoint(e.clientX, e.clientY);
+        if (pt) onPointerDriveRef.current?.(true, pt.x, pt.z);
+      }
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      const moved = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+      if (e.button === 0 && isLeftDragging && moved < 6) {
+        const pt = pickTerrainPoint(e.clientX, e.clientY);
+        if (pt && Math.abs(pt.x) <= 17.5 && Math.abs(pt.z) <= 17.5) {
+          onTerrainClickRef.current?.(pt.x, pt.z, e.shiftKey, e.altKey);
+        }
+      }
+      if (e.button === 0) isLeftDragging = false;
+      if (e.button === 2) {
+        isRightDragging = false;
+        onPointerDriveRef.current?.(false, 0, 0);
+      }
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      orbitAnglesRef.current.dist = Math.max(2.0, Math.min(20.0, orbitAnglesRef.current.dist + e.deltaY * 0.004));
+    };
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    renderer.domElement.addEventListener('contextmenu', onContextMenu);
+    renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
+
+    // Animation loop primitives (zero per-frame allocations)
+    const pacer = new FramePacer();
+    const cameraRig = new FollowCameraRig({
+      posHalfLife: 0.16,
+      lookHalfLife: 0.11,
+      lookAheadSec: 0.25,
+    });
+    const probe = PerfProbe.getInstance();
+    const renderState: InterpolatedDroidRenderState = {
+      time: 0,
+      step: 0,
+      pos: [0, 0.385, 0],
+      quat: [0, 0, 0, 1],
+      vel: [0, 0, 0],
+      yaw: 0,
+      speed: 0,
+      cmdSpeed: 0,
+      joints: {},
+      jointTorques: {},
+      feet: [],
+      antennaAngles: [0, 0],
+      gaitState: 'stand',
+      gaitPattern: 'trot',
+      froudeNumber: 0,
+      hopActive: false,
+      justLanded: false,
+      landingImpactSpeed: 0,
+      stabilityMargin: 1.0,
+      tiltDeg: 0,
+      distanceToEdge: 18,
+      boundaryState: 'inside',
+    };
+
+    const tmpCamTargetPos = new THREE.Vector3();
+    const tmpCamTargetLook = new THREE.Vector3();
+    const tmpFpvDir = new THREE.Vector3();
+    let shakeIntensity = 0;
+    let shakeSeed = 1337;
+    let lastRadarSyncMs = 0;
+    let lastUiSyncMs = 0;
+    let lastLidarMs = 0;
+    let lastEdgeWarnMs = 0;
+    let animId = 0;
+
+    // Debug accessor for Playwright & automated trace verification
     if (typeof window !== 'undefined') {
       (window as any).__omniDebug = {
-        getJitterBuffer: () => jitterBuffer,
-        getPacer: () => pacer,
-        getCameraRig: () => cameraRig,
-        toggleAnimation: () => {
-          isNewAnimationRef.current = !isNewAnimationRef.current;
-          return isNewAnimationRef.current;
-        },
-        isNewAnimation: () => isNewAnimationRef.current,
+        getEngine: () => engineRef.current,
+        getClock: () => engineRef.current.getClockSnapshot(),
+        getState: () => ({ ...renderState }),
+        getLatencyMs: () => engineRef.current.getLastInputLatencyMs(),
+        runScript: (steps: any[]) => engineRef.current.runScript(steps),
+        setCameraMode: (m: CameraMode) => { cameraModeRef.current = m; },
       };
     }
 
-    // Single Animation Scheduler Loop
     const animate = () => {
-      animationFrameId = requestAnimationFrame(animate);
-
+      animId = requestAnimationFrame(animate);
       const now = performance.now();
-      lastTime = now;
       const dt = pacer.tick(now);
-
-      // Record frame timing in PerfProbe
       probe.recordFrame(now);
 
-      // Rotate goal beacon softly
-      if (beacon) {
-        beacon.rotation.y += dt * 0.8;
-      }
+      const eng = engineRef.current;
+      const { alpha } = eng.tick(dt);
+      eng.sampleRenderState(alpha, renderState);
 
-      // Update ballistic lunar dust puffs
-      if (lunarDustRef.current) {
-        const gravY = Math.abs(latestSpecRef.current.gravity?.[1] ?? 1.62);
-        lunarDustRef.current.update(dt, gravY);
-      }
+      // 1. Update Droid Root Transform (strictly on canonical terrain heightfield — ZERO floating!)
+      const sanitized = sanitizeViewerPosition(renderState.pos, DEFAULT_ARENA);
+      robotGroup.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
+      robotGroup.quaternion.set(renderState.quat[0], renderState.quat[1], renderState.quat[2], renderState.quat[3]);
 
-      // GPU dust particle offset
-      if (dustParticlesRef.current) {
-        dustParticlesRef.current.position.y = (now * 0.00018) % 3.0;
-      }
-
-      const preset = cameraPresetRef.current;
-      const isNewAnim = isNewAnimationRef.current;
-      const robotPos = new THREE.Vector3(0, 0.45, 0);
-      const robotVel: [number, number, number] = [0, 0, 0];
-      let robotYaw = 0;
-      let frameCollisions: any[] | undefined = undefined;
-
-      if (isNewAnim) {
-        // --- NEW FLUID ANIMATION PIPELINE ---
-        jitterBuffer.advance(dt, 1.0);
-        const hasInterp = jitterBuffer.sample(interpFrame);
-
-        if (robotGroupRef.current && hasInterp) {
-          const sanitized = sanitizeViewerPosition(
-            [interpFrame.pos[0], interpFrame.pos[1], interpFrame.pos[2]],
-            DEFAULT_ARENA
-          );
-          robotGroupRef.current.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
-          robotGroupRef.current.quaternion.set(
-            interpFrame.quat[0],
-            interpFrame.quat[1],
-            interpFrame.quat[2],
-            interpFrame.quat[3]
-          );
-          robotPos.copy(robotGroupRef.current.position);
-
-          // Compute yaw from quaternion for radar alignment
-          const q = robotGroupRef.current.quaternion;
-          robotYaw = Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z));
-
-          // Update terrain rim shader proximity uniform
-          const robotDistToEdge = Math.max(
-            0,
-            DEFAULT_ARENA.halfExtent - Math.max(Math.abs(robotPos.x), Math.abs(robotPos.z))
-          );
-          if (terrainUniformsRef.current) {
-            terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
-          }
-
-          // Articulated joints update (Corrected signs for Single Frame Convention)
-          const joints = jointMeshesRef.current;
-          for (const [name, angle] of Object.entries(interpFrame.joints)) {
-            const group = joints[name];
-            if (group) {
-              if (name.includes('hip')) group.rotation.x = -angle;
-              if (name.includes('thigh')) group.rotation.z = angle;
-              if (name.includes('calf')) group.rotation.z = angle;
-            }
-          }
-
-          // Feet & Contact Blobs update (Clamped directly to terrain surface)
-          if (interpFrame.feet && interpFrame.feet.length > 0 && footBlobsRef.current.length === 4) {
-            for (let fi = 0; fi < interpFrame.feet.length; fi++) {
-              const foot = interpFrame.feet[fi];
-              const blob = footBlobsRef.current[fi];
-              if (blob) {
-                const groundY = canonicalFieldRef.current
-                  ? canonicalFieldRef.current.sampleHeight(foot.pos[0], foot.pos[2])
-                  : foot.pos[1];
-                blob.position.set(foot.pos[0], groundY + 0.003, foot.pos[2]);
-                const clearance = Math.max(0, foot.pos[1] - groundY);
-                const bMat = blob.material as THREE.MeshBasicMaterial;
-                bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
-                bMat.opacity = foot.contact ? 0.85 : Math.max(0, Math.min(0.25, 0.25 * (1 - clearance / 0.12)));
-              }
-
-              const wasContact = prevFootContactsRef.current[fi];
-              if (foot.contact && !wasContact && lunarDustRef.current) {
-                lunarDustRef.current.emit(foot.pos, 5);
-              }
-              prevFootContactsRef.current[fi] = foot.contact;
-            }
-          }
-
-          // Translucent Ghost comparison
-          if (showGhostComparisonRef.current && ghostRobotGroupRef.current) {
-            ghostRobotGroupRef.current.position.set(robotPos.x * 0.86, robotPos.y, robotPos.z);
-            for (const [name, angle] of Object.entries(interpFrame.joints)) {
-              const group = ghostJointMeshesRef.current[name];
-              if (group) {
-                if (name.includes('hip')) group.rotation.x = -angle * 0.85;
-                if (name.includes('thigh')) group.rotation.z = angle * 0.85;
-                if (name.includes('calf')) group.rotation.z = angle * 0.85;
-              }
-            }
-          }
-
-          // Draped Terrain Trail update (Distance sampled, zero wrap jumps)
-          const lastPos = lastRecordedTrailPosRef.current;
-          const distMoved = lastPos ? Math.hypot(robotPos.x - lastPos[0], robotPos.z - lastPos[2]) : 1.0;
-          if (distMoved >= 0.10 && trailCountRef.current < maxTrailPoints) {
-            const trailBuf = trailBufferRef.current;
-            const idx = trailCountRef.current;
-            const groundY = canonicalFieldRef.current
-              ? canonicalFieldRef.current.sampleHeight(robotPos.x, robotPos.z)
-              : robotPos.y;
-            trailBuf[idx * 3] = robotPos.x;
-            trailBuf[idx * 3 + 1] = groundY + 0.012;
-            trailBuf[idx * 3 + 2] = robotPos.z;
-            trailCountRef.current++;
-            lastRecordedTrailPosRef.current = [robotPos.x, robotPos.y, robotPos.z];
-
-            if (trailLineRef.current) {
-              const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
-              attr.needsUpdate = true;
-              trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
-            }
-          }
-
-          // Boundary Warning & Rim Pulse
-          const distFromCenter = Math.hypot(robotPos.x, robotPos.z);
-          if (distFromCenter > 16.0 && boundaryRimMatRef.current) {
-            const pulse = (Math.sin(now * 0.005) + 1.0) * 0.5;
-            boundaryRimMatRef.current.color.setRGB(0.72 + pulse * 0.28, 0.23, 0.18);
-            if (onBoundaryWarningRef.current) {
-              onBoundaryWarningRef.current(
-                distFromCenter > 20.0 ? 'out' : 'soft',
-                Math.max(0, 18.0 - distFromCenter)
-              );
-            }
-          } else if (boundaryRimMatRef.current) {
-            boundaryRimMatRef.current.color.set(0xfdfbf7);
-          }
-
-          // Episode Resets
-          if (interpFrame.episodeEvent && onEpisodeResetRef.current) {
-            onEpisodeResetRef.current(interpFrame.episodeEvent);
-          }
-
-          // Collision Flash
-          frameCollisions = interpFrame.collisions;
-          if (frameCollisions && frameCollisions.length > 0) {
-            const col = frameCollisions[0];
-            if (collisionFlashRef.current) {
-              collisionFlashRef.current.position.set(col.point[0], 0.05, -col.point[1]);
-              (collisionFlashRef.current.material as THREE.MeshBasicMaterial).opacity = 0.95;
-            }
-            if (onCollisionDetectedRef.current) onCollisionDetectedRef.current(col);
-          } else if (collisionFlashRef.current) {
-            const mat = collisionFlashRef.current.material as THREE.MeshBasicMaterial;
-            mat.opacity = Math.max(0, mat.opacity - dt * 2.8);
-          }
+      // 2. Update Articulated Joint Rotations + Torque-Driven Actuator LEDs
+      for (const name in renderState.joints) {
+        const g = jointGroups[name];
+        const angle = renderState.joints[name];
+        if (g) {
+          if (name.includes('hip')) g.rotation.x = -angle;
+          else if (name.includes('thigh')) g.rotation.z = angle;
+          else if (name.includes('calf')) g.rotation.z = angle;
         }
-      } else {
-        // --- LEGACY BASELINE PIPELINE ---
-        const frame = store.getLatestFrame() || currentFrameRef.current;
-
-        if (robotGroupRef.current && frame?.bodies && frame.bodies.length > 0) {
-          const torso = frame.bodies.find((b) => b.id === 'torso') || frame.bodies[0];
-
-          const sanitized = sanitizeViewerPosition([torso.pos[0], torso.pos[1], torso.pos[2]], DEFAULT_ARENA);
-          robotGroupRef.current.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
-          robotGroupRef.current.quaternion.set(torso.quat[0], torso.quat[1], torso.quat[2], torso.quat[3]);
-          robotPos.copy(robotGroupRef.current.position);
-
-          const q = robotGroupRef.current.quaternion;
-          robotYaw = Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z));
-
-          const robotDistToEdge = Math.max(0, DEFAULT_ARENA.halfExtent - Math.max(Math.abs(robotPos.x), Math.abs(robotPos.z)));
-          if (terrainUniformsRef.current) {
-            terrainUniformsRef.current.uEdgeDistance.value = robotDistToEdge;
-          }
-
-          const joints = jointMeshesRef.current;
-          for (const j of frame.joints) {
-            const group = joints[j.name];
-            if (group) {
-              if (j.name.includes('hip')) group.rotation.x = -j.angle;
-              if (j.name.includes('thigh')) group.rotation.z = j.angle;
-              if (j.name.includes('calf')) group.rotation.z = j.angle;
-            }
-          }
-
-          if (frame.feet && frame.feet.length > 0 && footBlobsRef.current.length === 4) {
-            for (let fi = 0; fi < frame.feet.length; fi++) {
-              const foot = frame.feet[fi];
-              const blob = footBlobsRef.current[fi];
-              if (blob) {
-                const groundY = canonicalFieldRef.current
-                  ? canonicalFieldRef.current.sampleHeight(foot.pos[0], foot.pos[2])
-                  : foot.pos[1];
-                blob.position.set(foot.pos[0], groundY + 0.003, foot.pos[2]);
-                const clearance = Math.max(0, foot.pos[1] - groundY);
-                const bMat = blob.material as THREE.MeshBasicMaterial;
-                bMat.color.setHex(foot.contact ? 0x6b705c : 0xfdfbf7);
-                bMat.opacity = foot.contact ? 0.85 : Math.max(0, Math.min(0.25, 0.25 * (1 - clearance / 0.12)));
-              }
-
-              const wasContact = prevFootContactsRef.current[fi];
-              if (foot.contact && !wasContact && lunarDustRef.current) {
-                lunarDustRef.current.emit(foot.pos, 5);
-              }
-              prevFootContactsRef.current[fi] = foot.contact;
-            }
-          }
-
-          if (showGhostComparisonRef.current && ghostRobotGroupRef.current) {
-            ghostRobotGroupRef.current.position.set(robotPos.x * 0.86, robotPos.y, robotPos.z);
-            for (const j of frame.joints) {
-              const group = ghostJointMeshesRef.current[j.name];
-              if (group) {
-                if (j.name.includes('hip')) group.rotation.x = -j.angle * 0.85;
-                if (j.name.includes('thigh')) group.rotation.z = j.angle * 0.85;
-                if (j.name.includes('calf')) group.rotation.z = j.angle * 0.85;
-              }
-            }
-          }
-
-          const lastPos = lastRecordedTrailPosRef.current;
-          const distMoved = lastPos ? Math.hypot(robotPos.x - lastPos[0], robotPos.z - lastPos[2]) : 1.0;
-          if (distMoved >= 0.10 && trailCountRef.current < maxTrailPoints) {
-            const trailBuf = trailBufferRef.current;
-            const idx = trailCountRef.current;
-            const groundY = canonicalFieldRef.current
-              ? canonicalFieldRef.current.sampleHeight(robotPos.x, robotPos.z)
-              : robotPos.y;
-            trailBuf[idx * 3] = robotPos.x;
-            trailBuf[idx * 3 + 1] = groundY + 0.012;
-            trailBuf[idx * 3 + 2] = robotPos.z;
-            trailCountRef.current++;
-            lastRecordedTrailPosRef.current = [robotPos.x, robotPos.y, robotPos.z];
-
-            if (trailLineRef.current) {
-              const attr = trailLineRef.current.geometry.attributes.position as THREE.BufferAttribute;
-              attr.needsUpdate = true;
-              trailLineRef.current.geometry.setDrawRange(0, trailCountRef.current);
-            }
-          }
-
-          const distFromCenter = Math.hypot(robotPos.x, robotPos.z);
-          if (distFromCenter > 16.0 && boundaryRimMatRef.current) {
-            const pulse = (Math.sin(now * 0.005) + 1.0) * 0.5;
-            boundaryRimMatRef.current.color.setRGB(0.72 + pulse * 0.28, 0.23, 0.18);
-            if (onBoundaryWarningRef.current) onBoundaryWarningRef.current(distFromCenter > 20.0 ? 'out' : 'soft', Math.max(0, 18.0 - distFromCenter));
-          } else if (boundaryRimMatRef.current) {
-            boundaryRimMatRef.current.color.set(0xfdfbf7);
-          }
-
-          if (frame.episodeEvent && onEpisodeResetRef.current) {
-            onEpisodeResetRef.current(frame.episodeEvent);
-          }
-
-          frameCollisions = frame.collisions;
-          if (frameCollisions && frameCollisions.length > 0) {
-            const col = frameCollisions[0];
-            if (collisionFlashRef.current) {
-              collisionFlashRef.current.position.set(col.point[0], 0.05, -col.point[1]);
-              (collisionFlashRef.current.material as THREE.MeshBasicMaterial).opacity = 0.95;
-            }
-            if (onCollisionDetectedRef.current) onCollisionDetectedRef.current(col);
-          } else if (collisionFlashRef.current) {
-            const mat = collisionFlashRef.current.material as THREE.MeshBasicMaterial;
-            mat.opacity = Math.max(0, mat.opacity - dt * 2.8);
-          }
+        const led = actuatorLeds[name];
+        if (led) {
+          const tq = renderState.jointTorques[name] ?? 0;
+          const intensity = Math.min(1.6, 0.25 + tq * 0.22);
+          (led.material as THREE.MeshStandardMaterial).emissiveIntensity = intensity;
         }
       }
 
-      // Camera Rig & Target Clamping
-      const maxCameraEnvelope = DEFAULT_ARENA.halfExtent + 1.0;
-      const clampedLookX = Math.max(-maxCameraEnvelope, Math.min(maxCameraEnvelope, robotPos.x));
-      const clampedLookZ = Math.max(-maxCameraEnvelope, Math.min(maxCameraEnvelope, robotPos.z));
+      // Secondary-motion antenna sway
+      if (antennaGroup) {
+        antennaGroup.rotation.z = renderState.antennaAngles[0] * 0.8;
+        antennaGroup.rotation.x = renderState.antennaAngles[1] * 0.8;
+      }
 
-      if (isNewAnim) {
-        // --- NEW FLUID CAMERA RIG (Critically damped springs, rule-of-thirds framing, roll-locked) ---
-        cameraRig.update(
-          camera,
-          [clampedLookX, robotPos.y, clampedLookZ],
-          robotVel,
-          preset === 'side' ? 'side' : preset === 'top' ? 'top' : 'chase',
-          canonicalFieldRef.current,
-          dt,
-          targetCameraAngle
-        );
+      // Collider debug wireframe
+      colliderSphere.visible = showColliderRef.current;
+
+      // 3. Ghost Droid Overlay (from saved replay or comparison)
+      const ghostPose = showGhostRef.current || eng.hasGhost() ? eng.getCurrentGhostPose() : null;
+      if (ghostPose) {
+        ghostGroup.visible = true;
+        ghostGroup.position.set(ghostPose.pos[0], ghostPose.pos[1], ghostPose.pos[2]);
+        ghostGroup.quaternion.set(ghostPose.quat[0], ghostPose.quat[1], ghostPose.quat[2], ghostPose.quat[3]);
+        for (const name in renderState.joints) {
+          const gg = ghostJoints[name];
+          if (gg) {
+            const ang = renderState.joints[name];
+            if (name.includes('hip')) gg.rotation.x = -ang;
+            else if (name.includes('thigh') || name.includes('calf')) gg.rotation.z = ang;
+          }
+        }
       } else {
-        // --- LEGACY CAMERA LERP ---
-        camera.up.set(0, 1, 0);
+        ghostGroup.visible = false;
+      }
 
-        if (preset === 'top') {
-          camera.position.set(clampedLookX, robotPos.y + 8.5, clampedLookZ);
-          camera.lookAt(clampedLookX, robotPos.y, clampedLookZ);
-        } else if (preset === 'side') {
-          camera.position.set(clampedLookX, robotPos.y + 1.2, clampedLookZ + 4.5);
-          camera.lookAt(clampedLookX, robotPos.y + 0.3, clampedLookZ);
+      // 4. Subtle Contact Shadows under actual footfalls + Ballistic Dust Puffs
+      const field = eng.terrain.getField();
+      for (let i = 0; i < renderState.feet.length && i < footShadows.length; i++) {
+        const f = renderState.feet[i];
+        const sh = footShadows[i];
+        const gy = field.sampleHeight(f.pos[0], f.pos[2]);
+        const clearance = Math.max(0, f.pos[1] - gy);
+        sh.position.set(f.pos[0], gy + 0.004, f.pos[2]);
+        const scale = Math.max(0.3, 1.0 - clearance * 2.5);
+        sh.scale.set(scale, 1, scale);
+        const sMat = sh.material as THREE.MeshBasicMaterial;
+        sMat.opacity = f.contact ? 0.42 : Math.max(0, 0.22 * (1 - clearance / 0.28));
+
+        if (f.contact && !prevContacts[i] && showDustRef.current && !isLow && !reducedMotionRef.current) {
+          lunarDust.emit(f.pos, 4);
+        }
+        prevContacts[i] = f.contact;
+      }
+
+      // Landing impact dust burst & seeded camera shake
+      if (renderState.justLanded) {
+        if (showDustRef.current && !isLow && !reducedMotionRef.current) {
+          lunarDust.emit([sanitized.pos[0], field.sampleHeight(sanitized.pos[0], sanitized.pos[2]) + 0.02, sanitized.pos[2]], 14);
+        }
+        if (shakeEnabledRef.current && !reducedMotionRef.current) {
+          shakeIntensity = Math.min(0.14, 0.04 + renderState.landingImpactSpeed * 0.05);
+        }
+      }
+      lunarDust.update(dt, eng.getScenario().gravity);
+
+      // 5. Terrain shader uniforms (edge proximity glow & smooth contour toggle)
+      if (terrainUniformsRef.current) {
+        terrainUniformsRef.current.uEdgeDistance.value = renderState.distanceToEdge;
+        terrainUniformsRef.current.uShowContours.value = showContoursRef.current ? 1.0 : 0.0;
+      }
+      if (renderState.boundaryState !== 'inside' && now - lastEdgeWarnMs > 1500) {
+        lastEdgeWarnMs = now;
+        onBoundaryWarnRef.current?.(renderState.boundaryState, renderState.distanceToEdge);
+      }
+
+      // 6. Subtle Fading Trail Line (sampled every 15cm along ground)
+      trailLine.visible = showTrailRef.current && showOverlaysRef.current;
+      const distMoved = Math.hypot(sanitized.pos[0] - lastTrailX, sanitized.pos[2] - lastTrailZ);
+      if (distMoved > 0.15) {
+        if (trailCount >= maxTrailPoints) {
+          // Shift ring smoothly without drawing a cross-screen jump cord
+          trailPositions.copyWithin(0, 3, maxTrailPoints * 3);
+          trailCount = maxTrailPoints - 1;
+          trailHistory2D.shift();
+        }
+        const gy = field.sampleHeight(sanitized.pos[0], sanitized.pos[2]) + 0.015;
+        trailPositions[trailCount * 3] = sanitized.pos[0];
+        trailPositions[trailCount * 3 + 1] = gy;
+        trailPositions[trailCount * 3 + 2] = sanitized.pos[2];
+        trailCount++;
+        trailHistory2D.push([sanitized.pos[0], sanitized.pos[2]]);
+        lastTrailX = sanitized.pos[0];
+        lastTrailZ = sanitized.pos[2];
+        trailGeo.attributes.position.needsUpdate = true;
+        trailGeo.setDrawRange(0, trailCount);
+        trailLine.computeLineDistances();
+      }
+
+      // 7. Rebuild Mission Beacons & Waypoints when changed
+      const activeMarkers = missionMarkersRef.current;
+      const doneIds = completedIdsRef.current;
+      const wps = waypointsRef.current;
+      const markerSig = `${activeMarkers.map((m) => m.id).join(',')}|${doneIds.join(',')}|${wps.map((w) => `${w.x.toFixed(1)},${w.z.toFixed(1)}`).join(';')}|${colorblindRef.current}`;
+      if (markerSig !== lastMarkerSig) {
+        lastMarkerSig = markerSig;
+        while (markerGroup.children.length > 0) {
+          const child = markerGroup.children[0];
+          markerGroup.remove(child);
+        }
+        const objColor = colorblindRef.current ? 0x38bdf8 : 0x8ea48c;
+        const wpColor = colorblindRef.current ? 0xfbbf24 : 0xf59e0b;
+
+        for (const m of activeMarkers) {
+          if (doneIds.includes(m.id)) continue;
+          const gy = field.sampleHeight(m.x, m.z);
+          const beacon = buildTerrainBeacon(m.x, gy, m.z, m.radius * 0.5, objColor, m.kind === 'trench' ? 1.8 : 2.6);
+          markerGroup.add(beacon);
+        }
+        for (const wp of wps) {
+          const gy = field.sampleHeight(wp.x, wp.z);
+          const wpBeacon = buildTerrainBeacon(wp.x, gy, wp.z, 0.42, wp.reachable === false ? 0xb83b2f : wpColor, 1.5);
+          markerGroup.add(wpBeacon);
+        }
+      }
+      markerGroup.visible = showOverlaysRef.current;
+
+      // 8. Sensor Overlays (LiDAR, GRF Arrows, Support Polygon, Planned Path — Phase W9.1)
+      const sFlags = sensorsRef.current;
+      lidarLines.visible = sFlags.lidar && !isLow;
+      if (lidarLines.visible && now - lastLidarMs > 50) {
+        lastLidarMs = now;
+        const rays = eng.computeLidarScan(24, 14.0);
+        let idx = 0;
+        for (let i = 0; i < rays.length && idx + 1 < lidarMaxVerts; i++) {
+          const r = rays[i];
+          lidarPositions[idx * 3] = r.origin[0];
+          lidarPositions[idx * 3 + 1] = r.origin[1];
+          lidarPositions[idx * 3 + 2] = r.origin[2];
+          lidarPositions[(idx + 1) * 3] = r.hitPoint[0];
+          lidarPositions[(idx + 1) * 3 + 1] = r.hitPoint[1];
+          lidarPositions[(idx + 1) * 3 + 2] = r.hitPoint[2];
+          const cr = r.isObstacle ? 0.96 : 0.42;
+          const cg = r.isObstacle ? 0.35 : 0.72;
+          const cb = r.isObstacle ? 0.25 : 0.55;
+          lidarColors[idx * 3] = cr; lidarColors[idx * 3 + 1] = cg; lidarColors[idx * 3 + 2] = cb;
+          lidarColors[(idx + 1) * 3] = cr; lidarColors[(idx + 1) * 3 + 1] = cg; lidarColors[(idx + 1) * 3 + 2] = cb;
+          idx += 2;
+        }
+        lidarGeo.attributes.position.needsUpdate = true;
+        lidarGeo.attributes.color.needsUpdate = true;
+        lidarGeo.setDrawRange(0, idx);
+      }
+
+      grfLines.visible = sFlags.contacts;
+      if (grfLines.visible) {
+        let idx = 0;
+        for (let i = 0; i < renderState.feet.length; i++) {
+          const f = renderState.feet[i];
+          const gy = field.sampleHeight(f.pos[0], f.pos[2]);
+          const h = f.contact ? 0.35 : 0.0;
+          grfPositions[idx * 3] = f.pos[0]; grfPositions[idx * 3 + 1] = gy + 0.01; grfPositions[idx * 3 + 2] = f.pos[2];
+          grfPositions[(idx + 1) * 3] = f.pos[0]; grfPositions[(idx + 1) * 3 + 1] = gy + 0.01 + h; grfPositions[(idx + 1) * 3 + 2] = f.pos[2];
+          idx += 2;
+        }
+        grfGeo.attributes.position.needsUpdate = true;
+        grfGeo.setDrawRange(0, idx);
+      }
+
+      polyLine.visible = sFlags.stability;
+      if (polyLine.visible) {
+        const planted = renderState.feet.filter((f) => f.contact);
+        if (planted.length >= 2) {
+          for (let i = 0; i < planted.length; i++) {
+            const f = planted[i];
+            polyPositions[i * 3] = f.pos[0];
+            polyPositions[i * 3 + 1] = field.sampleHeight(f.pos[0], f.pos[2]) + 0.02;
+            polyPositions[i * 3 + 2] = f.pos[2];
+          }
+          polyPositions[planted.length * 3] = planted[0].pos[0];
+          polyPositions[planted.length * 3 + 1] = field.sampleHeight(planted[0].pos[0], planted[0].pos[2]) + 0.02;
+          polyPositions[planted.length * 3 + 2] = planted[0].pos[2];
+          polyGeo.attributes.position.needsUpdate = true;
+          polyGeo.setDrawRange(0, planted.length + 1);
         } else {
-          currentCameraAngle.yaw += (targetCameraAngle.yaw - currentCameraAngle.yaw) * 0.12;
-          currentCameraAngle.pitch += (targetCameraAngle.pitch - currentCameraAngle.pitch) * 0.12;
-          currentCameraAngle.dist += (targetCameraAngle.dist - currentCameraAngle.dist) * 0.12;
-
-          const camX = clampedLookX + Math.sin(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
-          const rawCamY = robotPos.y + Math.sin(currentCameraAngle.pitch) * currentCameraAngle.dist + 0.35;
-          const camZ = clampedLookZ + Math.cos(currentCameraAngle.yaw) * Math.cos(currentCameraAngle.pitch) * currentCameraAngle.dist;
-          
-          const groundAtCam = canonicalFieldRef.current ? canonicalFieldRef.current.sampleHeight(camX, camZ) : 0;
-          const clampedCamY = Math.max(groundAtCam + 0.45, rawCamY);
-
-          camera.position.set(camX, clampedCamY, camZ);
-          camera.lookAt(clampedLookX, robotPos.y + 0.25, clampedLookZ);
+          polyGeo.setDrawRange(0, 0);
         }
       }
 
-      // Tight Following Shadow Camera updates (Throttled to 30 Hz)
-      shadowUpdateFrame++;
-      if (dirLightRef.current && shadowsEnabled && shadowUpdateFrame % 2 === 0) {
-        dirLightRef.current.position.set(robotPos.x + 8, robotPos.y + 14, robotPos.z + 10);
-        dirLightRef.current.target.position.set(robotPos.x, robotPos.y, robotPos.z);
-        dirLightRef.current.target.updateMatrixWorld();
+      pathLine.visible = sFlags.path || wps.length > 0;
+      if (pathLine.visible) {
+        let pCount = 0;
+        pathPositions[0] = sanitized.pos[0];
+        pathPositions[1] = field.sampleHeight(sanitized.pos[0], sanitized.pos[2]) + 0.04;
+        pathPositions[2] = sanitized.pos[2];
+        pCount = 1;
+        const targets = wps.length > 0
+          ? wps
+          : activeMarkers.filter((m) => !doneIds.includes(m.id)).slice(0, 1);
+        for (let i = 0; i < targets.length && pCount < 32; i++) {
+          const t = targets[i];
+          pathPositions[pCount * 3] = t.x;
+          pathPositions[pCount * 3 + 1] = field.sampleHeight(t.x, t.z) + 0.04;
+          pathPositions[pCount * 3 + 2] = t.z;
+          pCount++;
+        }
+        pathGeo.attributes.position.needsUpdate = true;
+        pathGeo.setDrawRange(0, pCount);
       }
 
-      // Render Three.js WebGL Scene
+      // 9. Camera Rig (Follow, Orbit, Top-Down, FPV, Free-Fly + 0.35s Min-Jerk Blend + Landing Shake)
+      if (Math.abs(camera.fov - fovRef.current) > 0.1) {
+        camera.fov = fovRef.current;
+        camera.updateProjectionMatrix();
+      }
+
+      // Auto-recenter follow orbit offset after 3s idle
+      const nowSec = now / 1000;
+      if (
+        cameraModeRef.current === 'follow' &&
+        autoRecenterRef.current &&
+        !isLeftDragging &&
+        nowSec - orbitAnglesRef.current.lastDragSec > 3.0
+      ) {
+        orbitAnglesRef.current.offsetYaw *= Math.exp(-2.2 * dt);
+      }
+
+      // Apply gamepad right-stick pitch delta smoothly
+      if (Math.abs(eng.inputs.gamepadCameraPitchDelta) > 0.01) {
+        orbitAnglesRef.current.phi = Math.max(
+          0.12,
+          Math.min(1.15, orbitAnglesRef.current.phi + eng.inputs.gamepadCameraPitchDelta * dt * 1.4)
+        );
+      }
+
+      const mode = cameraModeRef.current;
+      const rx = sanitized.pos[0];
+      const ry = sanitized.pos[1];
+      const rz = sanitized.pos[2];
+
+      if (mode === 'follow') {
+        if (Math.abs(orbitAnglesRef.current.offsetYaw) > 0.03) {
+          const ang = renderState.yaw + Math.PI + orbitAnglesRef.current.offsetYaw;
+          const d = orbitAnglesRef.current.dist;
+          const cx = rx + Math.cos(ang) * d;
+          const cz = rz - Math.sin(ang) * d;
+          const cy = Math.max(field.sampleHeight(cx, cz) + 0.55, ry + Math.sin(orbitAnglesRef.current.phi) * d + 0.35);
+          tmpCamTargetPos.set(cx, cy, cz);
+          tmpCamTargetLook.set(rx, ry + 0.12, rz);
+        } else {
+          cameraRig.update(
+            camera,
+            [rx, ry, rz],
+            renderState.vel,
+            'chase',
+            field,
+            dt
+          );
+          tmpCamTargetPos.copy(camera.position);
+          tmpCamTargetLook.set(rx + renderState.vel[0] * 0.25, ry + 0.15, rz + renderState.vel[2] * 0.25);
+        }
+      } else if (mode === 'orbit' || mode === 'freefly') {
+        const d = orbitAnglesRef.current.dist;
+        const th = orbitAnglesRef.current.theta;
+        const ph = orbitAnglesRef.current.phi;
+        const cx = rx + Math.sin(th) * Math.cos(ph) * d;
+        const cz = rz + Math.cos(th) * Math.cos(ph) * d;
+        const cy = Math.max(field.sampleHeight(cx, cz) + 0.4, ry + Math.sin(ph) * d + 0.3);
+        tmpCamTargetPos.set(cx, cy, cz);
+        tmpCamTargetLook.set(rx, ry + 0.18, rz);
+      } else if (mode === 'topdown') {
+        const topH = Math.max(10.0, orbitAnglesRef.current.dist * 3.2);
+        tmpCamTargetPos.set(rx, ry + topH, rz + 0.01);
+        tmpCamTargetLook.set(rx, ry, rz);
+      } else if (mode === 'fpv') {
+        const fwdX = Math.cos(renderState.yaw);
+        const fwdZ = -Math.sin(renderState.yaw);
+        tmpCamTargetPos.set(rx + fwdX * 0.34, ry + 0.20, rz + fwdZ * 0.34);
+        tmpCamTargetLook.set(rx + fwdX * 5.0, ry + 0.05, rz + fwdZ * 5.0);
+      }
+
+      if (cameraBlendRef.current.active) {
+        cameraBlendRef.current.elapsed += dt;
+        const tau = Math.min(1, cameraBlendRef.current.elapsed / cameraBlendRef.current.duration);
+        const blend = minJerk(tau);
+        camera.position.lerpVectors(cameraBlendRef.current.fromPos, tmpCamTargetPos, blend);
+        if (tau >= 1) cameraBlendRef.current.active = false;
+      } else {
+        camera.position.copy(tmpCamTargetPos);
+      }
+
+      // Seeded exponential landing shake
+      if (shakeIntensity > 0.001 && !reducedMotionRef.current) {
+        shakeSeed = (shakeSeed * 1664525 + 1013904223) >>> 0;
+        const sx = ((shakeSeed & 0xff) / 255 - 0.5) * 2 * shakeIntensity;
+        const sy = (((shakeSeed >> 8) & 0xff) / 255 - 0.5) * 2 * shakeIntensity;
+        camera.position.x += sx;
+        camera.position.y += sy;
+        shakeIntensity *= Math.exp(-10 * dt);
+      } else {
+        shakeIntensity = 0;
+      }
+
+      camera.up.set(0, 1, 0);
+      camera.lookAt(tmpCamTargetLook);
+
+      // 10. Sun Directional Light tracking robot with texel-snapped shadow frustum
+      const elevRad = (sunRef.current.elev * Math.PI) / 180;
+      const azimRad = (sunRef.current.azim * Math.PI) / 180;
+      const sunDist = 18;
+      dirLight.position.set(
+        rx + Math.cos(elevRad) * Math.cos(azimRad) * sunDist,
+        ry + Math.sin(elevRad) * sunDist,
+        rz + Math.cos(elevRad) * Math.sin(azimRad) * sunDist
+      );
+      dirLight.target.position.set(rx, ry, rz);
+      dirLight.target.updateMatrixWorld();
+
+      // 11. Main WebGL Render Pass
+      const curW = container.clientWidth || width;
+      const curH = container.clientHeight || height;
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, curW, curH);
       renderer.render(scene, camera);
 
-      // Record Renderer Draw Calls & Triangles
-      probe.updateRendererInfo(renderer.info);
+      // 12. Optional Picture-in-Picture (PiP) Droid Head Camera (rendered ONLY when visible!)
+      if (pipEnabledRef.current && mode !== 'fpv') {
+        const pipW = Math.min(240, Math.round(curW * 0.22));
+        const pipH = Math.round(pipW * (9 / 16));
+        const margin = 16;
+        const px = curW - pipW - margin;
+        const py = 86; // Above bottom scrubber
 
-      // 15 Hz Cached Radar Render
-      if (now - lastRadarUpdate >= 66 && showRadarRef.current) {
-        const radarStart = performance.now();
-        radarSweepAngle = (radarSweepAngle + dt * 2.5) % (Math.PI * 2);
-        renderCachedTerrainRadar(
-          radarCanvasRef.current,
-          offscreenRadarRef.current,
-          robotPos,
-          robotYaw,
-          debrisDataRef.current,
-          radarSweepAngle,
-          frameCollisions
-        );
-        probe.recordSubsystemTime('radar', Number((performance.now() - radarStart).toFixed(2)));
-        lastRadarUpdate = now;
+        const fwdX = Math.cos(renderState.yaw);
+        const fwdZ = -Math.sin(renderState.yaw);
+        pipCamera.position.set(rx + fwdX * 0.34, ry + 0.19, rz + fwdZ * 0.34);
+        tmpFpvDir.set(rx + fwdX * 6.0, ry + 0.02, rz + fwdZ * 6.0);
+        pipCamera.lookAt(tmpFpvDir);
+        pipCamera.aspect = pipW / pipH;
+        pipCamera.updateProjectionMatrix();
+
+        renderer.setScissorTest(true);
+        renderer.setScissor(px, py, pipW, pipH);
+        renderer.setViewport(px, py, pipW, pipH);
+        renderer.render(scene, pipCamera);
+        renderer.setScissorTest(false);
+      }
+
+      // 13. Throttled Radar & HUD Sync (12 Hz — zero per-frame React state churn!)
+      if (now - lastRadarSyncMs > 85) {
+        lastRadarSyncMs = now;
+        setRadarState({
+          pos: [sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]],
+          yaw: renderState.yaw,
+          trail: trailHistory2D.slice(-120),
+        });
+      }
+      if (now - lastUiSyncMs > 100) {
+        lastUiSyncMs = now;
+        onUiSyncRef.current?.();
       }
     };
 
@@ -850,39 +927,39 @@ export default function ThreeViewer({
 
     const handleResize = () => {
       if (!container) return;
-      const w = container.clientWidth;
-      const h = container.clientHeight;
+      const w = container.clientWidth || 1;
+      const h = container.clientHeight || 1;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     };
-
     window.addEventListener('resize', handleResize);
 
     return () => {
-      cancelAnimationFrame(animationFrameId);
-      unsubStore();
-      if (typeof window !== 'undefined' && (window as any).__omniDebug) {
-        delete (window as any).__omniDebug;
-      }
+      cancelAnimationFrame(animId);
       window.removeEventListener('resize', handleResize);
-      container.removeEventListener('mousedown', onMouseDown);
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-      container.removeEventListener('wheel', onWheel);
+      renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('contextmenu', onContextMenu);
+      renderer.domElement.removeEventListener('wheel', onWheel);
+      renderer.domElement.removeEventListener('webglcontextlost', handleContextLost);
+      renderer.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
 
-      lunarDustRef.current?.dispose();
-      lunarDustRef.current = null;
+      onCanvasReadyRef.current?.(null);
+      lunarDust.dispose();
+      lidarGeo.dispose(); lidarMat.dispose();
+      grfGeo.dispose(); grfMat.dispose();
+      polyGeo.dispose(); polyMat.dispose();
+      pathGeo.dispose(); pathMat.dispose();
+      trailGeo.dispose(); trailMat.dispose();
 
       scene.traverse((obj) => {
         if ((obj as THREE.Mesh).isMesh) {
-          const mesh = obj as THREE.Mesh;
-          mesh.geometry?.dispose();
-          if (Array.isArray(mesh.material)) {
-            mesh.material.forEach((m) => m.dispose());
-          } else {
-            mesh.material?.dispose();
-          }
+          const m = obj as THREE.Mesh;
+          m.geometry?.dispose();
+          if (Array.isArray(m.material)) m.material.forEach((mat) => mat.dispose());
+          else m.material?.dispose();
         }
       });
 
@@ -895,54 +972,81 @@ export default function ThreeViewer({
 
   return (
     <div className="relative w-full h-full overflow-hidden select-none bg-charcoal">
-      <div ref={mountRef} className="w-full h-full" />
+      <div
+        ref={mountRef}
+        className={`w-full h-full ${editorTool !== 'none' ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'}`}
+      />
 
-      {/* Low Gravity & Scale HUD Chip */}
-      <div className="absolute top-4 left-4 z-20 flex items-center space-x-2 pointer-events-none">
+      {/* WebGL Context Lost Recovery Overlay (Phase W12.3) */}
+      {contextLost && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-charcoal-deep/95 font-mono text-xs text-cream">
+          <div className="p-6 rounded-2xl border border-amber-400/50 bg-charcoal space-y-2 text-center max-w-sm">
+            <div className="font-bold text-amber-300">WebGL Context Lost</div>
+            <p className="text-cream-dim text-[11px]">
+              GPU context was interrupted. Simulation state is preserved and will resume automatically upon restore.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Top-Left Gravity Telemetry Chip */}
+      <div className="absolute top-3 left-3 z-20 flex items-center space-x-2 pointer-events-none">
         <div className="analog-glass px-2.5 py-1 text-[11px] font-mono text-cream flex items-center space-x-1.5 shadow-lg">
           <span className="w-2 h-2 rounded-full bg-sage animate-pulse" />
           <span className="text-cream-dim">GRAVITY:</span>
-          <span className="font-bold text-cream">
-            {formatGravityDisplay(envSpec.gravity)}
+          <span className="font-bold text-cream tabular-nums">
+            {formatGravityDisplay([0, -engine.getScenario().gravity, 0])}
           </span>
         </div>
       </div>
 
-      {/* Radar Overlay (Top-Right) */}
+      {/* Upgraded Top-Right Radar Panel (Phase W1.5 — R-05) */}
       {showRadar && (
-        <div className="absolute top-4 right-4 z-20 pointer-events-none">
-          <div className="analog-glass p-2 rounded-xl border border-cream/15 shadow-2xl">
-            <div className="flex items-center justify-between font-mono text-[9px] text-cream-dim uppercase mb-1 px-0.5">
-              <div className="flex items-center gap-1.5 text-sage">
-                <span className="w-1.5 h-1.5 rounded-full bg-sage inline-block animate-pulse" />
-                <span className="font-bold text-cream">RADAR 40×40 m</span>
-              </div>
-              <span className="text-[8px] text-cream-dim">LIVE</span>
-            </div>
-            <canvas
-              ref={radarCanvasRef}
-              width={130}
-              height={130}
-              className="rounded-lg bg-charcoal-deep border border-cream/10"
-            />
-          </div>
+        <div className="absolute top-3 right-3 z-20 pointer-events-auto">
+          <RadarPanel
+            size={radarSize}
+            onSizeChange={onRadarSizeChange}
+            field={engine.terrain.getField()}
+            terrainVersion={terrainVersion}
+            debris={engine.getDebris()}
+            robotPos={radarState.pos}
+            robotYaw={radarState.yaw}
+            trailPoints={radarState.trail}
+            waypoints={waypoints}
+            missionMarkers={missionMarkers}
+            completedMarkerIds={completedMarkerIds}
+            colorblindSafe={colorblindSafe}
+          />
+        </div>
+      )}
+
+      {/* Picture-in-Picture Droid Camera Frame Badge */}
+      {pipEnabled && cameraMode !== 'fpv' && (
+        <div className="pointer-events-none absolute bottom-[86px] right-4 z-20 px-2 py-0.5 rounded-t bg-charcoal-deep/85 border border-cream/25 font-mono text-[9px] text-sage font-bold">
+          DROID FPV CAM
         </div>
       )}
     </div>
   );
 }
 
-/**
- * Builds distant background starfield points for airless lunar sky.
- */
+// ============================================================================
+// SCENE & MODEL BUILDERS
+// ============================================================================
+
 function buildStarfield(): THREE.Points {
   const count = 350;
   const geo = new THREE.BufferGeometry();
   const pos = new Float32Array(count * 3);
+  let s = 918273;
+  const rand = () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
   for (let i = 0; i < count; i++) {
-    const theta = Math.random() * Math.PI * 2;
-    const phi = Math.acos(Math.random() * 0.85); // Upper hemisphere only
-    const r = 90.0;
+    const theta = rand() * Math.PI * 2;
+    const phi = Math.acos(rand() * 0.85);
+    const r = 95.0;
     pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
     pos[i * 3 + 1] = r * Math.cos(phi) + 10.0;
     pos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
@@ -958,11 +1062,8 @@ function buildStarfield(): THREE.Points {
   return new THREE.Points(geo, mat);
 }
 
-/**
- * Creates subdivided noise-perturbed icosahedron boulder (>= 80 triangles, zero pyramids).
- */
 function createDisplacedIcosahedron(radius: number, detail = 1, seed = 0): THREE.BufferGeometry {
-  const geo = new THREE.IcosahedronGeometry(radius, detail); // 80 triangles
+  const geo = new THREE.IcosahedronGeometry(radius, detail);
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
     const vx = pos.getX(i);
@@ -976,14 +1077,14 @@ function createDisplacedIcosahedron(radius: number, detail = 1, seed = 0): THREE
   return geo;
 }
 
-/**
- * Builds canonical 257x257 TerrainField mesh with slope tinting, contours, and anti-aliased surface-draped rim.
- */
 function buildCanonicalTerrainMesh(
   scene: THREE.Scene,
   field: TerrainField,
   effectiveTier: string,
-  uniformsRef?: React.MutableRefObject<{ uEdgeDistance: { value: number } } | null>
+  uniformsRef?: React.MutableRefObject<{
+    uEdgeDistance: { value: number };
+    uShowContours: { value: number };
+  } | null>
 ): THREE.Mesh {
   const segments = effectiveTier === 'ultra' ? 256 : effectiveTier === 'high' ? 128 : effectiveTier === 'medium' ? 96 : 64;
   const terrainGeo = new THREE.PlaneGeometry(48.0, 48.0, segments, segments);
@@ -993,26 +1094,25 @@ function buildCanonicalTerrainMesh(
   for (let i = 0; i < posAttr.count; i++) {
     const x = posAttr.getX(i);
     const z = posAttr.getZ(i);
-    const y = field.sampleHeight(x, z);
-    posAttr.setY(i, y);
+    posAttr.setY(i, field.sampleHeight(x, z));
   }
   terrainGeo.computeVertexNormals();
 
   const terrainMat = new THREE.MeshStandardMaterial({
     color: 0x2e2e2e,
     roughness: 0.88,
-    metalness: 0.12,
+    metalness: 0.10,
     flatShading: false,
   });
 
   terrainMat.onBeforeCompile = (shader) => {
     const uniforms = {
       uEdgeDistance: { value: 18.0 },
+      uShowContours: { value: 1.0 },
     };
-    if (uniformsRef) {
-      uniformsRef.current = uniforms;
-    }
+    if (uniformsRef) uniformsRef.current = uniforms;
     shader.uniforms.uEdgeDistance = uniforms.uEdgeDistance;
+    shader.uniforms.uShowContours = uniforms.uShowContours;
 
     shader.vertexShader = shader.vertexShader.replace(
       '#include <common>',
@@ -1032,48 +1132,43 @@ function buildCanonicalTerrainMesh(
       `#include <common>
        varying vec3 vWorldPos;
        varying vec3 vWorldNormal;
-       uniform float uEdgeDistance;`
+       uniform float uEdgeDistance;
+       uniform float uShowContours;`
     );
 
-    // Pre-fog injection: Shading, contours, and anti-aliased proximity rim
+    // Smooth anti-aliased contours (R-04 fix) & surface-draped arena boundary rim
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <fog_fragment>',
-      `// 1. Slope-tinted shading (sage for flat plains, darker charcoal for steep slopes)
-       float slope = 1.0 - max(0.0, vWorldNormal.y);
+      `float slope = 1.0 - max(0.0, vWorldNormal.y);
        vec3 slopeTint = mix(vec3(0.18, 0.18, 0.18), vec3(0.11, 0.11, 0.11), smoothstep(0.1, 0.4, slope));
        gl_FragColor.rgb = mix(gl_FragColor.rgb, slopeTint, 0.35);
 
-       // 2. Regolith subtle sage tone for low flat terrain
        float flatT = smoothstep(0.15, 0.02, slope);
        gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.42, 0.44, 0.36), flatT * 0.22);
 
-       // 3. Elevation Contour Lines: 1.0m bold, 0.25m subtle (anti-aliased & distance-fading beyond 22m)
+       // Smooth fragment-space fwidth anti-aliased elevation isolines (zero jagged squiggles)
        float camDist = length(vWorldPos - cameraPosition);
-       float distFade = 1.0 - smoothstep(12.0, 22.0, camDist);
-       float fMajor = abs(fract(vWorldPos.y / 1.0 - 0.5) - 0.5) / max(0.001, fwidth(vWorldPos.y));
-       float fMinor = abs(fract(vWorldPos.y / 0.25 - 0.5) - 0.5) / max(0.001, fwidth(vWorldPos.y));
-       if (distFade > 0.001) {
-         if (fMajor < 1.0) {
-           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.08 * distFade);
-         } else if (fMinor < 0.7) {
-           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.04 * distFade);
-         }
+       if (uShowContours > 0.5) {
+         float distFade = 1.0 - smoothstep(10.0, 24.0, camDist);
+         float dyFw = max(0.003, fwidth(vWorldPos.y));
+         float fMajor = abs(fract(vWorldPos.y / 1.0 - 0.5) - 0.5) / dyFw;
+         float majorLine = 1.0 - smoothstep(0.35, 1.35, fMajor);
+         gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), majorLine * 0.065 * distFade);
        }
 
-       // 4. Square Arena Boundary Rim (Surface-draped, anti-aliased fwidth, distance fade, <= 35% opacity)
+       // Square Arena Boundary Rim (18m half-extent)
        float distArena = max(abs(vWorldPos.x), abs(vWorldPos.z));
        float rimDist = abs(distArena - 18.0);
        float rimWidth = max(0.04, fwidth(distArena) * 1.5);
        float rimAlpha = 1.0 - smoothstep(0.0, rimWidth, rimDist);
        float rimFade = 1.0 - smoothstep(18.0, 32.0, camDist);
-       float dash = fract((vWorldPos.x + vWorldPos.z) * 1.0); // 0.5m on / 0.5m off
+       float dash = fract((vWorldPos.x + vWorldPos.z) * 1.0);
        if (dash < 0.5 && rimAlpha > 0.01 && rimFade > 0.01) {
          gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.99, 0.98, 0.97), 0.28 * rimAlpha * rimFade);
        }
 
-       // 5. Proximity boundary alert glow (Gated strictly by uEdgeDistance < 2.5m)
        if (uEdgeDistance < 2.5) {
-         float alertIntensity = smoothstep(2.5, 0.0, uEdgeDistance) * 0.45;
+         float alertIntensity = smoothstep(2.5, 0.0, uEdgeDistance) * 0.42;
          gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.72, 0.23, 0.18), alertIntensity);
        }
        #include <fog_fragment>`
@@ -1087,67 +1182,81 @@ function buildCanonicalTerrainMesh(
   return mesh;
 }
 
-/**
- * Builds ground contact shadow blobs under planted quadruped feet with polygon offset.
- */
-function buildFootContactBlobs(scene: THREE.Scene): THREE.Mesh[] {
-  const blobs: THREE.Mesh[] = [];
-  const geo = new THREE.CircleGeometry(0.07, 16);
+function buildFootContactShadows(scene: THREE.Scene): THREE.Mesh[] {
+  const shadows: THREE.Mesh[] = [];
+  const geo = new THREE.CircleGeometry(0.055, 16);
   geo.rotateX(-Math.PI / 2);
-
   for (let i = 0; i < 4; i++) {
     const mat = new THREE.MeshBasicMaterial({
-      color: 0x6b705c, // Sage token
+      color: 0x0c0c0a,
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.42,
       depthWrite: false,
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
     });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(0, -10, 0); // initial off-screen
-    scene.add(mesh);
-    blobs.push(mesh);
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(0, -10, 0);
+    scene.add(m);
+    shadows.push(m);
   }
-  return blobs;
+  return shadows;
 }
 
-/**
- * Builds Fallback Floor Catch Plane at y = -5.0m.
- */
-function buildFloorCatchPlane(scene: THREE.Scene, width: number, length: number, y: number) {
-  const geo = new THREE.PlaneGeometry(width * 1.5, length * 1.5);
-  geo.rotateX(-Math.PI / 2);
-  const mat = new THREE.MeshBasicMaterial({
-    color: 0x1f1f1f,
-    wireframe: true,
+function buildTerrainBeacon(
+  x: number,
+  groundY: number,
+  z: number,
+  radius: number,
+  colorHex: number,
+  beamHeight: number
+): THREE.Group {
+  const g = new THREE.Group();
+  g.position.set(x, groundY + 0.02, z);
+
+  const ringGeo = new THREE.TorusGeometry(radius, 0.032, 8, 32);
+  ringGeo.rotateX(-Math.PI / 2);
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: colorHex,
     transparent: true,
-    opacity: 0.15,
+    opacity: 0.85,
+    depthWrite: false,
   });
-  const plane = new THREE.Mesh(geo, mat);
-  plane.position.y = y;
-  scene.add(plane);
-  return plane;
+  g.add(new THREE.Mesh(ringGeo, ringMat));
+
+  const beamGeo = new THREE.CylinderGeometry(radius * 0.55, radius * 0.85, beamHeight, 16, 1, true);
+  const beamMat = new THREE.MeshBasicMaterial({
+    color: colorHex,
+    transparent: true,
+    opacity: 0.22,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const beam = new THREE.Mesh(beamGeo, beamMat);
+  beam.position.y = beamHeight * 0.5;
+  g.add(beam);
+
+  return g;
 }
 
-/**
- * Builds 4x4 spatial chunked instanced debris boulders with pure white base material and authentic geological tones.
- */
-function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enableShadows = true): THREE.InstancedMesh[] {
+function buildChunkedDebris(
+  scene: THREE.Scene,
+  debris: readonly DebrisInstance[],
+  enableShadows = true
+): THREE.InstancedMesh[] {
   const chunks: DebrisInstance[][] = Array.from({ length: 16 }, () => []);
   for (const d of debris) {
-    const cid = d.chunkId ?? 0;
-    chunks[cid].push(d);
+    chunks[d.chunkId ?? 0].push(d);
   }
 
-  // 3 shared displaced icosahedrons (>= 80 triangles, ZERO pyramids)
-  const boulderGeo1 = createDisplacedIcosahedron(0.28, 1, 101);
-  const boulderGeo2 = createDisplacedIcosahedron(0.24, 1, 202);
-  const boulderGeo3 = createDisplacedIcosahedron(0.20, 1, 303);
-  const sharedGeos = [boulderGeo1, boulderGeo2, boulderGeo3];
+  const sharedGeos = [
+    createDisplacedIcosahedron(0.28, 1, 101),
+    createDisplacedIcosahedron(0.24, 1, 202),
+    createDisplacedIcosahedron(0.20, 1, 303),
+  ];
 
-  // Base material MUST be pure white (0xffffff) so instanceColor applies true luminance
+  // Pure white base material (0xffffff) preserves true lit & shadowed boulder luminance
   const debrisMat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
     roughness: 0.90,
@@ -1155,174 +1264,127 @@ function buildChunkedDebris(scene: THREE.Scene, debris: DebrisInstance[], enable
     flatShading: false,
   });
 
-  const colorVariation = [
-    new THREE.Color(0x52524b),
+  const palette = [
+    new THREE.Color(0x56564f),
     new THREE.Color(0x4a4a44),
-    new THREE.Color(0x3e3e38),
-    new THREE.Color(0x56564e),
-    new THREE.Color(0x44443e),
+    new THREE.Color(0x40403a),
+    new THREE.Color(0x5c5c54),
+    new THREE.Color(0x464640),
   ];
 
   const dummy = new THREE.Object3D();
-  const createdMeshes: THREE.InstancedMesh[] = [];
+  const created: THREE.InstancedMesh[] = [];
 
   for (let c = 0; c < 16; c++) {
     const chunkDebris = chunks[c];
     if (chunkDebris.length === 0) continue;
-
-    const geo = sharedGeos[c % 3];
-    const instancedMesh = new THREE.InstancedMesh(geo, debrisMat, chunkDebris.length);
-    instancedMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-
-    const chunkBox = new THREE.Box3();
-
+    const mesh = new THREE.InstancedMesh(sharedGeos[c % 3].clone(), debrisMat, chunkDebris.length);
+    mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    const box = new THREE.Box3();
     for (let i = 0; i < chunkDebris.length; i++) {
       const d = chunkDebris[i];
       dummy.position.set(d.x, d.y, d.z);
       dummy.scale.set(d.scale, d.scale * 0.95, d.scale);
       dummy.rotation.set(d.rotation[0], d.rotation[1], d.rotation[2]);
       dummy.updateMatrix();
-      instancedMesh.setMatrixAt(i, dummy.matrix);
-      chunkBox.expandByPoint(dummy.position);
-
-      const col = colorVariation[(d.id + c) % colorVariation.length];
-      instancedMesh.setColorAt(i, col);
+      mesh.setMatrixAt(i, dummy.matrix);
+      box.expandByPoint(dummy.position);
+      mesh.setColorAt(i, palette[(d.id + c) % palette.length]);
     }
-
-    instancedMesh.instanceMatrix.needsUpdate = true;
-    if (instancedMesh.instanceColor) {
-      instancedMesh.instanceColor.needsUpdate = true;
-    }
-
-    const chunkSphere = new THREE.Sphere();
-    chunkBox.getBoundingSphere(chunkSphere);
-    chunkSphere.radius += 0.8;
-    instancedMesh.boundingSphere = chunkSphere;
-
-    instancedMesh.castShadow = enableShadows;
-    instancedMesh.receiveShadow = true;
-
-    scene.add(instancedMesh);
-    createdMeshes.push(instancedMesh);
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    const sphere = new THREE.Sphere();
+    box.getBoundingSphere(sphere);
+    sphere.radius += 0.8;
+    mesh.boundingSphere = sphere;
+    mesh.castShadow = enableShadows;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    created.push(mesh);
   }
-
-  return createdMeshes;
+  return created;
 }
 
 /**
- * Builds low-gravity drifting dust particles with soft circular alpha mask.
+ * Upgraded 12-DOF Quadruped Model (R-09 fix):
+ * - Chamfered multi-part torso chassis + sensor head visor (+X forward)
+ * - Articulated shoulder brackets & servo housings visibly joining hips to torso
+ * - Tapered thighs/calves + rubber foot pads + torque-driven actuator LEDs
+ * - Secondary-motion damped telemetry antenna
  */
-function buildDustParticles(scene: THREE.Scene, width: number, length: number): THREE.Points {
-  const particleCount = 400;
-  const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array(particleCount * 3);
-
-  for (let i = 0; i < particleCount; i++) {
-    positions[i * 3] = (Math.random() - 0.5) * width;
-    positions[i * 3 + 1] = 0.2 + Math.random() * 4.5;
-    positions[i * 3 + 2] = (Math.random() - 0.5) * length;
-  }
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-
-  const canvas = document.createElement('canvas');
-  canvas.width = 32;
-  canvas.height = 32;
-  const ctx = canvas.getContext('2d');
-  if (ctx) {
-    const rad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
-    rad.addColorStop(0, 'rgba(253, 251, 247, 0.85)');
-    rad.addColorStop(0.35, 'rgba(107, 112, 92, 0.45)');
-    rad.addColorStop(1, 'rgba(107, 112, 92, 0)');
-    ctx.fillStyle = rad;
-    ctx.fillRect(0, 0, 32, 32);
-  }
-  const circleTexture = new THREE.CanvasTexture(canvas);
-
-  const material = new THREE.PointsMaterial({
-    map: circleTexture,
-    size: 0.025,
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 0.28,
-    depthWrite: false,
-  });
-
-  const points = new THREE.Points(geometry, material);
-  scene.add(points);
-  return points;
-}
-
-/**
- * Builds goal marker: terrain-grounded ring (0.6m radius) plus soft column of light (height 2.5m).
- */
-function buildGoalMarker(scene: THREE.Scene, position: [number, number, number]): THREE.Group {
-  const beaconGroup = new THREE.Group();
-  beaconGroup.position.set(position[0], position[1] + 0.02, position[2]);
-
-  // Ground ring: cream-dim, 0.6m radius
-  const ringGeo = new THREE.TorusGeometry(0.6, 0.03, 8, 32);
-  ringGeo.rotateX(-Math.PI / 2);
-  const ringMat = new THREE.MeshBasicMaterial({
-    color: 0xfdfbf7,
-    transparent: true,
-    opacity: 0.60,
-    depthWrite: false,
-    polygonOffset: true,
-    polygonOffsetFactor: -1,
-  });
-  const ring = new THREE.Mesh(ringGeo, ringMat);
-  beaconGroup.add(ring);
-
-  // Soft translucent light column (height 2.5m)
-  const beamGeo = new THREE.CylinderGeometry(0.45, 0.65, 2.5, 16, 1, true);
-  const beamMat = new THREE.MeshBasicMaterial({
-    color: 0x6b705c,
-    transparent: true,
-    opacity: 0.22,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-  });
-  const beam = new THREE.Mesh(beamGeo, beamMat);
-  beam.position.y = 1.25;
-  beaconGroup.add(beam);
-
-  scene.add(beaconGroup);
-  return beaconGroup;
-}
-
-/**
- * Builds the articulated 12-DOF Quadruped Hierarchy.
- */
-function build12DOFQuadruped(isGhost = false) {
+function buildDetailedQuadruped(isGhost = false) {
   const robotGroup = new THREE.Group();
   const jointGroups: Record<string, THREE.Group> = {};
+  const actuatorLeds: Record<string, THREE.Mesh> = {};
 
-  const torsoGeo = new THREE.BoxGeometry(0.6, 0.16, 0.3);
-  const torsoMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.38, roughness: 0.5 })
-    : new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.38, metalness: 0.55 });
-  const torsoMesh = new THREE.Mesh(torsoGeo, torsoMat);
+  const chassisMat = isGhost
+    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.3, roughness: 0.5 })
+    : new THREE.MeshStandardMaterial({ color: 0x383836, roughness: 0.36, metalness: 0.58 });
+  const armorMat = isGhost
+    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.25 })
+    : new THREE.MeshStandardMaterial({ color: 0x4b4c46, roughness: 0.42, metalness: 0.45 });
+  const boneMat = isGhost
+    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.3 })
+    : new THREE.MeshStandardMaterial({ color: 0xe8e6e0, roughness: 0.38, metalness: 0.35 });
+  const jointMat = isGhost
+    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.35 })
+    : new THREE.MeshStandardMaterial({ color: 0x6b705c, roughness: 0.28, metalness: 0.78 });
+  const padMat = isGhost
+    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.3 })
+    : new THREE.MeshStandardMaterial({ color: 0x1e1e1c, roughness: 0.9, metalness: 0.1 });
+
+  // Main chassis core
+  const torsoMesh = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.14, 0.24), chassisMat);
   torsoMesh.castShadow = !isGhost;
   torsoMesh.receiveShadow = !isGhost;
   robotGroup.add(torsoMesh);
 
-  // High-contrast cream top stripe
-  const stripeGeo = new THREE.BoxGeometry(0.61, 0.025, 0.07);
-  const stripeMat = new THREE.MeshBasicMaterial({ color: 0xfdfbf7 });
-  const stripe = new THREE.Mesh(stripeGeo, stripeMat);
-  stripe.position.y = 0.07;
+  // Upper armor deck + cream spine stripe
+  const upperDeck = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.035, 0.20), armorMat);
+  upperDeck.position.y = 0.085;
+  upperDeck.castShadow = !isGhost;
+  robotGroup.add(upperDeck);
+
+  const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.50, 0.014, 0.055), new THREE.MeshBasicMaterial({ color: 0xfdfbf7 }));
+  stripe.position.y = 0.105;
   robotGroup.add(stripe);
 
-  // Cream lower edge highlight bevel for >= 2.0:1 contrast
-  const bevelGeo = new THREE.BoxGeometry(0.605, 0.015, 0.305);
-  const bevelMat = new THREE.MeshBasicMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.35 });
-  const bevel = new THREE.Mesh(bevelGeo, bevelMat);
-  bevel.position.y = -0.075;
-  robotGroup.add(bevel);
+  // Forward Sensor Head / Stereo Camera Visor (+X front)
+  const headPod = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.095, 0.16), armorMat);
+  headPod.position.set(0.31, 0.015, 0);
+  headPod.castShadow = !isGhost;
+  robotGroup.add(headPod);
 
-  const colliderGeo = new THREE.SphereGeometry(0.55, 16, 16);
-  const colliderMat = new THREE.MeshBasicMaterial({ color: 0xb83b2f, wireframe: true, transparent: true, opacity: 0.3 });
-  const colliderSphere = new THREE.Mesh(colliderGeo, colliderMat);
+  if (!isGhost) {
+    const visorMat = new THREE.MeshStandardMaterial({
+      color: 0x8ea48c,
+      emissive: 0x6b705c,
+      emissiveIntensity: 0.9,
+      roughness: 0.15,
+    });
+    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.032, 0.11), visorMat);
+    visor.position.set(0.365, 0.02, 0);
+    robotGroup.add(visor);
+  }
+
+  // Secondary-motion damped telemetry antenna mast (rear top)
+  const antennaGroup = new THREE.Group();
+  antennaGroup.position.set(-0.22, 0.10, 0.05);
+  robotGroup.add(antennaGroup);
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.008, 0.22, 8), boneMat);
+  mast.position.y = 0.11;
+  antennaGroup.add(mast);
+  const tip = new THREE.Mesh(
+    new THREE.SphereGeometry(0.015, 10, 10),
+    new THREE.MeshBasicMaterial({ color: 0xf59e0b })
+  );
+  tip.position.y = 0.225;
+  antennaGroup.add(tip);
+
+  const colliderSphere = new THREE.Mesh(
+    new THREE.SphereGeometry(0.55, 16, 16),
+    new THREE.MeshBasicMaterial({ color: 0xb83b2f, wireframe: true, transparent: true, opacity: 0.3 })
+  );
   colliderSphere.visible = false;
   if (!isGhost) robotGroup.add(colliderSphere);
 
@@ -1335,30 +1397,44 @@ function build12DOFQuadruped(isGhost = false) {
   const thighLen = 0.22;
   const calfLen = 0.22;
 
-  const boneMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.35, roughness: 0.5 })
-    : new THREE.MeshStandardMaterial({ color: 0xe8e6e0, roughness: 0.42, metalness: 0.4 });
-  const jointMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.45 })
-    : new THREE.MeshStandardMaterial({ color: 0x6b705c, roughness: 0.25, metalness: 0.85 });
-
   for (const cfg of legConfigs) {
+    // Structural hip mounting strut connecting torso to hip servo housing
+    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.06, Math.abs(cfg.z) * 0.9), armorMat);
+    strut.position.set(cfg.x, 0, cfg.z * 0.55);
+    robotGroup.add(strut);
+
     const hipGroup = new THREE.Group();
     hipGroup.position.set(cfg.x, 0, cfg.z);
     robotGroup.add(hipGroup);
     jointGroups[`${cfg.name}_hip_joint`] = hipGroup;
 
-    const hipPivotMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.07, 16), jointMat);
-    hipPivotMesh.rotateZ(Math.PI / 2);
-    hipGroup.add(hipPivotMesh);
+    // Shoulder servo cylinder
+    const hipServo = new THREE.Mesh(new THREE.CylinderGeometry(0.044, 0.044, 0.075, 16), jointMat);
+    hipServo.rotateX(Math.PI / 2);
+    hipServo.castShadow = !isGhost;
+    hipGroup.add(hipServo);
 
     const thighGroup = new THREE.Group();
     hipGroup.add(thighGroup);
     jointGroups[`${cfg.name}_thigh_joint`] = thighGroup;
 
-    const thighMesh = new THREE.Mesh(new THREE.BoxGeometry(0.045, thighLen, 0.045), boneMat);
+    // Torque-reactive actuator status LED ring on thigh servo
+    if (!isGhost) {
+      const ledMat = new THREE.MeshStandardMaterial({
+        color: 0x8ea48c,
+        emissive: 0x8ea48c,
+        emissiveIntensity: 0.4,
+      });
+      const led = new THREE.Mesh(new THREE.BoxGeometry(0.025, 0.012, 0.082), ledMat);
+      led.position.set(0, -0.02, 0);
+      thighGroup.add(led);
+      actuatorLeds[`${cfg.name}_thigh_joint`] = led;
+    }
+
+    // Tapered thigh armor limb
+    const thighMesh = new THREE.Mesh(new THREE.BoxGeometry(0.052, thighLen * 0.94, 0.044), boneMat);
     thighMesh.position.y = -thighLen / 2;
-    thighMesh.castShadow = true;
+    thighMesh.castShadow = !isGhost;
     thighGroup.add(thighMesh);
 
     const calfGroup = new THREE.Group();
@@ -1366,220 +1442,22 @@ function build12DOFQuadruped(isGhost = false) {
     thighGroup.add(calfGroup);
     jointGroups[`${cfg.name}_calf_joint`] = calfGroup;
 
-    const kneePivot = new THREE.Mesh(new THREE.SphereGeometry(0.035, 12, 12), jointMat);
-    calfGroup.add(kneePivot);
+    const kneeServo = new THREE.Mesh(new THREE.CylinderGeometry(0.034, 0.034, 0.056, 14), jointMat);
+    kneeServo.rotateX(Math.PI / 2);
+    calfGroup.add(kneeServo);
 
-    const calfMesh = new THREE.Mesh(new THREE.BoxGeometry(0.04, calfLen, 0.04), boneMat);
+    const calfMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.021, 0.016, calfLen * 0.95, 10), boneMat);
     calfMesh.position.y = -calfLen / 2;
-    calfMesh.castShadow = true;
+    calfMesh.castShadow = !isGhost;
     calfGroup.add(calfMesh);
 
-    const footMesh = new THREE.Mesh(new THREE.SphereGeometry(0.038, 16, 16), jointMat);
-    footMesh.position.y = -calfLen;
-    footMesh.castShadow = true;
-    calfGroup.add(footMesh);
+    // Rubberized hemispherical lunar foot pad (exact bottom contact at -calfLen)
+    const footPad = new THREE.Mesh(new THREE.SphereGeometry(0.032, 14, 14), padMat);
+    footPad.position.y = -calfLen + 0.024;
+    footPad.scale.set(1.1, 0.85, 1.1);
+    footPad.castShadow = !isGhost;
+    calfGroup.add(footPad);
   }
 
-  return { robotGroup, jointGroups, colliderSphere };
-}
-
-/**
- * Initializes offscreen cached background for Radar (Canonical hillshade, square arena outline, filtered obstacles).
- */
-function initOffscreenRadar(
-  offscreenRef: React.MutableRefObject<HTMLCanvasElement | null>,
-  debris: DebrisInstance[],
-  arenaRadius = 18.0,
-  field: TerrainField | null = null
-) {
-  const canvas = document.createElement('canvas');
-  canvas.width = 130;
-  canvas.height = 130;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-
-  const cx = 65;
-  const cy = 65;
-  const rangeRadius = 58;
-  const scale = 58 / 20.0;
-
-  // 1. Subtle Hillshade of Canonical TerrainField
-  if (field) {
-    const hillSize = 116;
-    const imgData = ctx.createImageData(hillSize, hillSize);
-    const step = 40.0 / hillSize;
-    for (let py = 0; py < hillSize; py++) {
-      const wz = -20.0 + py * step;
-      for (let px = 0; px < hillSize; px++) {
-        const wx = -20.0 + px * step;
-        const idx = (py * hillSize + px) * 4;
-        const h0 = field.sampleHeight(wx, wz);
-        const hx = field.sampleHeight(wx + 0.3, wz);
-        const hz = field.sampleHeight(wx, wz + 0.3);
-        const gx = (hx - h0) / 0.3;
-        const gz = (hz - h0) / 0.3;
-        const shade = Math.max(0, Math.min(255, Math.floor(34 + (gx * 32 - gz * 20))));
-        imgData.data[idx] = shade;
-        imgData.data[idx + 1] = shade + 2;
-        imgData.data[idx + 2] = shade;
-        imgData.data[idx + 3] = 140;
-      }
-    }
-    ctx.putImageData(imgData, cx - 58, cy - 58);
-  }
-
-  // 2. Square Arena Boundary Outline (18m x 18m)
-  const sqHalf = (18.0 / 20.0) * rangeRadius;
-  ctx.strokeStyle = 'rgba(253, 251, 247, 0.40)';
-  ctx.lineWidth = 1.0;
-  ctx.setLineDash([4, 3]);
-  ctx.strokeRect(cx - sqHalf, cy - sqHalf, sqHalf * 2, sqHalf * 2);
-  ctx.setLineDash([]);
-
-  // 3. Range Rings (Subtle reference circles at 5m and 10m)
-  ctx.strokeStyle = 'rgba(253, 251, 247, 0.08)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.arc(cx, cy, (10.0 / 20.0) * rangeRadius, 0, Math.PI * 2);
-  ctx.arc(cx, cy, (5.0 / 20.0) * rangeRadius, 0, Math.PI * 2);
-  ctx.stroke();
-
-  // 4. Debris Dots: Filtered to prominent hazard boulders (scale >= 0.44) to prevent white-noise clutter
-  const obstacles = debris.filter((d) => d.scale >= 0.44);
-  for (const d of obstacles) {
-    const dx = cx + d.x * scale;
-    const dy = cy + d.z * scale;
-    const dist = Math.hypot(dx - cx, dy - cy);
-    if (dist <= rangeRadius) {
-      ctx.fillStyle = 'rgba(253, 251, 247, 0.40)';
-      ctx.beginPath();
-      ctx.arc(dx, dy, 1.2, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  // Crosshairs
-  ctx.strokeStyle = 'rgba(253, 251, 247, 0.06)';
-  ctx.beginPath();
-  ctx.moveTo(cx, cy - rangeRadius);
-  ctx.lineTo(cx, cy + rangeRadius);
-  ctx.moveTo(cx - rangeRadius, cy);
-  ctx.lineTo(cx + rangeRadius, cy);
-  ctx.stroke();
-
-  // 5. 10m Scale Bar Legend in corner
-  const scaleBarPx = 10.0 * scale;
-  ctx.strokeStyle = 'rgba(253, 251, 247, 0.35)';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(12, 120);
-  ctx.lineTo(12 + scaleBarPx, 120);
-  ctx.stroke();
-  ctx.font = '8px monospace';
-  ctx.fillStyle = 'rgba(253, 251, 247, 0.45)';
-  ctx.fillText('10m', 14, 116);
-
-  offscreenRef.current = canvas;
-}
-
-/**
- * 2-Layer Radar Rendering (Robot-centered, real heading rotation, goal indicator).
- */
-function renderCachedTerrainRadar(
-  canvas: HTMLCanvasElement | null,
-  offscreenBg: HTMLCanvasElement | null,
-  robotPos: THREE.Vector3,
-  robotYaw: number,
-  debris: DebrisInstance[],
-  sweepAngle: number,
-  collisions?: any[]
-) {
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-
-  const w = canvas.width;
-  const h = canvas.height;
-  const cx = w / 2;
-  const cy = h / 2;
-  const rangeRadius = 58;
-  const scale = 58 / 20.0;
-
-  ctx.clearRect(0, 0, w, h);
-
-  // 1. Draw pre-rendered static background offset relative to robot position
-  if (offscreenBg) {
-    const offsetX = -robotPos.x * scale;
-    const offsetY = -robotPos.z * scale;
-    ctx.save();
-    // Clip to radar circular aperture
-    ctx.beginPath();
-    ctx.arc(cx, cy, rangeRadius, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.drawImage(offscreenBg, offsetX, offsetY);
-    ctx.restore();
-  }
-
-  // 2. Rotating sweep line
-  ctx.strokeStyle = 'rgba(107, 112, 92, 0.35)';
-  ctx.lineWidth = 1.2;
-  ctx.beginPath();
-  ctx.moveTo(cx, cy);
-  ctx.lineTo(cx + Math.cos(sweepAngle) * rangeRadius, cy + Math.sin(sweepAngle) * rangeRadius);
-  ctx.stroke();
-
-  // 3. Goal Marker at (14m, -10m) relative to robot
-  const gx = cx + (14.0 - robotPos.x) * scale;
-  const gy = cy + (-10.0 - robotPos.z) * scale;
-  const distToGoal = Math.hypot(gx - cx, gy - cy);
-
-  if (distToGoal < rangeRadius - 4) {
-    ctx.fillStyle = '#6B705C';
-    ctx.beginPath();
-    ctx.arc(gx, gy, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = '#FDFBF7';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  } else {
-    // Off-screen edge arrow indicator
-    const angleToGoal = Math.atan2(gy - cy, gx - cx);
-    const edgeX = cx + Math.cos(angleToGoal) * (rangeRadius - 4);
-    const edgeY = cy + Math.sin(angleToGoal) * (rangeRadius - 4);
-    ctx.fillStyle = '#6B705C';
-    ctx.beginPath();
-    ctx.arc(edgeX, edgeY, 3, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // 4. Robot Heading Arrow at Center (Rotates truthfully with robotYaw, size >= 14px)
-  ctx.save();
-  ctx.translate(cx, cy);
-  // In Single Frame Convention: yaw angle from +X (East). Canvas: -Y is North.
-  // rot = atan2(vz, vx) + PI/2 = -yaw + PI/2 (with Three.js yaw)
-  ctx.rotate(-robotYaw + Math.PI / 2);
-  ctx.fillStyle = '#FDFBF7';
-  ctx.beginPath();
-  ctx.moveTo(0, -8);
-  ctx.lineTo(5, 6);
-  ctx.lineTo(0, 3);
-  ctx.lineTo(-5, 6);
-  ctx.closePath();
-  ctx.fill();
-
-  // Sage center position indicator dot
-  ctx.fillStyle = '#6B705C';
-  ctx.beginPath();
-  ctx.arc(0, 1, 1.8, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
-
-  // 5. Collision Highlights
-  if (collisions && collisions.length > 0) {
-    ctx.strokeStyle = '#B83B2F';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 8, 0, Math.PI * 2);
-    ctx.stroke();
-  }
+  return { robotGroup, jointGroups, colliderSphere, antennaGroup, actuatorLeds };
 }

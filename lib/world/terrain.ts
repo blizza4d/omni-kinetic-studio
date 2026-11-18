@@ -1,7 +1,13 @@
 /**
- * Deterministic procedural terrain generator using fractional Brownian motion (fBm).
- * Shared across Three.js visual mesh, cannon-es physical heightfield, and local runner.
+ * Unified Procedural Terrain Accessor
+ *
+ * Delegates directly to the authoritative canonical TerrainField service
+ * (`lib/world/terrain/service.ts`) so that Three.js mesh vertices, physics/gait,
+ * foot contact blobs, debris boulders, radar hillshade, and LiDAR all agree
+ * to sub-millimeter precision (0.000m terrain divergence).
  */
+
+import { getCanonicalTerrainField } from './terrain/service';
 
 export interface TerrainConfig {
   seed: number;
@@ -24,61 +30,13 @@ export const DEFAULT_TERRAIN_CONFIG: TerrainConfig = {
 };
 
 /**
- * Pseudo-random 2D gradient hash for deterministic continuous noise.
- */
-function hash2d(x: number, z: number, seed: number): number {
-  const n = Math.sin(x * 12.9898 + z * 78.233 + seed * 137.5) * 43758.5453;
-  return n - Math.floor(n);
-}
-
-/**
- * Bilinear smoothed noise cell.
- */
-function smoothNoise2d(x: number, z: number, seed: number): number {
-  const ix = Math.floor(x);
-  const iz = Math.floor(z);
-  const fx = x - ix;
-  const fz = z - iz;
-
-  // Smoothstep interpolation curve
-  const wx = fx * fx * (3.0 - 2.0 * fx);
-  const wz = fz * fz * (3.0 - 2.0 * fz);
-
-  const s00 = hash2d(ix, iz, seed);
-  const s10 = hash2d(ix + 1, iz, seed);
-  const s01 = hash2d(ix, iz + 1, seed);
-  const s11 = hash2d(ix + 1, iz + 1, seed);
-
-  const top = s00 * (1.0 - wx) + s10 * wx;
-  const bottom = s01 * (1.0 - wx) + s11 * wx;
-  return top * (1.0 - wz) + bottom * wz;
-}
-
-/**
- * Evaluates the terrain elevation at world coordinates (x, z).
- * Deterministic and reproducible across all platforms.
+ * Evaluates the authoritative canonical terrain elevation at world coordinates (x, z).
+ * Deterministic and bit-identical across ThreeViewer, LocalSimulationRunner, and SimEngine.
  */
 export function getTerrainHeight(x: number, z: number, config: TerrainConfig = DEFAULT_TERRAIN_CONFIG): number {
-  const { seed, roughness, octaves = 4, amplitude = 1.8 } = config;
-
-  let total = 0.0;
-  let freq = 0.08;
-  let amp = amplitude * roughness;
-  let maxAmp = 0.0;
-
-  for (let o = 0; o < octaves; o++) {
-    total += smoothNoise2d(x * freq, z * freq, seed + o * 31) * amp;
-    maxAmp += amp;
-    amp *= 0.5;
-    freq *= 2.0;
-  }
-
-  // Normalize and apply low-gravity crater bowl dip
-  const normalized = (total / maxAmp) * 2.0 - 1.0;
-  const distFromCenter = Math.sqrt(x * x + z * z);
-  const craterRim = Math.sin(distFromCenter * 0.25 + seed) * 0.35 * roughness;
-
-  return normalized * (amplitude * roughness) + craterRim;
+  const seed = Number.isFinite(config.seed) ? config.seed : DEFAULT_TERRAIN_CONFIG.seed;
+  const field = getCanonicalTerrainField(seed);
+  return field.sampleHeight(x, z);
 }
 
 /**
@@ -99,8 +57,8 @@ export function generateElevationGrid(config: TerrainConfig): {
   const halfW = width / 2;
   const halfL = length / 2;
 
-  let minH = Infinity;
-  let maxH = -Infinity;
+  let minHeight = Infinity;
+  let maxHeight = -Infinity;
 
   for (let j = 0; j < gridRes; j++) {
     const z = j * dz - halfL;
@@ -108,11 +66,10 @@ export function generateElevationGrid(config: TerrainConfig): {
       const x = i * dx - halfW;
       const h = getTerrainHeight(x, z, config);
       heights[j * gridRes + i] = h;
-
-      if (h < minH) minH = h;
-      if (h > maxH) maxH = h;
+      if (h < minHeight) minHeight = h;
+      if (h > maxHeight) maxHeight = h;
     }
   }
 
-  return { heights, minHeight: minH, maxHeight: maxH };
+  return { heights, minHeight, maxHeight };
 }

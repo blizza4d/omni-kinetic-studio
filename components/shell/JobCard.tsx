@@ -49,8 +49,8 @@ export default function JobCard({
   const badgeText = isCloud
     ? `CLOUD: ${status.region}`
     : isCached
-    ? 'CACHED CLOUD RUN'
-    : 'DEMO: LOCAL RUNNER';
+    ? 'DEMO FIXTURES'
+    : 'LOCAL SIMULATION';
 
   return (
     <div className="font-mono text-xs p-3 rounded-xl border border-hairline bg-charcoal-deep/90 shadow-xl space-y-3 select-none">

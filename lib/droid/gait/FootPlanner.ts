@@ -179,9 +179,9 @@ export class FootPlanner {
           const maxFwdReach = Math.sqrt(Math.max(0.005, maxReach * maxReach - vertDist * vertDist - latDist * latDist));
 
           // Raibert capture point heuristic for touchdown target:
-          // Clamped strictly within the forward reachable envelope to prevent airborne overreach
-          const nominalStepM = Math.min(maxFwdReach * 0.70, forwardSpeed * (tStance * 0.5));
-          const totalLeadM = Math.min(maxFwdReach * 0.82, nominalStepM + forwardSpeed * tSwing * 0.40);
+          // Clamped strictly within the forward reachable envelope to prevent airborne overreach or thigh splay
+          const nominalStepM = Math.min(maxFwdReach * 0.58, forwardSpeed * (tStance * 0.45));
+          const totalLeadM = Math.min(maxFwdReach * 0.72, nominalStepM + forwardSpeed * tSwing * 0.35);
 
           const targetX = hipWorld[0] + fwdX * totalLeadM;
           const targetZ = hipWorld[2] + fwdZ * totalLeadM;

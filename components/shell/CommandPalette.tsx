@@ -120,7 +120,7 @@ export default function CommandPalette({
           <div className="pt-2 border-t border-cream/10 space-y-2 text-xs font-mono">
             <div className="text-[10px] text-cream-dim uppercase tracking-wider flex items-center justify-between">
               <span>Simulation Execution Mode</span>
-              <span className="text-sage">{currentMode === 'cloud_nebius' ? '[CLOUD: L40S]' : '[DEMO: LOCAL RUNNER]'}</span>
+              <span className="text-sage">{currentMode === 'cloud_nebius' ? '[CLOUD STREAM]' : '[LOCAL SIMULATION]'}</span>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <button

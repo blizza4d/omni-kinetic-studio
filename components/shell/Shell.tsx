@@ -1,8 +1,10 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import dynamic from 'next/dynamic';
 import {
   Sparkles,
+  Gamepad2,
   Camera,
   Cpu,
   Coins,
@@ -10,40 +12,84 @@ import {
   Pause,
   SkipForward,
   SkipBack,
-  SlidersHorizontal,
-  Compass,
-  Activity,
   Layers,
   AlertTriangle,
+  RotateCcw,
 } from 'lucide-react';
-import ThreeViewer, { CameraPreset, QualityTier } from '@/components/viewer/ThreeViewer';
-import TeleopOverlay from '@/components/teleop/TeleopOverlay';
+import ThreeViewer, { QualityTier } from '@/components/viewer/ThreeViewer';
 import CommandPalette from '@/components/shell/CommandPalette';
 import AnalogLogPane from '@/components/shell/AnalogLogPane';
 import ShortcutsOverlay from '@/components/shell/ShortcutsOverlay';
 import LayoutMenu from '@/components/shell/LayoutMenu';
-import StageRail, { StageKey, StageState } from '@/components/shell/StageRail';
+import StageRail, { StageState } from '@/components/shell/StageRail';
 import TokenSpendPopover from '@/components/shell/TokenSpendPopover';
 import ColdStartCard from '@/components/shell/ColdStartCard';
 import RunSummaryCard from '@/components/shell/RunSummaryCard';
-import DatasetPanel from '@/components/teleop/DatasetPanel';
-import DeltaComparisonCard from '@/components/teleop/DeltaComparisonCard';
 import FpsBadge from '@/components/shell/FpsBadge';
 import PerfPanel from '@/components/shell/PerfPanel';
-import GaitLab from '@/components/debug/GaitLab';
+import ControlHUD, { SensorOverlayFlags } from '@/components/control/ControlHUD';
+import {
+  MissionObjectiveHUD,
+  MissionPickerModal,
+  EpisodeResultsModal,
+  ScenarioEditorDrawer,
+  SettingsModal,
+  PauseMenuModal,
+  EditorToolMode,
+} from '@/components/missions/MissionPanels';
+import {
+  captureCanvasScreenshot,
+  CanvasClipRecorder,
+  isClipRecordingSupported,
+} from '@/components/viewer/CaptureTools';
 import { getBuildStamp } from '@/lib/build_stamp';
 import {
   EnvironmentSpec,
-  TelemetryFrame,
   TeleopCommand,
   ArchitectOutput,
   JobStatus,
   RunSummary,
 } from '@/contracts';
 import { generateDeterministicEnvironmentSpec } from '@/lib/nebius/prompts';
-import { TelemetryStore, TelemetryStoreSnapshot } from '@/lib/telemetry/store';
+import { TelemetryStore } from '@/lib/telemetry/store';
 import { PerfProbe } from '@/lib/perf/probe';
-import { parseFeatureToggles } from '@/lib/perf/toggles';
+import { SimEngine } from '@/lib/sim/SimEngine';
+import { describeRunMode, RunMode } from '@/lib/sim/runMode';
+import { getShortcutRegistry } from '@/lib/control/shortcuts';
+import { GaitMode } from '@/lib/control/types';
+import { BUILT_IN_MISSIONS, MissionProgressSnapshot } from '@/lib/missions/missions';
+import {
+  ScenarioConfig,
+  ScenarioConfigSchema,
+  encodeScenarioToHash,
+  decodeScenarioFromHash,
+} from '@/lib/scenario/sharing';
+import {
+  ReplayFile,
+  validateReplayJson,
+  exportDatasetJsonl,
+  exportDatasetCsv,
+} from '@/lib/replay/recorder';
+import {
+  StudioSettings,
+  DEFAULT_STUDIO_SETTINGS,
+  CameraMode,
+  MissionBestScore,
+  loadStudioSettings,
+  saveStudioSettings,
+  loadMissionScores,
+  saveMissionBestScore,
+  isCoachDismissed,
+  setCoachDismissed,
+  exportAllStudioData,
+  deleteAllStudioData,
+} from '@/lib/storage/settings';
+
+// Lazy-load heavy optional panels to protect first-load JS budget (Phase W13.2)
+const TeleopOverlay = dynamic(() => import('@/components/teleop/TeleopOverlay'), { ssr: false });
+const DatasetPanel = dynamic(() => import('@/components/teleop/DatasetPanel'), { ssr: false });
+const DeltaComparisonCard = dynamic(() => import('@/components/teleop/DeltaComparisonCard'), { ssr: false });
+const GaitLab = dynamic(() => import('@/components/debug/GaitLab'), { ssr: false });
 
 interface LogItem {
   id: string;
@@ -66,31 +112,68 @@ const INITIAL_STAGES: Record<string, StageState> = {
   critique: { key: 'critique', label: 'Physics Audit', tier: 'super', status: 'idle' },
 };
 
+const SPEED_PRESETS = [0.25, 0.5, 1, 2, 4] as const;
+
 export default function Shell() {
-  // Application State
+  const registry = getShortcutRegistry();
+
+  // Persistent settings & mission best scores
+  const [settings, setSettings] = useState<StudioSettings>(DEFAULT_STUDIO_SETTINGS);
+  const [bestScores, setBestScores] = useState<Record<string, MissionBestScore>>({});
+  const [showCoachMarks, setShowCoachMarks] = useState(false);
+  const [isCoarsePointer, setIsCoarsePointer] = useState(false);
+  const [showDebugLatency, setShowDebugLatency] = useState(false);
+
+  // Environment & run-mode state (ONE RunMode model)
   const [envSpec, setEnvSpec] = useState<EnvironmentSpec>(() =>
     generateDeterministicEnvironmentSpec('quadruped, low-gravity debris field')
   );
-  const [teleopCommand, setTeleopCommand] = useState<TeleopCommand | null>(null);
-  const [simMode, setSimMode] = useState<'cloud_nebius' | 'local_demo'>('local_demo');
-  const [isPlaying, setIsPlaying] = useState(true);
-  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
-  const [playbackIndex, setPlaybackIndex] = useState(0);
-
-  // Quality & Diagnostics State
+  const [runMode, setRunMode] = useState<RunMode>('local-simulation');
   const [qualityTier, setQualityTier] = useState<QualityTier>('high');
-  const [isPerfPanelOpen, setIsPerfPanelOpen] = useState(false);
-  const [boundaryToast, setBoundaryToast] = useState<{ visible: boolean; message: string }>({
-    visible: false,
-    message: '',
+  const [cameraMode, setCameraMode] = useState<CameraMode>('follow');
+  const [frameTrigger, setFrameTrigger] = useState(0);
+  const [terrainVersion, setTerrainVersion] = useState(1);
+  const [sensors, setSensors] = useState<SensorOverlayFlags>({
+    lidar: false,
+    contacts: false,
+    stability: false,
+    path: false,
   });
 
-  // Throttled Telemetry Store snapshot for HUD chips (<= 10 Hz)
-  const [storeSnapshot, setStoreSnapshot] = useState<TelemetryStoreSnapshot>(() =>
-    TelemetryStore.getInstance().getSnapshot()
-  );
+  // Modals & drawers
+  const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+  const [isTeleopOpen, setIsTeleopOpen] = useState(false);
+  const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
+  const [isTokenSpendOpen, setIsTokenSpendOpen] = useState(false);
+  const [isPerfPanelOpen, setIsPerfPanelOpen] = useState(false);
+  const [isMissionsOpen, setIsMissionsOpen] = useState(false);
+  const [isEditorOpen, setIsEditorOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isPauseMenuOpen, setIsPauseMenuOpen] = useState(false);
+  const [isResultsOpen, setIsResultsOpen] = useState(false);
+  const [showGaitLab, setShowGaitLab] = useState(false);
+  const [isNewAnimation, setIsNewAnimation] = useState(true);
 
-  // Layout & Overlays Settings
+  // Shared link confirmation banner (#s=)
+  const [pendingSharedScenario, setPendingSharedScenario] = useState<ScenarioConfig | null>(null);
+
+  // Scenario editor tool & terrain undo/redo stacks (bounded to 20 snapshots)
+  const [editorTool, setEditorTool] = useState<EditorToolMode>('none');
+  const undoStackRef = useRef<Int16Array[]>([]);
+  const redoStackRef = useRef<Int16Array[]>([]);
+  const [undoDepth, setUndoDepth] = useState({ undo: 0, redo: 0 });
+
+  // Capture tools (2x PNG & WebM clip)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const clipRecorderRef = useRef<CanvasClipRecorder | null>(null);
+  const [isRecordingClip, setIsRecordingClip] = useState(false);
+  const [clipSupported, setClipSupported] = useState(false);
+
+  // Last completed replay + results
+  const lastReplayRef = useRef<ReplayFile | null>(null);
+  const [lastMissionResult, setLastMissionResult] = useState<MissionProgressSnapshot | null>(null);
+
+  // Layout settings
   const [layoutSettings, setLayoutSettings] = useState({
     showLogPanel: true,
     showRadar: true,
@@ -99,50 +182,43 @@ export default function Shell() {
     showDustParticles: true,
     adaptiveQuality: true,
   });
+  const [logPaneWidth, setLogPaneWidth] = useState<number>(400);
 
-  // Persistent Left Panel Width (Clamped 320px to 640px)
-  const [logPaneWidth, setLogPaneWidth] = useState<number>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const saved = localStorage.getItem('omni_log_width');
-        if (saved) return Math.max(320, Math.min(640, Number(saved)));
-      } catch {}
-    }
-    return 420;
+  // Toast alert (accessible aria-live)
+  const [toast, setToast] = useState<{ text: string; level: 'info' | 'warn' } | null>(null);
+  const showToast = useCallback((text: string, level: 'info' | 'warn' = 'info') => {
+    setToast({ text, level });
+  }, []);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3600);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // Console logs
+  const [logs, setLogs] = useState<LogItem[]>(() => {
+    const stamp = getBuildStamp();
+    return [
+      {
+        id: 'init-1',
+        timestamp: '00:00:00',
+        level: 'info',
+        text: `Omni-Kinetic Sim-to-Real Studio initialized [${stamp.iterationTag} • sha:${stamp.sha} (${stamp.branch}) • ${stamp.buildType}].`,
+      },
+      {
+        id: 'init-2',
+        timestamp: '00:00:01',
+        level: 'info',
+        text: 'Press [T] to take manual control (WASD / Space hop / Click waypoint), [Ctrl+K] for prompt, [?] for shortcuts.',
+      },
+    ];
   });
+  const addLog = useCallback((text: string, level: LogItem['level'] = 'info') => {
+    const ts = new Date().toTimeString().split(' ')[0];
+    setLogs((prev) => [...prev.slice(-199), { id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, timestamp: ts, level, text }]);
+  }, []);
 
-  const handleLogWidthChange = (newWidth: number) => {
-    setLogPaneWidth(newWidth);
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.setItem('omni_log_width', String(newWidth));
-      } catch {}
-    }
-  };
-
-  const [cameraPreset, setCameraPreset] = useState<CameraPreset>('chase');
-  const [isPaletteOpen, setIsPaletteOpen] = useState(false);
-  const [isTeleopOpen, setIsTeleopOpen] = useState(false);
-  const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
-  const [isTokenSpendOpen, setIsTokenSpendOpen] = useState(false);
-  const [isNewAnimation, setIsNewAnimation] = useState(true);
-  const [showGaitLab, setShowGaitLab] = useState(false);
-
-  // Architect Stream State
-  const [logs, setLogs] = useState<LogItem[]>([
-    {
-      id: '1',
-      timestamp: '00:00:00',
-      level: 'info',
-      text: `Omni-Kinetic Sim-to-Real Studio initialized [${getBuildStamp().iterationTag} • sha:${getBuildStamp().sha} (${getBuildStamp().branch}) • ${getBuildStamp().buildType}].`,
-    },
-    {
-      id: '2',
-      timestamp: '00:00:01',
-      level: 'info',
-      text: 'Press [Ctrl+K] for prompt, [P] for PerfProbe, [Q] to cycle quality tiers, [?] for shortcuts.',
-    },
-  ]);
+  // Architect & legacy panel state
   const [currentStage, setCurrentStage] = useState('');
   const [stages, setStages] = useState<Record<string, StageState>>(INITIAL_STAGES);
   const [activeStageKey, setActiveStageKey] = useState<string | null>(null);
@@ -150,9 +226,6 @@ export default function Shell() {
     (ArchitectOutput & { critique?: any; safetyChecks?: any[]; compileReport?: any; compiledSpec?: any; sandboxResult?: any }) | null
   >(null);
   const [isStreamingArchitect, setIsStreamingArchitect] = useState(false);
-  const [isStageRailVisible, setIsStageRailVisible] = useState(true);
-
-  // Job Telemetry Stream State
   const [iteration, setIteration] = useState(1);
   const [isDatasetPanelOpen, setIsDatasetPanelOpen] = useState(false);
   const [isDeltaComparisonOpen, setIsDeltaComparisonOpen] = useState(false);
@@ -160,232 +233,454 @@ export default function Shell() {
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [runSummary, setRunSummary] = useState<RunSummary | null>(null);
   const [showRunSummary, setShowRunSummary] = useState(false);
-  const [tokenSpend, setTokenSpend] = useState({ promptTokens: 0, completionTokens: 0, costUsd: 0.0000 });
+  const [tokenSpend, setTokenSpend] = useState({ promptTokens: 0, completionTokens: 0, costUsd: 0.0 });
   const [collisionAlert, setCollisionAlert] = useState(false);
 
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const lastReportedEpisodeEvent = useRef<string | null>(null);
+  // Action handler ref so SimEngine InputManager invokes live React callbacks
+  const actionHandlerRef = useRef<(actionId: string) => void>(() => {});
 
-  const addLog = useCallback((text: string, level: LogItem['level'] = 'info') => {
-    const d = new Date();
-    const ts = d.toTimeString().split(' ')[0];
-    setLogs((prev) => [...prev.slice(-199), { id: Math.random().toString(36).substring(2, 9), timestamp: ts, level, text }]);
+  // Create ONE authoritative SimEngine instance (fixed-step deterministic simulation on canonical TerrainService)
+  const engineRef = useRef<SimEngine | null>(null);
+  if (!engineRef.current) {
+    engineRef.current = new SimEngine(registry, {
+      onToast: (msg, lvl) => showToast(msg, lvl),
+      onAction: (actId) => actionHandlerRef.current(actId),
+      onFrame: (frame) => {
+        TelemetryStore.getInstance().ingestFrame(frame);
+      },
+      onEpisodeComplete: (missionSnap, replay) => {
+        lastReplayRef.current = replay;
+        setLastMissionResult(missionSnap);
+        if (missionSnap.score.succeeded) {
+          const { scores, result } = saveMissionBestScore({
+            missionId: missionSnap.missionId,
+            bestScore: missionSnap.score.total,
+            medal: missionSnap.score.medal,
+            bestTimeSec: missionSnap.score.elapsedSec,
+            assistsUsed: missionSnap.score.assistsUsed.length > 0,
+          });
+          setBestScores(scores);
+          if (!result.ok && result.quotaExceeded) {
+            showToast(result.error || 'Storage quota exceeded.', 'warn');
+          }
+        }
+        setIsResultsOpen(true);
+      },
+    });
+  }
+  const engine = engineRef.current;
+
+  // Throttled UI sync tick (~10 Hz driven by ThreeViewer onUiSync — zero per-frame React state!)
+  const [, setUiTick] = useState(0);
+  const handleUiSync = useCallback(() => {
+    setUiTick((t) => (t + 1) & 0x3fffffff);
   }, []);
 
-  // Poll TelemetryStore at <= 10 Hz for HUD chips
+  // Load persisted settings, mission scores, coach state, URL params, and #s= share hash on mount
   useEffect(() => {
-    const interval = setInterval(() => {
-      const snap = TelemetryStore.getInstance().getSnapshot();
-      setStoreSnapshot(snap);
-      if (snap.currentFrame && isPlaying) {
-        setPlaybackIndex(snap.historyLength - 1);
-      }
-    }, 100);
-    return () => clearInterval(interval);
-  }, [isPlaying]);
+    const loaded = loadStudioSettings();
+    setSettings(loaded);
+    setQualityTier(loaded.display.qualityTier);
+    setCameraMode(loaded.camera.defaultMode);
+    setBestScores(loadMissionScores());
+    setShowCoachMarks(!isCoachDismissed());
+    setClipSupported(isClipRecordingSupported());
+    clipRecorderRef.current = new CanvasClipRecorder();
 
-  // Handle Feature Toggles
-  useEffect(() => {
+    // Apply persisted key remappings
+    for (const [id, keys] of Object.entries(loaded.controls.keyOverrides || {})) {
+      registry.remap(id, keys);
+    }
+
+    // Coarse pointer detection for touch virtual joystick
     if (typeof window !== 'undefined') {
+      const mq = window.matchMedia?.('(pointer: coarse)');
+      if (mq) setIsCoarsePointer(mq.matches);
+
+      try {
+        const savedW = localStorage.getItem('omni_log_width');
+        if (savedW) setLogPaneWidth(Math.max(320, Math.min(640, Number(savedW))));
+      } catch {}
+
       const params = new URLSearchParams(window.location.search);
-      const tierParam = params.get('tier')?.toUpperCase();
-      if (tierParam === 'ULTRA' || tierParam === 'HIGH' || tierParam === 'MED' || tierParam === 'LOW') {
-        setQualityTier(tierParam as QualityTier);
+      if (params.get('debug') === '1') setShowDebugLatency(true);
+      const seedParam = params.get('seed');
+      if (seedParam) {
+        const parsedSeed = parseInt(seedParam, 10);
+        if (Number.isFinite(parsedSeed) && parsedSeed > 0) {
+          engine.applyScenario({ seed: parsedSeed }, true);
+          setTerrainVersion(engine.terrain.getVersion());
+        }
+      }
+      if (params.get('paused') === '1') {
+        engine.clock.setPaused(true);
+      }
+
+      // Check shareable scenario hash (#s=...)
+      if (window.location.hash.includes('s=')) {
+        const decoded = decodeScenarioFromHash(window.location.hash);
+        if (decoded.ok && decoded.config) {
+          setPendingSharedScenario(decoded.config);
+        } else if (decoded.error) {
+          showToast(decoded.error, 'warn');
+        }
       }
     }
-  }, []);
 
-  // Global Keyboard Shortcuts
+    // Attach single unified window input listener (handles keyboard, blur, visibilitychange, gamepad)
+    const detachInputs = engine.inputs.attachWindowListeners();
+
+    return () => {
+      detachInputs();
+      clipRecorderRef.current?.dispose();
+    };
+  }, [engine, registry, showToast]);
+
+  // Sync live settings into SimEngine immediately whenever changed
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (
-        document.activeElement &&
-        (document.activeElement.tagName === 'INPUT' ||
-          document.activeElement.tagName === 'TEXTAREA' ||
-          (document.activeElement as HTMLElement).isContentEditable)
-      ) {
-        if (e.key === 'Escape') {
-          (document.activeElement as HTMLElement).blur();
+    engine.inputs.settings.sensitivity = settings.controls.sensitivity;
+    engine.inputs.settings.gamepadDeadzone = settings.controls.gamepadDeadzone;
+    engine.inputs.settings.gamepadCurve = settings.controls.gamepadCurve;
+    engine.inputs.settings.invertYaw = settings.controls.invertYaw;
+    engine.inputs.settings.invertCameraY = settings.controls.invertCameraY;
+    engine.inputs.settings.oneHandedMode = settings.controls.oneHandedMode;
+    engine.inputs.settings.pointerDriveEnabled = settings.controls.pointerDriveEnabled;
+    engine.inputs.settings.avoidRocks = settings.controls.avoidRocks;
+    engine.inputs.settings.hapticsEnabled = settings.controls.hapticsEnabled;
+
+    engine.shaper.params.realism = settings.simulation.realism;
+    engine.shaper.params.speedLimiter = settings.simulation.speedLimiter;
+    engine.shaper.params.brakeAssist = settings.simulation.brakeAssist;
+    engine.clock.setEndBehavior(settings.simulation.endBehavior);
+
+    if (settings.controls.oneHandedMode) engine.missionRuntime.registerAssist('one-handed');
+    if (settings.simulation.speedLimiter < 0.99) engine.missionRuntime.registerAssist('speed-limiter');
+    if (settings.simulation.noFalls) engine.missionRuntime.registerAssist('no-falls');
+  }, [engine, settings]);
+
+  // Auto-pause on blur when enabled in settings
+  useEffect(() => {
+    if (!settings.simulation.autoPauseOnBlur) return;
+    const onBlur = () => {
+      engine.clock.setPaused(true);
+      handleUiSync();
+    };
+    window.addEventListener('blur', onBlur);
+    return () => window.removeEventListener('blur', onBlur);
+  }, [engine, settings.simulation.autoPauseOnBlur, handleUiSync]);
+
+  const updateSettings = useCallback(
+    (next: StudioSettings) => {
+      setSettings(next);
+      setQualityTier(next.display.qualityTier);
+      const res = saveStudioSettings(next);
+      if (!res.ok && res.quotaExceeded) {
+        showToast(res.error || 'Storage quota exceeded.', 'warn');
+      }
+    },
+    [showToast]
+  );
+
+  // Capture Screenshot [F12]
+  const handleScreenshot = useCallback(async () => {
+    if (!canvasRef.current) {
+      showToast('Viewport canvas not ready yet.', 'warn');
+      return;
+    }
+    const res = await captureCanvasScreenshot(canvasRef.current);
+    if (res.ok) {
+      showToast(
+        `Saved ${res.width}×${res.height} PNG${res.copiedToClipboard ? ' & copied to clipboard' : ''}.`,
+        'info'
+      );
+    } else {
+      showToast(res.error || 'Screenshot capture failed.', 'warn');
+    }
+  }, [showToast]);
+
+  // Wire global studio actions triggered by ShortcutRegistry / InputManager
+  actionHandlerRef.current = (actionId: string) => {
+    switch (actionId) {
+      case 'toggle_control': {
+        const nowManual = engine.arbiter.toggleManualControl('keyboard', engine.clock.getElapsed());
+        showToast(
+          nowManual ? 'Manual control engaged — drive with WASD, Space to hop!' : 'Released control to Policy v1.',
+          'info'
+        );
+        addLog(
+          nowManual ? 'Control handoff: MANUAL: KEYBOARD engaged.' : 'Control handoff: AUTONOMOUS: POLICY v1 resumed.',
+          'info'
+        );
+        handleUiSync();
+        break;
+      }
+      case 'emergency_stop':
+        engine.arbiter.triggerEmergencyStop();
+        showToast('Emergency Stop engaged — settling to neutral stance.', 'warn');
+        handleUiSync();
+        break;
+      case 'open_palette':
+        setIsPaletteOpen((p) => !p);
+        break;
+      case 'toggle_panel':
+        setLayoutSettings((s) => ({ ...s, showLogPanel: !s.showLogPanel }));
+        break;
+      case 'toggle_perf':
+        setIsPerfPanelOpen((p) => !p);
+        break;
+      case 'cycle_quality':
+        setQualityTier((prev) => {
+          const tiers: QualityTier[] = ['low', 'medium', 'high', 'ultra'];
+          const next = tiers[(tiers.indexOf(prev) + 1) % tiers.length];
+          PerfProbe.getInstance().setTier(next);
+          showToast(`Quality tier: ${next.toUpperCase()}`, 'info');
+          return next;
+        });
+        break;
+      case 'toggle_hud_legend':
+        updateSettings({
+          ...settings,
+          display: { ...settings.display, showKeyLegend: !settings.display.showKeyLegend },
+        });
+        break;
+      case 'open_shortcuts':
+        setIsShortcutsOpen((p) => !p);
+        break;
+      case 'focus_log_filter': {
+        const input = document.querySelector('input[placeholder*="Filter logs"]') as HTMLInputElement | null;
+        input?.focus();
+        break;
+      }
+      case 'capture_screenshot':
+        void handleScreenshot();
+        break;
+      case 'toggle_editor':
+        setIsEditorOpen((p) => {
+          const next = !p;
+          if (next) setCameraMode('topdown');
+          return next;
+        });
+        break;
+      case 'pause_menu':
+        setIsPauseMenuOpen((prev) => {
+          const next = !prev;
+          engine.clock.setPaused(next);
+          return next;
+        });
+        handleUiSync();
+        break;
+      case 'camera_frame':
+        setFrameTrigger((n) => n + 1);
+        break;
+      case 'camera_follow':
+        setCameraMode('follow');
+        break;
+      case 'camera_orbit':
+        setCameraMode('orbit');
+        break;
+      case 'camera_topdown':
+        setCameraMode('topdown');
+        break;
+      case 'camera_fpv':
+        setCameraMode('fpv');
+        break;
+      case 'camera_freefly':
+        setCameraMode('freefly');
+        break;
+      case 'camera_cycle':
+        setCameraMode((prev) => {
+          const order: CameraMode[] = ['follow', 'orbit', 'topdown', 'fpv', 'freefly'];
+          return order[(order.indexOf(prev) + 1) % order.length];
+        });
+        break;
+    }
+  };
+
+  // Terrain Click Handler: Click-to-Move Waypoint OR Scenario Editor Brush/Boulder
+  const handleTerrainClick = useCallback(
+    (x: number, z: number, shiftKey: boolean, altKey: boolean) => {
+      if (editorTool === 'brush_raise' || editorTool === 'brush_lower') {
+        const snap = engine.terrain.snapshotHeights();
+        undoStackRef.current = [...undoStackRef.current.slice(-19), snap];
+        redoStackRef.current = [];
+        setUndoDepth({ undo: undoStackRef.current.length, redo: 0 });
+
+        const delta = editorTool === 'brush_raise' ? 0.35 : -0.35;
+        const res = engine.terrain.applyBrush(x, z, 2.6, delta);
+        if (res.applied) {
+          engine.rebuildDebris();
+          setTerrainVersion(res.version);
+          showToast(`${editorTool === 'brush_raise' ? 'Raised' : 'Lowered'} lunar terrain at (${x.toFixed(1)}, ${z.toFixed(1)}).`, 'info');
+        } else {
+          showToast(res.reason || 'Terrain edit rejected.', 'warn');
         }
         return;
       }
 
-      // Ctrl + K: Command Palette
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        setIsPaletteOpen((prev) => !prev);
-      }
-      // Ctrl + B: Toggle Left Panel
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'b') {
-        e.preventDefault();
-        setLayoutSettings((s) => ({ ...s, showLogPanel: !s.showLogPanel }));
-      }
-      // P: Toggle PerfPanel
-      if (e.key.toLowerCase() === 'p' && !e.ctrlKey && !e.metaKey) {
-        e.preventDefault();
-        setIsPerfPanelOpen((prev) => !prev);
-      }
-      // Q: Cycle Quality Tier
-      if (e.key.toLowerCase() === 'q') {
-        e.preventDefault();
-        setQualityTier((prev) => {
-          const tiers: QualityTier[] = ['ultra', 'high', 'medium', 'low', 'potato'];
-          const nextIdx = (tiers.indexOf(prev) + 1) % tiers.length;
-          const nextTier = tiers[nextIdx];
-          PerfProbe.getInstance().setTier(nextTier);
-          return nextTier;
-        });
-      }
-      // B: Toggle Boundary Rim Overlay
-      if (e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.metaKey) {
-        e.preventDefault();
-        setLayoutSettings((s) => ({ ...s, showOverlays: !s.showOverlays }));
-      }
-      // ?: Shortcuts Modal
-      if (e.key === '?' || (e.shiftKey && e.key === '/')) {
-        e.preventDefault();
-        setIsShortcutsOpen((prev) => !prev);
-      }
-      // T: CV Teleoperation
-      if (e.key.toLowerCase() === 't' && !e.shiftKey) {
-        e.preventDefault();
-        setIsTeleopOpen((prev) => !prev);
-      }
-      // 1-4: Camera Presets
-      if (e.key === '1') setCameraPreset('chase');
-      if (e.key === '2') setCameraPreset('top');
-      if (e.key === '3') setCameraPreset('side');
-      if (e.key === '4') setCameraPreset('free');
-
-      // Space: Play/Pause Replay
-      if (e.code === 'Space') {
-        e.preventDefault();
-        setIsPlaying((prev) => !prev);
-      }
-      // Comma/Period: Single Step Backward/Forward
-      if (e.key === ',') {
-        setIsPlaying(false);
-        setPlaybackIndex((prev) => Math.max(0, prev - 1));
-      }
-      if (e.key === '.') {
-        setIsPlaying(false);
-        const history = TelemetryStore.getInstance().getHistory();
-        setPlaybackIndex((prev) => Math.min(history.length - 1, prev + 1));
-      }
-      // Bracket keys: Playback speed
-      if (e.key === '[') setPlaybackSpeed((s) => Math.max(0.25, s - 0.25));
-      if (e.key === ']') setPlaybackSpeed((s) => Math.min(4.0, s + 0.25));
-
-      // Hotkey: A to approve job when diff is ready
-      if (e.key.toLowerCase() === 'a' && architectOutput && !isPaletteOpen) {
-        e.preventDefault();
-        handleApproveJobRef.current();
-      }
-      // Hotkey: X to reject
-      if (e.key.toLowerCase() === 'x' && architectOutput && !isPaletteOpen) {
-        e.preventDefault();
-        handleRejectJobRef.current();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [architectOutput, isPaletteOpen]);
-
-  // Connect Telemetry Stream
-  const connectTelemetryStream = useCallback(
-    (mode: 'cloud_nebius' | 'local_demo', iter = 1, overrideSpec?: EnvironmentSpec) => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
+      if (editorTool === 'boulder') {
+        const cur = engine.getScenario();
+        const nextObs = [
+          ...cur.customObstacles,
+          { id: `obs_${Date.now()}`, x: Number(x.toFixed(2)), z: Number(z.toFixed(2)), radius: 0.55, kind: 'boulder' as const },
+        ];
+        engine.applyScenario({ customObstacles: nextObs }, false);
+        setTerrainVersion((v) => v + 1);
+        showToast(`Placed obstacle at (${x.toFixed(1)}m, ${z.toFixed(1)}m).`, 'info');
+        return;
       }
 
-      const activeSpec = overrideSpec || envSpec;
-      const specQuery = `&spec=${encodeURIComponent(JSON.stringify(activeSpec))}`;
-      const es = new EventSource(`/api/jobs/stream?mode=${mode}&duration=120&iteration=${iter}${specQuery}`);
-      eventSourceRef.current = es;
+      // Default: Click-to-Move Waypoint Driving
+      if (altKey) {
+        engine.inputs.removeLastWaypoint();
+        showToast('Removed last waypoint.', 'info');
+        handleUiSync();
+        return;
+      }
 
-      es.addEventListener('status', (e) => {
-        const status: JobStatus = JSON.parse(e.data);
-        setJobStatus(status);
-        if (status.status === 'succeeded') {
-          addLog(`[SIM SUCCEEDED] ${status.message}`, 'architect');
-          const summary: RunSummary = {
-            success: true,
-            distanceCovered: Number(((status.elapsed || 60) * 0.95).toFixed(2)),
-            meanReward: Number((status.currentReward || 1.82).toFixed(2)),
-            collisionCount: status.collisionCount || 0,
-            boundaryEvents: TelemetryStore.getInstance().getSnapshot().boundaryEventCount,
-            energyConsumed: Number(((status.elapsed || 60) * 0.72).toFixed(1)),
-            durationSeconds: status.elapsed || 60,
-            tokens: {
-              ultra: tokenSpend.promptTokens,
-              super: 950,
-              nano: 480,
-              total: tokenSpend.promptTokens + tokenSpend.completionTokens,
-            },
-            costUsd: tokenSpend.costUsd,
-            mode: status.mode,
-            sourceLabels: status.mode === 'cloud_nebius'
-              ? ['nebius_serverless_jobs', 'nvidia_l40s_gpu', 'headless_pybullet']
-              : ['deterministic_physics', 'heightfield_grounded', 'local_runner'],
-          };
-          setRunSummary(summary);
-          setShowRunSummary(true);
-        }
-      });
-
-      // Stream frames directly into imperative TelemetryStore outside React
-      es.addEventListener('telemetry', (e) => {
-        const batch = JSON.parse(e.data);
-        if (batch.frames && batch.frames.length > 0) {
-          TelemetryStore.getInstance().ingestBatch(batch.frames);
-        }
-      });
-
-      es.onerror = () => {
-        es.close();
-      };
+      const curPos = engine.gait.getSnapshot();
+      const check = engine.terrain.checkSegmentTraversability(curPos.posX, curPos.posZ, x, z, 28);
+      engine.inputs.addWaypoint(x, z, shiftKey, check.reachable, check.maxSlopeDeg);
+      engine.arbiter.takeManualControl('pointer', engine.clock.getElapsed());
+      showToast(
+        check.reachable
+          ? `Waypoint set at (${x.toFixed(1)}m, ${z.toFixed(1)}m)${shiftKey ? ' (appended)' : ''}.`
+          : `Steep slope warning (${check.maxSlopeDeg}°) along route to waypoint!`,
+        check.reachable ? 'info' : 'warn'
+      );
+      handleUiSync();
     },
-    [envSpec, addLog, tokenSpend]
+    [editorTool, engine, showToast, handleUiSync]
   );
 
-  useEffect(() => {
-    connectTelemetryStream(simMode, iteration);
-    return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
-    };
-  }, [simMode, iteration, connectTelemetryStream]);
+  // Undo / Redo Terrain Brush
+  const handleUndoTerrain = useCallback(() => {
+    const prev = undoStackRef.current.pop();
+    if (!prev) return;
+    redoStackRef.current.push(engine.terrain.snapshotHeights());
+    engine.terrain.restoreHeights(prev);
+    engine.rebuildDebris();
+    setTerrainVersion(engine.terrain.getVersion());
+    setUndoDepth({ undo: undoStackRef.current.length, redo: redoStackRef.current.length });
+  }, [engine]);
 
-  // Submit Prompt to Architect Stream
+  const handleRedoTerrain = useCallback(() => {
+    const next = redoStackRef.current.pop();
+    if (!next) return;
+    undoStackRef.current.push(engine.terrain.snapshotHeights());
+    engine.terrain.restoreHeights(next);
+    engine.rebuildDebris();
+    setTerrainVersion(engine.terrain.getVersion());
+    setUndoDepth({ undo: undoStackRef.current.length, redo: redoStackRef.current.length });
+  }, [engine]);
+
+  // Share Scenario Link (#s=...)
+  const handleShareScenario = useCallback(() => {
+    const res = encodeScenarioToHash(engine.getScenario());
+    if (!res.ok || !res.hash) {
+      showToast(res.error || 'Could not encode scenario link.', 'warn');
+      return;
+    }
+    const url = `${window.location.origin}${window.location.pathname}${res.hash}`;
+    window.history.replaceState(null, '', res.hash);
+    navigator.clipboard?.writeText(url).catch(() => {});
+    showToast(`Shareable scenario URL copied (${res.hash.length} bytes)!`, 'info');
+  }, [engine, showToast]);
+
+  // Export Deterministic Replay (.omni.json)
+  const handleExportReplay = useCallback(() => {
+    const replay = lastReplayRef.current || engine.recorder.exportReplay();
+    const blob = new Blob([JSON.stringify(replay, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `omni-kinetic-run-${replay.seed}-${replay.finalChecksum}.omni.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast(`Exported deterministic replay (checksum ${replay.finalChecksum}).`, 'info');
+  }, [engine, showToast]);
+
+  // Import Replay (.omni.json)
+  const handleImportReplay = useCallback(
+    (rawText: string) => {
+      const res = validateReplayJson(rawText);
+      if (!res.ok || !res.replay) {
+        showToast(res.error || 'Invalid replay file.', 'warn');
+        return;
+      }
+      lastReplayRef.current = res.replay;
+      engine.setGhostReplay(res.replay);
+      engine.startReplay(res.replay);
+      setTerrainVersion(engine.terrain.getVersion());
+      showToast(`Playing verified replay (${res.replay.totalSteps} steps, checksum ${res.replay.finalChecksum}).`, 'info');
+      handleUiSync();
+    },
+    [engine, showToast, handleUiSync]
+  );
+
+  // Export Dataset JSONL / CSV (Phase W9.3)
+  const handleExportDataset = useCallback(
+    (fmt: 'jsonl' | 'csv') => {
+      const replay = engine.recorder.exportReplay();
+      const text = fmt === 'jsonl' ? exportDatasetJsonl(replay) : exportDatasetCsv(replay);
+      const blob = new Blob([text], { type: fmt === 'jsonl' ? 'application/x-ndjson' : 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `omni-kinetic-dataset-${replay.seed}.${fmt}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast(`Exported ${replay.totalSteps} steps as ${fmt.toUpperCase()}.`, 'info');
+    },
+    [engine, showToast]
+  );
+
+  // Clip Recording Toggle
+  const handleToggleClipRecord = useCallback(() => {
+    const rec = clipRecorderRef.current;
+    if (!rec || !canvasRef.current) return;
+    if (rec.isRecording()) {
+      rec.stop();
+      setIsRecordingClip(false);
+      showToast('WebM clip saved.', 'info');
+    } else {
+      const res = rec.start(canvasRef.current, {
+        fps: 30,
+        maxDurationSec: 30,
+        onAutoStop: () => {
+          setIsRecordingClip(false);
+          showToast('30s WebM clip saved automatically.', 'info');
+        },
+      });
+      if (res.ok) {
+        setIsRecordingClip(true);
+        showToast('Recording 30fps WebM clip (max 30s)...', 'info');
+      } else {
+        showToast(res.error || 'Clip recording failed.', 'warn');
+      }
+    }
+  }, [showToast]);
+
+  // Architect Prompt Stream (preserved from v1)
   const handlePromptSubmit = async (prompt: string) => {
     setIsStreamingArchitect(true);
     addLog(`[USER PROMPT] "${prompt}"`, 'info');
-
-    // Reset stages
     setStages(INITIAL_STAGES);
-
     try {
       const res = await fetch('/api/architect/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),
       });
-
       if (!res.body) throw new Error('No stream body');
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n\n');
         buffer = lines.pop() || '';
-
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
           try {
@@ -395,11 +690,7 @@ export default function Shell() {
               setActiveStageKey(data.stage);
               setStages((prev) => ({
                 ...prev,
-                [data.stage]: {
-                  ...prev[data.stage],
-                  status: data.status,
-                  durationMs: data.durationMs,
-                },
+                [data.stage]: { ...prev[data.stage], status: data.status, durationMs: data.durationMs },
               }));
               addLog(`[STAGE: ${data.stage.toUpperCase()}] ${data.label} (${data.status})`, 'architect');
             } else if (data.type === 'token_update') {
@@ -410,10 +701,7 @@ export default function Shell() {
               }));
             } else if (data.type === 'complete') {
               setArchitectOutput(data.payload);
-              addLog(
-                `Architect complete. Task: "${data.payload.spec.taskName}" (${data.payload.spec.gravity[1]}m/s², ${data.payload.spec.debris?.count || 1800} boulders). Source: ${data.payload.sourceLabel}.`,
-                'architect'
-              );
+              addLog(`Architect complete. Task: "${data.payload.spec.taskName}".`, 'architect');
             }
           } catch {}
         }
@@ -425,81 +713,61 @@ export default function Shell() {
     }
   };
 
-  const handleApproveJobRef = useRef<() => void>(() => {});
-  const handleRejectJobRef = useRef<() => void>(() => {});
-
   const handleApproveJob = useCallback(() => {
     if (architectOutput) {
       const approvedSpec = architectOutput.spec;
       setEnvSpec(approvedSpec);
-      addLog(`[SPEC APPROVED] Activated "${approvedSpec.taskName}" (G=${approvedSpec.gravity?.[1]}m/s², Debris=${approvedSpec.debris?.count || 1800}). Simulation reinitialized.`, 'architect');
-      connectTelemetryStream(simMode, 1, approvedSpec);
-    } else {
-      addLog('Architecture specification and reward scripts approved by user.', 'architect');
-      connectTelemetryStream(simMode);
+      engine.applyScenario(
+        {
+          name: approvedSpec.taskName,
+          gravity: Math.abs(approvedSpec.gravity?.[1] ?? 1.62),
+          seed: approvedSpec.terrain?.seed ?? 42,
+          rockCount: approvedSpec.debris?.count ?? 1400,
+        },
+        true
+      );
+      setTerrainVersion(engine.terrain.getVersion());
+      engine.resetEpisode(true);
+      addLog(`[SPEC APPROVED] Activated "${approvedSpec.taskName}" on local deterministic engine.`, 'architect');
     }
-  }, [architectOutput, addLog, connectTelemetryStream, simMode]);
-
-  const handleApproveCode = (rewardCode: string, datagenCode: string) => {
-    if (architectOutput) {
-      const approvedSpec = architectOutput.spec;
-      setEnvSpec(approvedSpec);
-      setArchitectOutput({ ...architectOutput, rewardCode, datagenCode });
-      addLog(`[SPEC & CODE APPROVED] Activated "${approvedSpec.taskName}" with modified Python reward code. Re-initializing simulation...`, 'architect');
-      connectTelemetryStream(simMode, 1, approvedSpec);
-    } else {
-      addLog('Updated reward & datagen scripts approved. Re-initializing simulation...', 'architect');
-      connectTelemetryStream(simMode);
-    }
-  };
+  }, [architectOutput, engine, addLog]);
 
   const handleRejectJob = useCallback(() => {
     setArchitectOutput(null);
-    addLog('Specification rejected. Requesting Architect retry...', 'warn');
+    addLog('Specification rejected.', 'warn');
   }, [addLog]);
 
-  handleApproveJobRef.current = handleApproveJob;
-  handleRejectJobRef.current = handleRejectJob;
+  // Read unified snapshots for current render
+  const clockSnap = engine.getClockSnapshot();
+  const arbiterSnap = engine.getArbiterSnapshot();
+  const missionSnap = engine.getMissionSnapshot();
+  const activeMission = engine.missionRuntime.getMission();
+  const scenario = engine.getScenario();
+  const runModeDesc = describeRunMode(runMode);
+  const inputViz = engine.getInputVisualizer();
+  const chartHistory = engine.getChartHistory();
+  const latestChart = chartHistory[chartHistory.length - 1];
+  const showTouch =
+    settings.controls.showTouchControls === 'always' ||
+    (settings.controls.showTouchControls === 'auto' && isCoarsePointer);
 
-  const handleRejectWithFeedback = (feedback: string) => {
-    addLog(`[RETRY REQUESTED] Developer feedback: "${feedback}"`, 'warn');
-    handlePromptSubmit(`${envSpec.taskName}. Focus on feedback: ${feedback}`);
+  const handleLogWidthChange = (newWidth: number) => {
+    setLogPaneWidth(newWidth);
+    try { localStorage.setItem('omni_log_width', String(newWidth)); } catch {}
   };
-
-  const handleCollision = () => {
-    setCollisionAlert(true);
-    setTimeout(() => setCollisionAlert(false), 350);
-  };
-
-  const handleOpenDatasetPanel = (episodes: any[]) => {
-    setCollectedEpisodes(episodes);
-    setIsDatasetPanelOpen(true);
-  };
-
-  const handleTrainWithCorrections = (selectedIds: string[]) => {
-    setIteration(2);
-    setIsDeltaComparisonOpen(true);
-    addLog(
-      `Ingested ${selectedIds.length} human demonstration episodes. Retraining policy for Iteration 2... [SIMULATED IMPROVEMENT (DEMO)]`,
-      'architect'
-    );
-    connectTelemetryStream(simMode, 2);
-  };
-
-  const currentFrame = isPlaying
-    ? storeSnapshot.currentFrame
-    : TelemetryStore.getInstance().getFrameAtIndex(playbackIndex);
 
   return (
     <div
-      className={`relative w-screen h-screen overflow-hidden flex flex-col bg-charcoal text-cream transition-all duration-200 ${
-        collisionAlert ? 'animate-brick-impact' : ''
+      className={`relative w-screen h-screen overflow-hidden flex flex-col bg-charcoal text-cream ${
+        settings.accessibility.highContrast ? 'contrast-125' : ''
+      } ${settings.accessibility.largeText ? 'text-[15px]' : ''} ${
+        collisionAlert && !settings.accessibility.reducedMotion ? 'animate-brick-impact' : ''
       }`}
     >
-      {/* Top Workstation Header (Strict Single-Row Flex Layout with min-width: 0 and gap >= 6px) */}
-      <header className="analog-glass z-30 h-12 flex items-center justify-between px-3 md:px-4 border-b border-cream/10 select-none m-2 mb-0 whitespace-nowrap flex-nowrap min-w-0 overflow-hidden">
-        {/* Left: Branding & Task Context */}
-        <div className="flex items-center gap-2 min-w-0 flex-1 max-w-[45%]">
+      {/* Top Workstation Header (Single-Row Flex Layout, Zero Overlap Lock-In) */}
+      <header className="analog-glass z-30 h-12 flex items-center justify-between px-3 md:px-4 border-b border-cream/10 select-none m-2 mb-0 whitespace-nowrap flex-nowrap min-w-0 overflow-hidden gap-2">
+        {/* Left: Branding & Active Scenario */}
+        <div className="flex items-center gap-2 min-w-0 flex-1 max-w-[42%]">
           <div className="flex items-center space-x-1.5 shrink-0">
             <span className="w-2.5 h-2.5 rounded-sm bg-sage" />
             <h1 className="font-mono text-xs uppercase tracking-wider font-bold text-cream">
@@ -509,18 +777,25 @@ export default function Shell() {
           <span className="text-cream-dim/30 shrink-0">/</span>
           <span
             className="text-xs font-mono text-cream-dim truncate min-w-0 max-w-[180px] lg:max-w-xs shrink"
-            title={envSpec.taskName}
+            title={scenario.name}
           >
-            {envSpec.taskName}
+            {scenario.name}
           </span>
-          <div className="hidden lg:flex items-center space-x-1.5 px-2 py-0.5 rounded bg-charcoal border border-cream/10 text-xs font-mono shrink-0">
-            <span className={`w-2 h-2 rounded-full ${iteration >= 2 ? 'bg-sage animate-pulse' : 'bg-cream-dim'}`} />
-            <span>{iteration >= 2 ? 'Policy v2' : 'Policy v1'}</span>
+          <div
+            className={`hidden lg:flex items-center space-x-1.5 px-2 py-0.5 rounded border text-[11px] font-mono shrink-0 ${
+              arbiterSnap.isManual
+                ? 'bg-sage/20 border-sage text-cream font-bold'
+                : 'bg-charcoal border-cream/10 text-cream-dim'
+            }`}
+          >
+            <span className={`w-2 h-2 rounded-full ${arbiterSnap.isManual ? 'bg-sage animate-pulse' : 'bg-cream-dim'}`} />
+            <span>{arbiterSnap.isManual ? arbiterSnap.modeLabel : `Policy v${iteration}`}</span>
           </div>
           {collectedEpisodes.length > 0 && (
             <button
+              type="button"
               onClick={() => setIsDatasetPanelOpen(true)}
-              className="px-2 py-0.5 rounded bg-sage/20 border border-sage/40 text-sage hover:bg-sage/30 text-xs font-mono flex items-center space-x-1 transition-colors shrink-0"
+              className="px-2 py-0.5 rounded bg-sage/20 border border-sage/40 text-sage hover:bg-sage/30 text-xs font-mono flex items-center space-x-1 shrink-0"
             >
               <Layers className="w-3 h-3" />
               <span>Dataset ({collectedEpisodes.length})</span>
@@ -528,12 +803,13 @@ export default function Shell() {
           )}
         </div>
 
-        {/* Center: Command Palette Trigger & Teleop Toggle */}
-        <div className="flex items-center gap-2 shrink-0">
+        {/* Center: Task Prompt, Control Toggle [T], and CV Cam */}
+        <div className="flex items-center gap-1.5 shrink-0">
           <button
+            type="button"
             onClick={() => setIsPaletteOpen(true)}
             title="Open Task Prompt [Ctrl+K]"
-            className="flex items-center space-x-1.5 bg-charcoal hover:bg-charcoal-light border border-cream/15 px-2.5 py-1 rounded text-xs font-mono text-cream transition-colors focus-visible:ring-2 focus-visible:ring-sage"
+            className="flex items-center space-x-1.5 bg-charcoal hover:bg-charcoal-light border border-cream/15 px-2.5 py-1 rounded text-xs font-mono text-cream transition-colors"
           >
             <Sparkles className="w-3.5 h-3.5 text-sage" />
             <span className="hidden sm:inline">Task Prompt</span>
@@ -543,50 +819,67 @@ export default function Shell() {
           </button>
 
           <button
-            onClick={() => setIsTeleopOpen((prev) => !prev)}
-            title="Client-side webcam teleoperation (T)"
+            type="button"
+            onClick={() => actionHandlerRef.current('toggle_control')}
+            title="Take / Release manual droid control [T]"
             className={`flex items-center space-x-1.5 px-2.5 py-1 rounded text-xs font-mono transition-colors border ${
-              isTeleopOpen
-                ? 'bg-brick border-brick text-cream shadow-lg shadow-brick/30'
-                : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream-dim hover:text-cream'
+              arbiterSnap.isManual
+                ? 'bg-sage border-sage text-cream font-bold shadow-lg shadow-sage/25'
+                : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream hover:border-sage'
             }`}
           >
-            <Camera className="w-3.5 h-3.5 text-sage" />
-            <span className="hidden sm:inline">Teleop</span>
-            <kbd className="bg-charcoal-deep px-1.5 py-0.5 rounded text-[10px] border border-cream/10">
+            <Gamepad2 className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">{arbiterSnap.isManual ? 'Driving' : 'Control'}</span>
+            <kbd className="bg-charcoal-deep px-1.5 py-0.5 rounded text-[10px] border border-cream/10 text-cream">
               T
             </kbd>
           </button>
+
+          <button
+            type="button"
+            onClick={() => setIsTeleopOpen((p) => !p)}
+            title="Webcam CV Hand Teleoperation"
+            aria-label="Toggle CV Webcam Teleop"
+            className={`p-1.5 rounded border text-xs font-mono transition-colors ${
+              isTeleopOpen
+                ? 'bg-brick border-brick text-cream'
+                : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream-dim hover:text-cream'
+            }`}
+          >
+            <Camera className="w-3.5 h-3.5" />
+          </button>
         </div>
 
-        {/* Right: Mode Badge, Honest FPS & Token Meter */}
-        <div className="flex items-center gap-2 text-xs font-mono shrink-0">
-          {/* Mode Switcher */}
+        {/* Right: Unified Run-Mode Chip, Honest FPS, Token Meter, Shortcuts, Layout */}
+        <div className="flex items-center gap-1.5 text-xs font-mono shrink-0">
           <button
-            onClick={() => setSimMode(simMode === 'cloud_nebius' ? 'local_demo' : 'cloud_nebius')}
-            title="Click to toggle simulation execution provider"
+            type="button"
+            onClick={() =>
+              setRunMode((m) =>
+                m === 'local-simulation' ? 'cloud-stream' : m === 'cloud-stream' ? 'demo-fixtures' : 'local-simulation'
+              )
+            }
+            title={runModeDesc.tooltip}
             className={`px-2 py-0.5 rounded border flex items-center space-x-1.5 transition-colors text-[11px] ${
-              simMode === 'cloud_nebius'
+              runMode === 'cloud-stream'
                 ? 'bg-sage/20 border-sage/50 text-sage'
+                : runMode === 'demo-fixtures'
+                ? 'bg-amber-500/20 border-amber-400/50 text-amber-200'
                 : 'bg-cream/10 border-cream/20 text-cream'
             }`}
           >
             <Cpu className="w-3 h-3" />
-            <span className="hidden xl:inline">{simMode === 'cloud_nebius' ? 'CLOUD STREAM: NEBIUS' : 'LOCAL SIMULATION'}</span>
-            <span className="xl:hidden">{simMode === 'cloud_nebius' ? 'CLOUD' : 'LOCAL'}</span>
+            <span className="hidden xl:inline">{runModeDesc.badgeLabel}</span>
+            <span className="xl:hidden">{runModeDesc.shortLabel}</span>
           </button>
 
-          {/* Honest FPS Readout Badge */}
-          <FpsBadge
-            tier={qualityTier}
-            onTogglePanel={() => setIsPerfPanelOpen((prev) => !prev)}
-          />
+          <FpsBadge tier={qualityTier} onTogglePanel={() => setIsPerfPanelOpen((p) => !p)} />
 
-          {/* Token Meter with Dollar Cost */}
           <button
+            type="button"
             onClick={() => setIsTokenSpendOpen(true)}
-            title="Click to inspect detailed token & cost accounting per tier"
-            className="flex items-center space-x-1.5 bg-charcoal hover:bg-charcoal-light px-2 py-0.5 rounded border border-cream/10 text-cream-dim hover:text-cream cursor-pointer transition-colors text-[11px]"
+            title="Inspect token & cost accounting"
+            className="hidden md:flex items-center space-x-1.5 bg-charcoal hover:bg-charcoal-light px-2 py-0.5 rounded border border-cream/10 text-cream-dim hover:text-cream text-[11px]"
           >
             <Coins className="w-3 h-3 text-sage" />
             <span>
@@ -596,16 +889,15 @@ export default function Shell() {
             </span>
           </button>
 
-          {/* Quick Shortcuts Trigger */}
           <button
+            type="button"
             onClick={() => setIsShortcutsOpen(true)}
-            title="Keyboard Shortcuts [?]"
-            className="p-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/10 text-cream-dim hover:text-cream text-[11px] font-mono px-2 transition-colors"
+            title="Controls & Shortcuts [?]"
+            className="p-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/10 text-cream-dim hover:text-cream text-[11px] font-mono px-2"
           >
             ?
           </button>
 
-          {/* Layout & Settings Menu */}
           <LayoutMenu
             settings={layoutSettings}
             onUpdateSettings={(newS) => setLayoutSettings((s) => ({ ...s, ...newS }))}
@@ -615,32 +907,62 @@ export default function Shell() {
         </div>
       </header>
 
-      {/* Stage Rail: 11-Stage Architectural Pipeline */}
-      {isStageRailVisible && (isStreamingArchitect || architectOutput) && (
+      {/* Stage Rail when Architect is active */}
+      {(isStreamingArchitect || architectOutput) && (
         <div className="mx-2 mt-1">
           <StageRail stages={stages} activeStage={activeStageKey} />
         </div>
       )}
 
-      {/* Main Studio Viewport */}
+      {/* Shared Scenario Confirmation Banner (#s=...) */}
+      {pendingSharedScenario && (
+        <div className="mx-2 mt-1.5 px-4 py-2 rounded-xl bg-sage/20 border border-sage flex items-center justify-between font-mono text-xs">
+          <span>
+            Shared scenario detected: <strong>{pendingSharedScenario.name}</strong> (seed {pendingSharedScenario.seed}, g={pendingSharedScenario.gravity} m/s²). Apply it?
+          </span>
+          <div className="flex items-center space-x-2">
+            <button
+              type="button"
+              onClick={() => {
+                engine.applyScenario(pendingSharedScenario, true);
+                setTerrainVersion(engine.terrain.getVersion());
+                engine.resetEpisode(true);
+                setPendingSharedScenario(null);
+                showToast(`Loaded shared scenario "${pendingSharedScenario.name}".`, 'info');
+              }}
+              className="px-3 py-1 rounded bg-sage text-cream font-bold"
+            >
+              Apply Scenario
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingSharedScenario(null)}
+              className="px-2.5 py-1 rounded bg-charcoal border border-hairline text-cream-dim"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Main Studio Split Viewport */}
       <div className="relative flex-1 flex overflow-hidden p-2 pt-1 gap-2">
-        {/* Left Analog Log & Code Diff Pane (Resizable, persistent width) */}
+        {/* Left Resizable Console & Analysis Pane (Single SimClock progress source — R-01 fixed!) */}
         <AnalogLogPane
           logs={logs}
           currentStage={currentStage}
           architectOutput={architectOutput}
           currentSpec={envSpec}
           activeJobStatus={jobStatus}
+          clockSnapshot={clockSnap}
+          runModeDescription={`${runModeDesc.consolePrefix} · ${arbiterSnap.modeLabel}`}
+          chartHistory={chartHistory}
+          safetyEvents={engine.getSafetyEvents()}
+          onExportDatasetJsonl={() => handleExportDataset('jsonl')}
+          onExportDatasetCsv={() => handleExportDataset('csv')}
           onApprove={handleApproveJob}
           onReject={handleRejectJob}
-          onApproveCode={handleApproveCode}
-          onRejectWithFeedback={handleRejectWithFeedback}
-          onUpdateSpec={(spec) => {
-            setEnvSpec(spec);
-            if (architectOutput) {
-              setArchitectOutput({ ...architectOutput, spec });
-            }
-          }}
+          onUpdateSpec={(spec) => setEnvSpec(spec)}
           onOpenPrompt={() => setIsPaletteOpen(true)}
           isStreaming={isStreamingArchitect}
           isOpen={layoutSettings.showLogPanel}
@@ -649,117 +971,391 @@ export default function Shell() {
           onWidthChange={handleLogWidthChange}
         />
 
-        {/* Center 3D Three.js Spatial Visualizer */}
+        {/* Center 3D Spatial Viewport */}
         <main className="relative flex-1 h-full rounded-xl overflow-hidden border border-cream/10 shadow-2xl">
           <ThreeViewer
+            engine={engine}
             envSpec={envSpec}
-            currentFrame={currentFrame}
-            teleopCommand={isTeleopOpen ? teleopCommand : null}
-            cameraPreset={cameraPreset}
+            cameraMode={cameraMode}
             qualityTier={qualityTier}
+            fov={settings.camera.fov}
+            sunElevationDeg={scenario.sunElevationDeg}
+            sunAzimuthDeg={scenario.sunAzimuthDeg}
             showColliderDebug={layoutSettings.showColliderDebug}
             showOverlays={layoutSettings.showOverlays}
             showRadar={layoutSettings.showRadar}
+            radarSize={settings.display.radarSize}
+            onRadarSizeChange={(sz) => updateSettings({ ...settings, display: { ...settings.display, radarSize: sz } })}
             showDustParticles={layoutSettings.showDustParticles}
-            showGhostComparison={iteration >= 2 || isDeltaComparisonOpen}
-            adaptiveQuality={layoutSettings.adaptiveQuality}
-            isNewAnimation={isNewAnimation}
-            onCollisionDetected={handleCollision}
+            showGhostComparison={engine.hasGhost() || iteration >= 2}
+            showContours={settings.display.showContours}
+            showTrail={settings.display.showTrail}
+            pipEnabled={settings.camera.pipEnabled}
+            sensors={sensors}
+            cameraShakeEnabled={settings.camera.shakeEnabled}
+            autoRecenterOrbit={settings.camera.autoRecenterOrbit}
+            reducedMotion={settings.accessibility.reducedMotion}
+            colorblindSafe={settings.display.colorblindSafe}
+            editorTool={editorTool}
+            terrainVersion={terrainVersion}
+            frameTrigger={frameTrigger}
+            missionMarkers={activeMission.markers}
+            completedMarkerIds={missionSnap.completedIds}
+            waypoints={engine.inputs.getWaypoints()}
+            onTerrainClick={handleTerrainClick}
+            onPointerDriveUpdate={(active, x, z) => {
+              engine.inputs.pointerDrive.active = active;
+              engine.inputs.pointerDrive.targetX = x;
+              engine.inputs.pointerDrive.targetZ = z;
+            }}
+            onCanvasReady={(c) => { canvasRef.current = c; }}
+            onUiSync={handleUiSync}
+            onBoundaryWarning={(st, dist) => showToast(`Arena ${st} edge (${dist.toFixed(1)}m) — safety layer active.`, 'warn')}
           />
 
-          {/* Boundary Reset Toast Alert */}
-          {boundaryToast.visible && (
-            <div className="absolute top-6 left-1/2 -translate-x-1/2 z-40 analog-glass-elevated px-4 py-2 text-xs font-mono text-brick border border-brick/40 shadow-2xl flex items-center space-x-2 animate-bounce">
-              <AlertTriangle className="w-4 h-4 text-brick" />
-              <span className="font-bold">{boundaryToast.message}</span>
+          {/* Top-Center Mission Objectives HUD */}
+          <MissionObjectiveHUD
+            mission={activeMission}
+            progress={missionSnap}
+            onOpenPicker={() => setIsMissionsOpen(true)}
+          />
+
+          {/* Accessible Rate-Limited Toast Banner */}
+          {toast && (
+            <div
+              role="status"
+              aria-live="polite"
+              className={`pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-40 px-3.5 py-1.5 rounded-full backdrop-blur-md border font-mono text-[11px] shadow-2xl flex items-center space-x-2 ${
+                toast.level === 'warn'
+                  ? 'bg-brick/25 border-brick/60 text-cream'
+                  : 'bg-charcoal-deep/90 border-sage/60 text-cream'
+              }`}
+            >
+              {toast.level === 'warn' && <AlertTriangle className="w-3.5 h-3.5 text-amber-300" />}
+              <span>{toast.text}</span>
             </div>
           )}
 
-          {/* Bottom Replay Scrubber Dock */}
-          <div className="absolute bottom-3 left-1/2 transform -translate-x-1/2 analog-glass-elevated px-4 py-1.5 flex items-center space-x-4 font-mono text-xs z-20">
-            {/* Play/Pause */}
+          {/* Interactive Control HUD + Touch Dual Virtual Joystick + Coach Marks */}
+          {settings.display.showControlHud && (
+            <ControlHUD
+              arbiter={arbiterSnap}
+              speed={latestChart?.speed ?? 0}
+              cmdSpeed={latestChart?.cmdSpeed ?? 0}
+              gaitPattern={engine.gait.getSnapshot().phase.pattern}
+              gaitOverride={engine.inputs.getGaitOverride()}
+              froudeNumber={engine.gait.getParams().froudeNumber}
+              gravity={scenario.gravity}
+              energyJoules={latestChart?.energy ?? 0}
+              inputLatencyMs={engine.getLastInputLatencyMs()}
+              showDebugLatency={showDebugLatency}
+              cameraMode={cameraMode}
+              pipEnabled={settings.camera.pipEnabled}
+              sensors={sensors}
+              showLegend={settings.display.showKeyLegend}
+              showVisualizer={settings.display.showInputVisualizer}
+              showTouchControls={showTouch}
+              showCoachMarks={showCoachMarks}
+              isReplay={engine.isReplayActive()}
+              isRecordingClip={isRecordingClip}
+              clipSupported={clipSupported}
+              visualizer={inputViz}
+              touchState={engine.inputs.touch}
+              onToggleManual={() => actionHandlerRef.current('toggle_control')}
+              onEmergencyStop={() => actionHandlerRef.current('emergency_stop')}
+              onGaitOverride={(g: GaitMode) => { engine.inputs.setGaitOverride(g); handleUiSync(); }}
+              onCameraMode={(m) => setCameraMode(m)}
+              onTogglePip={() =>
+                updateSettings({ ...settings, camera: { ...settings.camera, pipEnabled: !settings.camera.pipEnabled } })
+              }
+              onToggleSensor={(k) => setSensors((prev) => ({ ...prev, [k]: !prev[k] }))}
+              onToggleLegend={() => actionHandlerRef.current('toggle_hud_legend')}
+              onDismissCoach={(dontShow) => {
+                setShowCoachMarks(false);
+                if (dontShow) setCoachDismissed(true);
+              }}
+              onOpenMissions={() => setIsMissionsOpen(true)}
+              onOpenEditor={() => setIsEditorOpen((p) => !p)}
+              onOpenSettings={() => setIsSettingsOpen(true)}
+              onScreenshot={() => void handleScreenshot()}
+              onToggleClipRecord={handleToggleClipRecord}
+              onShareScenario={handleShareScenario}
+              onTakeOverReplay={() => {
+                engine.takeOverFromReplay();
+                showToast('Took manual control from replay branch!', 'info');
+                handleUiSync();
+              }}
+            />
+          )}
+
+          {/* Bottom Unified Playback & Scrubber Bar (Reads strictly from single SimClock — R-01 fixed!) */}
+          <div className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 analog-glass-elevated px-3.5 py-1.5 flex items-center space-x-3 font-mono text-xs z-20 max-w-[96%] overflow-x-auto">
             <button
-              onClick={() => setIsPlaying(!isPlaying)}
+              type="button"
+              onClick={() => {
+                engine.clock.togglePaused();
+                handleUiSync();
+              }}
               className="p-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/15 text-cream"
-              title="Play/Pause [Space]"
+              title="Play / Pause Simulation"
+              aria-label={clockSnap.paused ? 'Resume Simulation' : 'Pause Simulation'}
             >
-              {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 text-sage" />}
+              {clockSnap.paused ? <Play className="w-3.5 h-3.5 text-sage" /> : <Pause className="w-3.5 h-3.5" />}
             </button>
 
-            {/* Step Back/Forward */}
             <button
+              type="button"
               onClick={() => {
-                setIsPlaying(false);
-                setPlaybackIndex((prev) => Math.max(0, prev - 1));
+                engine.clock.setPaused(true);
+                engine.seekToStep(Math.max(0, clockSnap.step - 6));
+                handleUiSync();
               }}
               className="p-1 rounded hover:bg-charcoal text-cream-dim hover:text-cream"
-              title="Step Backward [,]"
+              title="Step Backward (-0.1s)"
+              aria-label="Step Backward"
             >
               <SkipBack className="w-3.5 h-3.5" />
             </button>
             <button
+              type="button"
               onClick={() => {
-                setIsPlaying(false);
-                const history = TelemetryStore.getInstance().getHistory();
-                setPlaybackIndex((prev) => Math.min(history.length - 1, prev + 1));
+                engine.clock.setPaused(true);
+                engine.executeFixedStep(clockSnap.step, engine.clock.fixedDt);
+                engine.clock.seekToStep(clockSnap.step + 1);
+                handleUiSync();
               }}
               className="p-1 rounded hover:bg-charcoal text-cream-dim hover:text-cream"
-              title="Step Forward [.]"
+              title="Step Forward (+1 tick)"
+              aria-label="Step Forward"
             >
               <SkipForward className="w-3.5 h-3.5" />
             </button>
 
-            {/* Scrubber Bar with Explicit Duration & Percentage */}
+            <button
+              type="button"
+              onClick={() => {
+                engine.resetEpisode(false);
+                handleUiSync();
+              }}
+              className="p-1 rounded hover:bg-charcoal text-cream-dim hover:text-cream"
+              title="Restart Episode"
+              aria-label="Restart Episode"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Unified SimClock Progress Scrubber */}
             <div className="flex items-center space-x-2">
-              <span className="text-[10px] text-cream-dim">
-                t={(currentFrame?.t || 0).toFixed(1)}s / {(envSpec.episodeLength / 60).toFixed(1)}s ({Math.min(100, Math.round(((currentFrame?.t || 0) / (envSpec.episodeLength / 60)) * 100))}%)
+              <span className="text-[10px] text-cream tabular-nums whitespace-nowrap" data-testid="bottom-progress-text">
+                {clockSnap.timeDisplay}
               </span>
-              <div className="w-36 bg-charcoal-deep rounded-full h-1.5 overflow-hidden">
-                <div
-                  className="bg-sage h-full transition-all"
-                  style={{
-                    width: `${Math.min(100, ((currentFrame?.t || 0) / (envSpec.episodeLength / 60)) * 100)}%`,
-                  }}
-                />
-              </div>
+              <input
+                type="range"
+                aria-label="Episode timeline scrubber"
+                min={0}
+                max={Math.round(clockSnap.episodeLength * 60)}
+                value={clockSnap.step}
+                onChange={(e) => {
+                  const targetStep = parseInt(e.target.value, 10);
+                  engine.clock.setPaused(true);
+                  engine.seekToStep(targetStep);
+                  handleUiSync();
+                }}
+                className="w-28 accent-sage cursor-pointer"
+              />
             </div>
 
-            {/* Speed Selector */}
-            <span className="text-[10px] text-cream-dim bg-charcoal px-1.5 py-0.5 rounded border border-cream/10">
-              {playbackSpeed}x
-            </span>
-
-            {/* Live Arena Status indicator */}
-            <div className="border-l border-cream/10 pl-3 flex items-center space-x-1.5 text-[10px]">
-              <span className="w-2 h-2 rounded-full bg-sage" />
-              <span className="text-cream-dim">Edge:</span>
-              <span className="font-bold text-cream">{storeSnapshot.distanceToEdge}m</span>
+            {/* Segmented Speed Selector (0.25x .. 4x) */}
+            <div className="flex items-center bg-charcoal rounded p-0.5 border border-cream/10 text-[9px]">
+              {SPEED_PRESETS.map((spd) => (
+                <button
+                  key={spd}
+                  type="button"
+                  onClick={() => {
+                    engine.clock.setSpeedMultiplier(spd);
+                    handleUiSync();
+                  }}
+                  className={`px-1.5 py-0.5 rounded transition-colors ${
+                    Math.abs(clockSnap.speedMultiplier - spd) < 0.01
+                      ? 'bg-sage text-cream font-bold'
+                      : 'text-cream-dim hover:text-cream'
+                  }`}
+                >
+                  {spd}x
+                </button>
+              ))}
             </div>
           </div>
         </main>
       </div>
 
-      {/* Floating Modals & Diagnostic Overlays */}
+      {/* v2 Interactive Modals & Drawers */}
+      <MissionPickerModal
+        isOpen={isMissionsOpen}
+        activeMissionId={scenario.missionId}
+        bestScores={bestScores}
+        onSelectMission={(id) => {
+          const m = engine.loadMission(id);
+          if (m) {
+            setTerrainVersion(engine.terrain.getVersion());
+            showToast(`Mission loaded: ${m.title} — ${m.coachTip}`, 'info');
+            handleUiSync();
+          }
+        }}
+        onClose={() => setIsMissionsOpen(false)}
+      />
+
+      <EpisodeResultsModal
+        isOpen={isResultsOpen}
+        progress={lastMissionResult || missionSnap}
+        speedHistory={chartHistory.map((c) => c.speed)}
+        onReplay={() => {
+          const rep = lastReplayRef.current || engine.recorder.exportReplay();
+          engine.setGhostReplay(rep);
+          engine.startReplay(rep);
+          handleUiSync();
+        }}
+        onRetry={() => {
+          engine.resetEpisode(true);
+          handleUiSync();
+        }}
+        onNextMission={() => {
+          const idx = BUILT_IN_MISSIONS.findIndex((m) => m.id === activeMission.id);
+          const nextM = BUILT_IN_MISSIONS[(idx + 1) % BUILT_IN_MISSIONS.length];
+          engine.loadMission(nextM.id);
+          setTerrainVersion(engine.terrain.getVersion());
+          handleUiSync();
+        }}
+        onExportReplay={handleExportReplay}
+        onShareScenario={handleShareScenario}
+        onClose={() => setIsResultsOpen(false)}
+      />
+
+      <ScenarioEditorDrawer
+        isOpen={isEditorOpen}
+        scenario={scenario}
+        editorTool={editorTool}
+        canUndo={undoDepth.undo > 0}
+        canRedo={undoDepth.redo > 0}
+        onToolChange={(t) => setEditorTool(t)}
+        onUpdateScenario={(patch, regen) => {
+          engine.applyScenario(patch, Boolean(regen));
+          if (regen || patch.rockCount !== undefined) {
+            setTerrainVersion(engine.terrain.getVersion() + 1);
+          }
+          handleUiSync();
+        }}
+        onRegenerate={() => {
+          engine.terrain.regenerate(scenario.seed, {
+            fbmAmplitude: Math.max(0.2, scenario.roughness * 0.9),
+            primaryCratersMax: Math.max(2, scenario.craterCount),
+          });
+          engine.rebuildDebris();
+          setTerrainVersion(engine.terrain.getVersion());
+          engine.resetEpisode(false);
+          showToast(`Regenerated deterministic lunar terrain (seed ${scenario.seed}).`, 'info');
+        }}
+        onUndo={handleUndoTerrain}
+        onRedo={handleRedoTerrain}
+        onShareLink={handleShareScenario}
+        onExportJson={() => {
+          const blob = new Blob([JSON.stringify(engine.getScenario(), null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `scenario-${scenario.seed}.json`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }}
+        onImportJson={(txt) => {
+          try {
+            const parsed = ScenarioConfigSchema.parse(JSON.parse(txt));
+            engine.applyScenario(parsed, true);
+            setTerrainVersion(engine.terrain.getVersion());
+            engine.resetEpisode(true);
+            showToast(`Imported scenario "${parsed.name}".`, 'info');
+          } catch {
+            showToast('Invalid scenario JSON file.', 'warn');
+          }
+        }}
+        onImportReplay={handleImportReplay}
+        onClose={() => {
+          setIsEditorOpen(false);
+          setEditorTool('none');
+        }}
+      />
+
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        settings={settings}
+        registry={registry}
+        onChange={updateSettings}
+        onResetDefaults={() => {
+          registry.resetAll();
+          updateSettings(DEFAULT_STUDIO_SETTINGS);
+          showToast('All settings & key bindings reset to defaults.', 'info');
+        }}
+        onExportAllData={() => {
+          const blob = new Blob([exportAllStudioData()], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `omni-kinetic-backup-${Date.now()}.json`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }}
+        onDeleteAllData={() => {
+          deleteAllStudioData();
+          registry.resetAll();
+          setSettings(DEFAULT_STUDIO_SETTINGS);
+          setBestScores({});
+          showToast('Deleted all locally stored studio data.', 'warn');
+        }}
+        onClose={() => setIsSettingsOpen(false)}
+      />
+
+      <PauseMenuModal
+        isOpen={isPauseMenuOpen}
+        onResume={() => {
+          setIsPauseMenuOpen(false);
+          engine.clock.setPaused(false);
+          handleUiSync();
+        }}
+        onRestart={() => {
+          engine.resetEpisode(true);
+          handleUiSync();
+        }}
+        onOpenMissions={() => setIsMissionsOpen(true)}
+        onReplayLast={() => {
+          const rep = engine.recorder.exportReplay();
+          engine.setGhostReplay(rep);
+          engine.startReplay(rep);
+          handleUiSync();
+        }}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenShortcuts={() => setIsShortcutsOpen(true)}
+        onQuitToResults={() => {
+          lastReplayRef.current = engine.recorder.exportReplay();
+          setLastMissionResult(engine.getMissionSnapshot());
+          setIsResultsOpen(true);
+        }}
+      />
+
+      {/* Existing Preserved Modals */}
       <CommandPalette
         isOpen={isPaletteOpen}
         onClose={() => setIsPaletteOpen(false)}
         onSubmitPrompt={(p) => { void handlePromptSubmit(p); }}
-        onToggleSimMode={() => setSimMode(simMode === 'cloud_nebius' ? 'local_demo' : 'cloud_nebius')}
-        currentMode={simMode}
-        onToggleTeleop={() => setIsTeleopOpen((p) => !p)}
+        onToggleSimMode={() => setRunMode((m) => (m === 'cloud-stream' ? 'local-simulation' : 'cloud-stream'))}
+        currentMode={runMode === 'cloud-stream' ? 'cloud_nebius' : 'local_demo'}
+        onToggleTeleop={() => actionHandlerRef.current('toggle_control')}
         onToggleAnimation={() => setIsNewAnimation((p) => !p)}
         isNewAnimation={isNewAnimation}
         onOpenGaitLab={() => setShowGaitLab(true)}
       />
 
       {jobStatus && jobStatus.status === 'cold_start' && (
-        <ColdStartCard
-          status={jobStatus}
-          onSwitchToLocal={() => {
-            setSimMode('local_demo');
-            connectTelemetryStream('local_demo');
-          }}
-        />
+        <ColdStartCard status={jobStatus} onSwitchToLocal={() => setRunMode('local-simulation')} />
       )}
 
       {showRunSummary && runSummary && (
@@ -770,8 +1366,7 @@ export default function Shell() {
           onClose={() => setShowRunSummary(false)}
           onReplay={() => {
             setShowRunSummary(false);
-            setPlaybackIndex(0);
-            setIsPlaying(true);
+            engine.resetEpisode(false);
           }}
         />
       )}
@@ -782,23 +1377,28 @@ export default function Shell() {
         onTierChange={(t) => setQualityTier(t)}
       />
 
-      <ShortcutsOverlay
-        isOpen={isShortcutsOpen}
-        onClose={() => setIsShortcutsOpen(false)}
-      />
+      <ShortcutsOverlay isOpen={isShortcutsOpen} onClose={() => setIsShortcutsOpen(false)} />
 
-      <TokenSpendPopover
-        isOpen={isTokenSpendOpen}
-        onClose={() => setIsTokenSpendOpen(false)}
-      />
+      <TokenSpendPopover isOpen={isTokenSpendOpen} onClose={() => setIsTokenSpendOpen(false)} />
 
+      {/* CV Hand Teleop wired directly into InputManager OneEuro pipeline (Phase W3.6) */}
       {isTeleopOpen && (
         <TeleopOverlay
           isOpen={isTeleopOpen}
-          onClose={() => setIsTeleopOpen(false)}
-          onCommand={(cmd) => setTeleopCommand(cmd)}
+          onClose={() => {
+            engine.inputs.setCVTeleopCommand(false, 0, 0);
+            setIsTeleopOpen(false);
+          }}
+          onCommand={(cmd: TeleopCommand) => {
+            const target = (cmd as any)?.targetPosition as [number, number, number] | undefined;
+            if (target) {
+              const vx = Math.max(-0.8, Math.min(1.6, target[0] * 4.0));
+              const yawRate = Math.max(-1.8, Math.min(1.8, -target[2] * 3.5));
+              engine.inputs.setCVTeleopCommand(true, vx, yawRate);
+            }
+          }}
           onSaveEpisode={(ep) => setCollectedEpisodes((prev) => [...prev, ep])}
-          currentFrame={currentFrame}
+          currentFrame={TelemetryStore.getInstance().getSnapshot().currentFrame}
         />
       )}
 
@@ -807,7 +1407,11 @@ export default function Shell() {
           isOpen={isDatasetPanelOpen}
           onClose={() => setIsDatasetPanelOpen(false)}
           episodes={collectedEpisodes}
-          onTrainWithCorrections={handleTrainWithCorrections}
+          onTrainWithCorrections={() => {
+            setIteration(2);
+            setIsDeltaComparisonOpen(true);
+            setIsDatasetPanelOpen(false);
+          }}
         />
       )}
 
@@ -824,10 +1428,10 @@ export default function Shell() {
         <GaitLab
           isOpen={showGaitLab}
           isNewAnimation={isNewAnimation}
-          onToggleAnimation={() => setIsNewAnimation((prev) => !prev)}
-          gravity={Math.abs(envSpec.gravity?.[1] ?? 1.62)}
-          speed={playbackSpeed}
-          onSpeedChange={setPlaybackSpeed}
+          onToggleAnimation={() => setIsNewAnimation((p) => !p)}
+          gravity={scenario.gravity}
+          speed={clockSnap.speedMultiplier}
+          onSpeedChange={(spd) => { engine.clock.setSpeedMultiplier(spd); handleUiSync(); }}
           onClose={() => setShowGaitLab(false)}
         />
       )}

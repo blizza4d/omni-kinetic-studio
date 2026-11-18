@@ -35,6 +35,9 @@ import { compileSpec } from '@/lib/spec/compiler';
 import CodeDiffViewer from '@/components/shell/CodeDiffViewer';
 import JobCard from '@/components/shell/JobCard';
 import { TelemetryStore } from '@/lib/telemetry/store';
+import { SimClockSnapshot, clampProgress, formatClockDisplay, formatProgressPct } from '@/lib/sim/SimClock';
+import { TelemetryChartSample } from '@/lib/sim/SimEngine';
+import { SafetyEvent } from '@/lib/control/types';
 
 export type LogTab =
   | 'console'
@@ -78,6 +81,12 @@ interface AnalogLogPaneProps {
   onToggleOpen?: () => void;
   width?: number;
   onWidthChange?: (width: number) => void;
+  clockSnapshot?: SimClockSnapshot;
+  runModeDescription?: string;
+  chartHistory?: readonly TelemetryChartSample[];
+  safetyEvents?: readonly SafetyEvent[];
+  onExportDatasetJsonl?: () => void;
+  onExportDatasetCsv?: () => void;
 }
 
 export default function AnalogLogPane({
@@ -97,14 +106,34 @@ export default function AnalogLogPane({
   onToggleOpen,
   width = 420,
   onWidthChange,
+  clockSnapshot,
+  runModeDescription,
+  chartHistory = [],
+  safetyEvents = [],
+  onExportDatasetJsonl,
+  onExportDatasetCsv,
 }: AnalogLogPaneProps) {
   const [activeTab, setActiveTab] = useState<LogTab>('console');
   const [searchQuery, setSearchQuery] = useState('');
   const [levelFilter, setLevelFilter] = useState<'all' | 'architect' | 'security' | 'warn'>('all');
   const [userScrolledUp, setUserScrolledUp] = useState(false);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(true);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const tabsContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const updateTabScrollFlags = () => {
+    const el = tabsContainerRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 4);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 4);
+  };
+
+  useEffect(() => {
+    updateTabScrollFlags();
+  }, [width, isOpen]);
 
   // Auto-switch to diff tab on architect output generation
   useEffect(() => {
@@ -243,28 +272,48 @@ export default function AnalogLogPane({
         </div>
       </div>
 
-      {/* Navigation Tabs with Smooth Horizontal Scroll Buttons & Edge Fades */}
-      <div className="relative flex items-center border-b border-cream/10 bg-charcoal-deep/30 font-mono text-[11px] overflow-hidden">
+      {/* Navigation Tabs with Snap Scrolling, Edge Fade Masks, Disabled Boundary Arrows & More Menu (R-06) */}
+      <div className="relative flex items-center border-b border-cream/10 bg-charcoal-deep/30 font-mono text-[11px]">
         {/* Left Scroll Button */}
         <button
+          type="button"
+          disabled={!canScrollLeft}
           onClick={() => handleScrollTabs('left')}
-          className="p-2 text-cream-dim hover:text-cream hover:bg-charcoal/50 shrink-0 border-r border-cream/10"
+          className="p-2 text-cream-dim hover:text-cream hover:bg-charcoal/50 disabled:opacity-25 disabled:pointer-events-none shrink-0 border-r border-cream/10"
           title="Scroll tabs left"
+          aria-label="Scroll tabs left"
         >
           <ChevronLeft className="w-3.5 h-3.5" />
         </button>
 
-        {/* Tab row */}
+        {/* Tab row with snap alignment and edge fade mask */}
         <div
           ref={tabsContainerRef}
-          className="flex-1 flex overflow-x-auto whitespace-nowrap scroll-smooth py-0.5"
-          style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+          onScroll={updateTabScrollFlags}
+          role="tablist"
+          aria-label="Studio Inspector Tabs"
+          className="flex-1 flex overflow-x-auto whitespace-nowrap scroll-smooth snap-x snap-mandatory py-0.5"
+          style={{
+            scrollbarWidth: 'none',
+            msOverflowStyle: 'none',
+            maskImage:
+              canScrollLeft && canScrollRight
+                ? 'linear-gradient(to right, transparent 0%, black 14px, black calc(100% - 14px), transparent 100%)'
+                : canScrollRight
+                ? 'linear-gradient(to right, black calc(100% - 16px), transparent 100%)'
+                : canScrollLeft
+                ? 'linear-gradient(to right, transparent 0%, black 16px)'
+                : 'none',
+          }}
         >
           {TABS.map((tab) => (
             <button
               key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.id}
               onClick={() => setActiveTab(tab.id)}
-              className={`px-3 py-2 border-b-2 transition-colors whitespace-nowrap capitalize flex items-center space-x-1 shrink-0 ${
+              className={`snap-start px-3 py-2 border-b-2 transition-colors whitespace-nowrap capitalize flex items-center space-x-1 shrink-0 ${
                 activeTab === tab.id
                   ? 'border-sage text-cream bg-charcoal/40 font-semibold'
                   : 'border-transparent text-cream-dim hover:text-cream'
@@ -277,18 +326,60 @@ export default function AnalogLogPane({
               {tab.id === 'diff' && architectOutput && (
                 <span className="w-1.5 h-1.5 rounded-full bg-sage" />
               )}
+              {tab.id === 'safety' && safetyEvents.length > 0 && (
+                <span className="px-1 rounded-full bg-amber-500/20 text-amber-300 text-[9px]">
+                  {safetyEvents.length}
+                </span>
+              )}
             </button>
           ))}
         </div>
 
         {/* Right Scroll Button */}
         <button
+          type="button"
+          disabled={!canScrollRight}
           onClick={() => handleScrollTabs('right')}
-          className="p-2 text-cream-dim hover:text-cream hover:bg-charcoal/50 shrink-0 border-l border-cream/10"
+          className="p-2 text-cream-dim hover:text-cream hover:bg-charcoal/50 disabled:opacity-25 disabled:pointer-events-none shrink-0 border-l border-cream/10"
           title="Scroll tabs right"
+          aria-label="Scroll tabs right"
         >
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
+
+        {/* Overflow "More" Menu listing all tabs cleanly */}
+        <div className="relative shrink-0 border-l border-cream/10">
+          <button
+            type="button"
+            onClick={() => setMoreMenuOpen((v) => !v)}
+            className="px-2 py-2 text-[10px] text-cream-dim hover:text-cream hover:bg-charcoal/50"
+            title="All Tabs Menu"
+            aria-label="All Tabs Menu"
+            aria-expanded={moreMenuOpen}
+          >
+            •••
+          </button>
+          {moreMenuOpen && (
+            <div className="absolute right-0 top-full mt-1 w-40 rounded-xl bg-charcoal-deep border border-cream/20 shadow-2xl py-1 z-50">
+              {TABS.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setActiveTab(tab.id);
+                    setMoreMenuOpen(false);
+                  }}
+                  className={`w-full text-left px-3 py-1.5 text-[11px] flex items-center justify-between ${
+                    activeTab === tab.id ? 'bg-sage/20 text-cream font-bold' : 'text-cream-dim hover:text-cream hover:bg-charcoal/60'
+                  }`}
+                >
+                  <span>{tab.label}</span>
+                  {activeTab === tab.id && <Check className="w-3 h-3 text-sage" />}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Active Tab View */}
@@ -326,30 +417,40 @@ export default function AnalogLogPane({
               </div>
             </div>
 
-            {/* Live Collapsed Simulation Progress Bar */}
-            {activeJobStatus && activeJobStatus.status === 'running' && (
-              <div className="p-3 border-b border-cream/10 bg-charcoal-deep/80 font-mono space-y-1.5">
-                <div className="flex items-center justify-between text-[11px]">
-                  <span className="text-sage flex items-center space-x-1.5">
-                    <Activity className="w-3.5 h-3.5 animate-pulse" />
-                    <span>SIMULATION RUNNING</span>
-                  </span>
-                  <span className="text-cream font-bold">
-                    t={(activeJobStatus.elapsed ?? 0).toFixed(1)}s / {(currentSpec?.episodeLength ? currentSpec.episodeLength / 60 : 100).toFixed(1)}s ({activeJobStatus.progress}%)
-                  </span>
+            {/* Live Simulation Progress Bar — Reads strictly from single SimClock source of truth (R-01) */}
+            {(clockSnapshot || (activeJobStatus && activeJobStatus.status === 'running')) && (() => {
+              const epLen = clockSnapshot?.episodeLength ?? (currentSpec?.episodeLength ? currentSpec.episodeLength / 60 : 60);
+              const elapsed = clockSnapshot?.elapsed ?? activeJobStatus?.elapsed ?? 0;
+              const progress = clockSnapshot?.progress ?? clampProgress(elapsed, epLen);
+              const pctNum = Math.round(progress * 100);
+              const displayTime = clockSnapshot?.timeDisplay ?? formatClockDisplay(elapsed, epLen);
+              const episodeNo = clockSnapshot?.episodeNumber ?? activeJobStatus?.currentEpisode ?? 1;
+              const isPaused = clockSnapshot?.paused ?? false;
+              const statusDesc = runModeDescription || activeJobStatus?.message || 'Local fixed-step simulation';
+              return (
+                <div className="p-3 border-b border-cream/10 bg-charcoal-deep/80 font-mono space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-sage flex items-center space-x-1.5">
+                      <Activity className={`w-3.5 h-3.5 ${isPaused ? '' : 'animate-pulse'}`} />
+                      <span>{isPaused ? 'SIMULATION PAUSED' : 'SIMULATION RUNNING'}</span>
+                    </span>
+                    <span className="text-cream font-bold tabular-nums" data-testid="console-progress-text">
+                      {displayTime}
+                    </span>
+                  </div>
+                  <div className="w-full bg-charcoal rounded-full h-1.5 overflow-hidden">
+                    <div
+                      className="bg-sage h-full transition-all duration-150"
+                      style={{ width: `${pctNum}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between text-[10px] text-cream-dim">
+                    <span>Episode: {episodeNo}</span>
+                    <span className="truncate ml-2">{statusDesc}</span>
+                  </div>
                 </div>
-                <div className="w-full bg-charcoal rounded-full h-1.5 overflow-hidden">
-                  <div
-                    className="bg-sage h-full transition-all duration-300"
-                    style={{ width: `${activeJobStatus.progress}%` }}
-                  />
-                </div>
-                <div className="flex items-center justify-between text-[10px] text-cream-dim">
-                  <span>Episode: {activeJobStatus.currentEpisode ?? 1}</span>
-                  <span>{activeJobStatus.message}</span>
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* Scrollable Log Stream */}
             <div
@@ -673,7 +774,34 @@ export default function AnalogLogPane({
 
         {/* DATAGEN TAB */}
         {activeTab === 'datagen' && (
-          <div className="flex-1 p-3 overflow-y-auto select-text font-mono">
+          <div className="flex-1 p-3 overflow-y-auto select-text font-mono space-y-3">
+            {/* v2 Deterministic Run Dataset Exporter */}
+            <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-cream">Recorded Run Dataset Export (v2)</span>
+                <span className="text-[10px] text-sage">{chartHistory.length} samples</span>
+              </div>
+              <p className="text-[10px] text-cream-dim">
+                Export recorded fixed-step commands and telemetry frames for imitation learning or offline analysis.
+              </p>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={onExportDatasetJsonl}
+                  className="flex-1 py-1.5 px-2.5 rounded bg-sage text-cream text-[11px] font-bold hover:bg-sage/90"
+                >
+                  Download JSONL
+                </button>
+                <button
+                  type="button"
+                  onClick={onExportDatasetCsv}
+                  className="flex-1 py-1.5 px-2.5 rounded bg-charcoal border border-hairline text-cream text-[11px] hover:border-sage"
+                >
+                  Download CSV
+                </button>
+              </div>
+            </div>
+
             {architectOutput ? (
               <pre className="text-[11px] bg-charcoal-deep/80 p-2.5 rounded-lg border border-cream/10 overflow-x-auto whitespace-pre-wrap text-cream leading-relaxed">
                 {architectOutput.datagenCode}
@@ -681,8 +809,8 @@ export default function AnalogLogPane({
             ) : (
               <EmptyTabState
                 icon={FileCode}
-                title="No Datagen Script Active"
-                description="Synthetic data rollout scripts with domain randomization appear here."
+                title="No Architect Datagen Script Active"
+                description="Use the buttons above to export your live driving session, or open Task Prompt to generate custom randomization scripts."
                 actionLabel="Run Task Prompt [Ctrl+K]"
                 onAction={onOpenPrompt}
               />
@@ -745,6 +873,31 @@ export default function AnalogLogPane({
         {/* SAFETY TAB */}
         {activeTab === 'safety' && (
           <div className="flex-1 p-3 overflow-y-auto font-mono select-text space-y-3">
+            {/* Live Command Safety Layer Events (Phase W2.3 & W9.3) */}
+            <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-cream">Live Control Safety Layer</span>
+                <span className="text-[10px] text-sage">{safetyEvents.length} events</span>
+              </div>
+              {safetyEvents.length === 0 ? (
+                <div className="text-[10px] text-cream-dim">
+                  All commands within safe arena margin, traction, and tilt bounds.
+                </div>
+              ) : (
+                <div className="space-y-1 max-h-40 overflow-y-auto">
+                  {safetyEvents.slice(-12).reverse().map((ev, i) => (
+                    <div
+                      key={`${ev.step}-${i}`}
+                      className="p-1.5 rounded bg-charcoal/70 border border-amber-400/20 text-[10px] flex items-start justify-between gap-2"
+                    >
+                      <span className="text-amber-300 shrink-0">t={ev.time.toFixed(1)}s</span>
+                      <span className="text-cream flex-1">{ev.message}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {architectOutput ? (
               <>
                 <div
@@ -848,7 +1001,7 @@ export default function AnalogLogPane({
         {/* METRICS TAB */}
         {activeTab === 'metrics' && (
           <div className="flex-1 p-3 overflow-y-auto font-mono space-y-3">
-            <MetricsTabContent onOpenPrompt={onOpenPrompt} />
+            <MetricsTabContent onOpenPrompt={onOpenPrompt} chartHistory={chartHistory} />
           </div>
         )}
       </div>
@@ -885,7 +1038,13 @@ export default function AnalogLogPane({
   );
 }
 
-function MetricsTabContent({ onOpenPrompt }: { onOpenPrompt?: () => void }) {
+function MetricsTabContent({
+  onOpenPrompt,
+  chartHistory = [],
+}: {
+  onOpenPrompt?: () => void;
+  chartHistory?: readonly TelemetryChartSample[];
+}) {
   const [snapshot, setSnapshot] = useState(() => TelemetryStore.getInstance().getSnapshot());
   const [history, setHistory] = useState(() => TelemetryStore.getInstance().getHistory().slice(-60));
 
@@ -898,26 +1057,26 @@ function MetricsTabContent({ onOpenPrompt }: { onOpenPrompt?: () => void }) {
   }, []);
 
   const currentFrame = snapshot.currentFrame;
-  if (!currentFrame || history.length === 0) {
+  const recentChart = chartHistory.slice(-80);
+  if ((!currentFrame || history.length === 0) && recentChart.length === 0) {
     return (
       <EmptyTabState
         icon={Activity}
-        title="Reward & Collision Curves"
-        description="Awaiting telemetry stream frames. Curves and reward distributions will render in real time."
+        title="Reward & Telemetry Curves"
+        description="Awaiting simulation telemetry frames. Commanded vs actual speed, slip, tilt, and reward curves will render in real time."
         actionLabel="Run Task Prompt [Ctrl+K]"
         onAction={onOpenPrompt}
       />
     );
   }
 
-  // Calculate sparkline points
-  const rewards = history.map((f) => f.reward || 0);
+  const rewards = recentChart.length > 1 ? recentChart.map((c) => c.reward) : history.map((f) => f.reward || 0);
   const minR = Math.min(...rewards, 0);
   const maxR = Math.max(...rewards, 2.5);
   const rangeR = Math.max(0.1, maxR - minR);
 
   const svgWidth = 320;
-  const svgHeight = 70;
+  const svgHeight = 64;
   const points = rewards
     .map((r, i) => {
       const x = (i / Math.max(1, rewards.length - 1)) * svgWidth;
@@ -926,14 +1085,54 @@ function MetricsTabContent({ onOpenPrompt }: { onOpenPrompt?: () => void }) {
     })
     .join(' ');
 
+  const speedPoints = recentChart
+    .map((c, i) => {
+      const x = (i / Math.max(1, recentChart.length - 1)) * svgWidth;
+      const y = svgHeight - (Math.min(2.5, c.speed) / 2.5) * (svgHeight - 10) - 5;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+  const cmdPoints = recentChart
+    .map((c, i) => {
+      const x = (i / Math.max(1, recentChart.length - 1)) * svgWidth;
+      const y = svgHeight - (Math.min(2.5, c.cmdSpeed) / 2.5) * (svgHeight - 10) - 5;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+
+  const latestSample = recentChart[recentChart.length - 1];
+
   return (
     <div className="space-y-3 text-xs">
-      {/* Live Reward Curve */}
+      {/* Commanded vs Actual Speed (Measured) */}
+      {recentChart.length > 1 && latestSample && (
+        <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="font-bold text-cream">Speed vs Command (m/s · Measured)</span>
+            <span className="text-sage font-bold tabular-nums">
+              {latestSample.speed.toFixed(2)} / {latestSample.cmdSpeed.toFixed(2)} m/s
+            </span>
+          </div>
+          <div className="h-16 w-full bg-charcoal rounded overflow-hidden">
+            <svg className="w-full h-full" viewBox={`0 0 ${svgWidth} ${svgHeight}`} preserveAspectRatio="none">
+              <polyline fill="none" stroke="rgba(253,251,247,0.35)" strokeDasharray="3,3" strokeWidth="1.5" points={cmdPoints} />
+              <polyline fill="none" stroke="#8EA48C" strokeWidth="2" points={speedPoints} />
+            </svg>
+          </div>
+          <div className="grid grid-cols-3 gap-1.5 text-[10px] text-cream-dim tabular-nums">
+            <div>Slip: <span className="text-cream font-semibold">{latestSample.slip.toFixed(1)} mm</span></div>
+            <div>Tilt: <span className="text-cream font-semibold">{latestSample.tiltDeg.toFixed(1)}°</span></div>
+            <div>Energy: <span className="text-cream font-semibold">{latestSample.energy.toFixed(1)} J</span></div>
+          </div>
+        </div>
+      )}
+
+      {/* Live Reward Curve (Derived) */}
       <div className="p-3 rounded-lg bg-charcoal-deep/80 border border-cream/10 space-y-2">
         <div className="flex items-center justify-between">
-          <span className="font-bold text-cream">Step Reward (Rolling 60 frames)</span>
-          <span className="text-sage font-bold text-sm">
-            {(currentFrame.reward ?? 0).toFixed(3)}
+          <span className="font-bold text-cream">Step Reward (Derived)</span>
+          <span className="text-sage font-bold text-sm tabular-nums">
+            {(latestSample?.reward ?? currentFrame?.reward ?? 0).toFixed(3)}
           </span>
         </div>
         <div className="h-16 w-full bg-charcoal rounded overflow-hidden flex items-end">
@@ -953,7 +1152,7 @@ function MetricsTabContent({ onOpenPrompt }: { onOpenPrompt?: () => void }) {
         <div className="p-2.5 rounded bg-charcoal-deep/80 border border-cream/10">
           <div className="text-[10px] text-cream-dim">Stability Margin</div>
           <div className="text-sm font-bold text-cream">
-            {(((currentFrame.bodyHeightAboveGround ?? 0.44) / 0.44) * 100).toFixed(0)}%
+            {(((currentFrame?.bodyHeightAboveGround ?? 0.385) / 0.44) * 100).toFixed(0)}%
           </div>
         </div>
         <div className="p-2.5 rounded bg-charcoal-deep/80 border border-cream/10">

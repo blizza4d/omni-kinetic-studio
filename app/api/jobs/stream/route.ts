@@ -3,6 +3,7 @@ import { LocalSimulationRunner } from '@/lib/telemetry/local_runner';
 import { JobStatus, TelemetryBatch } from '@/contracts';
 import { jobStore } from '@/lib/cloud/job_store';
 import { generateDeterministicEnvironmentSpec } from '@/lib/nebius/prompts';
+import { describeRunMode, normalizeRunMode, formatRunStatusMessage } from '@/lib/sim/runMode';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -66,7 +67,7 @@ export async function GET(req: NextRequest) {
         successRate: 0.98,
         message: isCloud
           ? 'Provisioning NVIDIA L40S container on Nebius Serverless Jobs (~00:04)...'
-          : 'Authoritative local physics engine active [DEMO: LOCAL RUNNER]',
+          : describeRunMode(normalizeRunMode(mode)).consolePrefix,
         timestamp: Date.now(),
       };
       sendSSE('status', initialStatus);
@@ -145,8 +146,8 @@ export async function GET(req: NextRequest) {
             collisionCount: lastFrame?.collisions.length ?? 0,
             successRate: 0.98,
             message: isCloud
-              ? `Headless simulation streaming from Nebius L40S node [CLOUD: eu-north1]`
-              : `Local physics streaming t=${lastFrame?.t.toFixed(1)}s [DEMO: LOCAL RUNNER]`,
+              ? `Cloud physics stream (Nebius L40S) · eu-north1`
+              : formatRunStatusMessage(normalizeRunMode(mode), lastFrame?.t ?? 0),
             timestamp: Date.now(),
           });
         }
