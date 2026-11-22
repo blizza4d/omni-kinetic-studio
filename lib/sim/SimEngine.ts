@@ -17,6 +17,8 @@ import { TerrainService } from '../world/terrain/service';
 import { generateDebrisField, DebrisInstance } from '../world/debris';
 import { evaluateBoundary, DEFAULT_ARENA } from '../world/bounds';
 import { SimClock, SimClockSnapshot, EpisodeEndBehavior } from './SimClock';
+import { EpisodeManager, EpisodeConfig, Episode, EpisodePhase } from './EpisodeManager';
+import { createEpisodeAbortController } from './guard';
 import { GaitController, GaitControllerSnapshot } from '../droid/gait/GaitController';
 import { DroidKinematicState, STANDING_HEIGHT } from '../droid/types';
 import { ControlArbiter } from '../control/arbiter';
@@ -161,6 +163,8 @@ export class SimEngine {
   // Callbacks
   private onEpisodeComplete?: (missionSnap: MissionProgressSnapshot, replay: ReplayFile) => void;
   private onFrameCallback?: (frame: TelemetryFrame) => void;
+  private episodeManager: EpisodeManager;
+  private currentEpisodeAbort: AbortController = new AbortController();
 
   constructor(
     registry: ShortcutRegistry,
@@ -201,6 +205,41 @@ export class SimEngine {
       this.scenario.startHeading,
       (x, z) => this.terrain.heightAt(x, z)
     );
+
+    this.episodeManager = new EpisodeManager((cfg: EpisodeConfig, id: number): Episode => {
+      this.currentEpisodeAbort.abort('superseded');
+      this.currentEpisodeAbort = new AbortController();
+      const signal = this.currentEpisodeAbort.signal;
+      let phase: EpisodePhase = 'running';
+
+      return {
+        id,
+        config: cfg,
+        signal,
+        step: (dt: number) => {
+          this.executeFixedStep(this.clock.getStep(), dt);
+        },
+        getPhase: () => (this.clock.isEnded() ? 'ended' : this.clock.isPaused() ? 'paused' : phase),
+        setPhase: (p: EpisodePhase) => {
+          phase = p;
+          if (p === 'paused') this.clock.setPaused(true);
+          else if (p === 'running') {
+            if (this.clock.isEnded()) {
+              this.clock.reset(false);
+            }
+            this.clock.setPaused(false);
+          } else if (p === 'ended') {
+            this.clock.seekToStep(Math.round(this.clock.getEpisodeLength() * 60));
+          }
+        },
+        submitCommand: (cmd: LocomotionCommand) => {
+          Object.assign(this._manualCmd, cmd);
+        },
+        dispose: () => {
+          this.currentEpisodeAbort.abort('disposed');
+        },
+      };
+    });
 
     this.onEpisodeComplete = options?.onEpisodeComplete;
     this.onFrameCallback = options?.onFrame;
@@ -248,6 +287,14 @@ export class SimEngine {
 
   public getSafetyEvents(): readonly SafetyEvent[] {
     return this.shaper.getSafetyEvents();
+  }
+
+  public getLatestKinematic(): DroidKinematicState | null {
+    return this.latestKinematic;
+  }
+
+  public getEpisodeManager(): EpisodeManager {
+    return this.episodeManager;
   }
 
   public getInputVisualizer(): InputVisualizerSnapshot {
@@ -339,8 +386,8 @@ export class SimEngine {
 
   public resetEpisode(incrementEpisode = false): void {
     this.replayCursor = null;
-    this.arbiter.setReplayActive(false);
-    this.arbiter.clearEmergencyStop();
+    this.inputs.onEpisodeStart();
+    this.arbiter.reset();
     this.shaper.reset();
     this.shaper.clearSafetyEvents();
     this.clock.reset(incrementEpisode);
@@ -377,6 +424,19 @@ export class SimEngine {
     });
 
     this.latestMissionSnap = this.missionRuntime.snapshot(sx, sz, sh);
+
+    this.episodeManager.start({
+      seed: this.scenario.seed,
+      scenarioId: this.scenario.name,
+      episodeLength: this.scenario.episodeLength,
+      gravity: this.scenario.gravity,
+      missionId: this.scenario.missionId,
+      roughness: this.scenario.roughness,
+      craterCount: this.scenario.craterCount,
+      rockCount: this.scenario.rockCount,
+      startPos: this.scenario.startPos,
+      startHeading: this.scenario.startHeading,
+    });
   }
 
   // --- REPLAY & GHOST CONTROLS (Phase W6) ---
@@ -478,6 +538,7 @@ export class SimEngine {
       (stepIndex, dt) => this.executeFixedStep(stepIndex, dt),
       (behavior: EpisodeEndBehavior) => {
         if (behavior === 'stop') {
+          this.episodeManager.end();
           this.onEpisodeComplete?.(this.latestMissionSnap, this.recorder.exportReplay());
         } else if (behavior === 'loop' || behavior === 'auto-restart') {
           const sampler = (x: number, z: number) => this.terrain.heightAt(x, z);

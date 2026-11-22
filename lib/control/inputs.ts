@@ -235,6 +235,31 @@ export class InputManager {
     this.touch.hopHeld = false;
   }
 
+  /**
+   * Resets all derived and volatile input states on episode boundary (Phase E3.1).
+   * App-scoped settings and key bindings are preserved.
+   */
+  public onEpisodeStart(): void {
+    this.releaseAllKeys();
+    this.pendingStop = false;
+    this.pendingHopLaunch = false;
+    this.pendingHopCharge = 0;
+    this.clearWaypoints();
+    this.pointerDrive.active = false;
+    this.cvActive = false;
+    this.cvRawVx = 0;
+    this.cvRawYaw = 0;
+    this.cvVxFilter.reset();
+    this.cvYawFilter.reset();
+    this.lastInputTimestampMs = 0;
+    this.lastActiveManualSource = 'keyboard';
+    this.gaitOverride = 'auto';
+  }
+
+  public clearEmergencyStop(): void {
+    this.pendingStop = false;
+  }
+
   public handleKeyDown(e: {
     code: string;
     key: string;
@@ -260,6 +285,7 @@ export class InputManager {
       return;
     }
     if (e.code === 'Escape') {
+      this.pendingStop = true;
       if (this.waypoints.length > 0) {
         this.clearWaypoints();
         this.onToast?.('Waypoints cleared.', 'info');
@@ -283,6 +309,7 @@ export class InputManager {
         'open_shortcuts',
         'focus_log_filter',
         'capture_screenshot',
+        'restart_episode',
         'toggle_editor',
         'camera_frame',
         'camera_follow',

@@ -364,11 +364,20 @@ export function EpisodeResultsModal({
             <div className="flex items-center space-x-1.5">
               <button
                 type="button"
+                onClick={onClose}
+                className="px-2.5 py-1.5 rounded-lg bg-charcoal border border-hairline text-cream-dim hover:text-cream text-[11px]"
+                title="Dismiss dialog and continue watching current scene"
+              >
+                Keep Watching
+              </button>
+              <button
+                type="button"
                 onClick={() => { onRetry(); onClose(); }}
                 className="flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-charcoal border border-hairline text-cream hover:border-cream/40 text-[11px]"
+                title="Restart episode [R]"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Retry</span>
+                <span>Restart [R]</span>
               </button>
               <button
                 type="button"

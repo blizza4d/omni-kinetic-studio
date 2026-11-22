@@ -141,6 +141,7 @@ export class SimClock {
     this.elapsed = 0;
     this.accumulator = 0;
     this.ended = false;
+    this.paused = false;
     if (incrementEpisode) {
       this.episodeNumber++;
     }

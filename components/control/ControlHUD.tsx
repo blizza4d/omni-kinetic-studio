@@ -60,6 +60,7 @@ interface ControlHUDProps {
   onEmergencyStop: () => void;
   onGaitOverride: (gait: GaitMode) => void;
   onCameraMode: (mode: CameraMode) => void;
+  onFrameCamera?: () => void;
   onTogglePip: () => void;
   onToggleSensor: (key: keyof SensorOverlayFlags) => void;
   onToggleLegend: () => void;
@@ -119,6 +120,7 @@ export default function ControlHUD({
   onEmergencyStop,
   onGaitOverride,
   onCameraMode,
+  onFrameCamera,
   onTogglePip,
   onToggleSensor,
   onToggleLegend,
@@ -505,6 +507,16 @@ export default function ControlHUD({
                 {label}
               </button>
             ))}
+            {onFrameCamera && (
+              <button
+                type="button"
+                onClick={onFrameCamera}
+                title="Reset camera framing onto droid [F]"
+                className="px-1.5 py-0.5 rounded text-[9px] border bg-charcoal/50 border-hairline text-cream-dim hover:text-cream transition-colors"
+              >
+                Frame [F]
+              </button>
+            )}
             <button
               type="button"
               onClick={onTogglePip}
@@ -526,12 +538,12 @@ export default function ControlHUD({
               <span>
                 {visualizer.gamepadConnected
                   ? 'L-Stick Move · R-Stick Turn · RT Sprint · A Hop · B Stop'
-                  : 'WASD Drive · Shift Bound · Space Hop · C/V Height · Click Waypoint'}
+                  : 'WASD / ↑↓←→ Drive · Shift Faster · X / Esc Stop · F Frame · Click Waypoint'}
               </span>
               <button
                 type="button"
                 onClick={onToggleLegend}
-                title="Hide legend [H]"
+                title="Dismiss legend [H]"
                 className="ml-1 text-cream-dim hover:text-cream"
               >
                 <X className="w-3 h-3" />

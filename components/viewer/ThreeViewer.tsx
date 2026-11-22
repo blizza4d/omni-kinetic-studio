@@ -525,7 +525,7 @@ export default function ThreeViewer({
     let lastEdgeWarnMs = 0;
     let animId = 0;
 
-    // Debug accessor for Playwright & automated trace verification
+    // Debug accessor for Playwright & automated trace verification (Phase E0.3)
     if (typeof window !== 'undefined') {
       (window as any).__omniDebug = {
         getEngine: () => engineRef.current,
@@ -533,7 +533,71 @@ export default function ThreeViewer({
         getState: () => ({ ...renderState }),
         getLatencyMs: () => engineRef.current.getLastInputLatencyMs(),
         runScript: (steps: any[]) => engineRef.current.runScript(steps),
-        setCameraMode: (m: CameraMode) => { cameraModeRef.current = m; },
+        setCameraMode: (m: CameraMode) => {
+          cameraModeRef.current = m;
+        },
+        getEpisodeInfo: () => {
+          const eng = engineRef.current;
+          const clk = eng.getClockSnapshot();
+          const arb = eng.getArbiterSnapshot();
+          const viz = eng.getInputVisualizer();
+          const kin = eng.getLatestKinematic();
+          return {
+            episodeId: clk.episodeNumber,
+            phase: clk.ended ? 'ended' : clk.paused ? 'paused' : 'running',
+            t: clk.elapsed,
+            progress: clk.progress,
+            controlMode: arb.isManual ? 'manual' : 'autonomous',
+            activeSource: arb.activeSource,
+            stopLatch: arb.emergencyStop,
+            heldKeys: [...viz.keysHeld],
+            droid: {
+              id: `droid-${clk.episodeNumber}`,
+              position: {
+                x: renderState.pos[0],
+                y: renderState.pos[1],
+                z: renderState.pos[2],
+              },
+              isSleeping: false,
+            },
+            listenersCount: 1,
+            loopsCount: 1,
+            meshCount: robotGroup.children.length,
+          };
+        },
+        finishEpisode: () => {
+          const eng = engineRef.current;
+          eng.clock.seekToStep(Math.round(eng.clock.getEpisodeLength() * 60));
+          eng.tick(1 / 60);
+        },
+        restartEpisode: () => {
+          const eng = engineRef.current;
+          eng.resetEpisode(true);
+          document.getElementById('viewport-container')?.focus({ preventScroll: true });
+        },
+        sendKeys: (keys: string[], ms = 100) => {
+          if (typeof window === 'undefined') return;
+          for (const k of keys) {
+            window.dispatchEvent(
+              new KeyboardEvent('keydown', {
+                code: k,
+                key: k.replace(/^Key/, '').toLowerCase(),
+                bubbles: true,
+              })
+            );
+          }
+          setTimeout(() => {
+            for (const k of keys) {
+              window.dispatchEvent(
+                new KeyboardEvent('keyup', {
+                  code: k,
+                  key: k.replace(/^Key/, '').toLowerCase(),
+                  bubbles: true,
+                })
+              );
+            }
+          }, ms);
+        },
       };
     }
 
@@ -676,12 +740,12 @@ export default function ThreeViewer({
         for (const m of activeMarkers) {
           if (doneIds.includes(m.id)) continue;
           const gy = field.sampleHeight(m.x, m.z);
-          const beacon = buildTerrainBeacon(m.x, gy, m.z, m.radius * 0.5, objColor, m.kind === 'trench' ? 1.8 : 2.6);
+          const beacon = buildTerrainBeacon(m.x, gy, m.z, m.radius * 0.5, objColor, m.kind === 'trench' ? 1.8 : 2.6, m.label);
           markerGroup.add(beacon);
         }
         for (const wp of wps) {
           const gy = field.sampleHeight(wp.x, wp.z);
-          const wpBeacon = buildTerrainBeacon(wp.x, gy, wp.z, 0.42, wp.reachable === false ? 0xb83b2f : wpColor, 1.5);
+          const wpBeacon = buildTerrainBeacon(wp.x, gy, wp.z, 0.42, wp.reachable === false ? 0xb83b2f : wpColor, 1.5, wp.label);
           markerGroup.add(wpBeacon);
         }
       }
@@ -784,7 +848,11 @@ export default function ThreeViewer({
         !isLeftDragging &&
         nowSec - orbitAnglesRef.current.lastDragSec > 3.0
       ) {
-        orbitAnglesRef.current.offsetYaw *= Math.exp(-2.2 * dt);
+        if (reducedMotionRef.current) {
+          orbitAnglesRef.current.offsetYaw = 0;
+        } else {
+          orbitAnglesRef.current.offsetYaw *= Math.exp(-2.2 * dt);
+        }
       }
 
       // Apply gamepad right-stick pitch delta smoothly
@@ -908,8 +976,8 @@ export default function ThreeViewer({
         renderer.setScissorTest(false);
       }
 
-      // 13. Throttled Radar & HUD Sync (12 Hz — zero per-frame React state churn!)
-      if (now - lastRadarSyncMs > 85) {
+      // 13. Throttled Radar & HUD Sync (10 Hz — zero per-frame React state churn!)
+      if (now - lastRadarSyncMs > 100) {
         lastRadarSyncMs = now;
         setRadarState({
           pos: [sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]],
@@ -971,7 +1039,11 @@ export default function ThreeViewer({
   }, [qualityTier]);
 
   return (
-    <div className="relative w-full h-full overflow-hidden select-none bg-charcoal">
+    <div
+      id="viewport-container"
+      tabIndex={-1}
+      className="relative w-full h-full overflow-hidden select-none bg-charcoal outline-none focus:outline-none"
+    >
       <div
         ref={mountRef}
         className={`w-full h-full ${editorTool !== 'none' ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'}`}
@@ -1210,11 +1282,13 @@ function buildTerrainBeacon(
   z: number,
   radius: number,
   colorHex: number,
-  beamHeight: number
+  beamHeight: number,
+  label?: string
 ): THREE.Group {
   const g = new THREE.Group();
   g.position.set(x, groundY + 0.02, z);
 
+  // Outer Ground Landing Ring
   const ringGeo = new THREE.TorusGeometry(radius, 0.032, 8, 32);
   ringGeo.rotateX(-Math.PI / 2);
   const ringMat = new THREE.MeshBasicMaterial({
@@ -1225,7 +1299,31 @@ function buildTerrainBeacon(
   });
   g.add(new THREE.Mesh(ringGeo, ringMat));
 
-  const beamGeo = new THREE.CylinderGeometry(radius * 0.55, radius * 0.85, beamHeight, 16, 1, true);
+  // Inner Concentric Target Ring
+  const innerRingGeo = new THREE.TorusGeometry(radius * 0.45, 0.022, 8, 24);
+  innerRingGeo.rotateX(-Math.PI / 2);
+  const innerRingMat = new THREE.MeshBasicMaterial({
+    color: 0xfdfbf7,
+    transparent: true,
+    opacity: 0.65,
+    depthWrite: false,
+  });
+  g.add(new THREE.Mesh(innerRingGeo, innerRingMat));
+
+  // Central Vertical Core Beam
+  const coreGeo = new THREE.CylinderGeometry(0.025, 0.025, beamHeight, 8);
+  const coreMat = new THREE.MeshBasicMaterial({
+    color: 0xfdfbf7,
+    transparent: true,
+    opacity: 0.8,
+    depthWrite: false,
+  });
+  const core = new THREE.Mesh(coreGeo, coreMat);
+  core.position.y = beamHeight * 0.5;
+  g.add(core);
+
+  // Holographic Light Shaft
+  const beamGeo = new THREE.CylinderGeometry(radius * 0.45, radius * 0.85, beamHeight, 16, 1, true);
   const beamMat = new THREE.MeshBasicMaterial({
     color: colorHex,
     transparent: true,
@@ -1236,6 +1334,51 @@ function buildTerrainBeacon(
   const beam = new THREE.Mesh(beamGeo, beamMat);
   beam.position.y = beamHeight * 0.5;
   g.add(beam);
+
+  // Floating Diamond Head at Top
+  const headGeo = new THREE.OctahedronGeometry(radius * 0.28, 0);
+  const headMat = new THREE.MeshBasicMaterial({
+    color: colorHex,
+    wireframe: false,
+  });
+  const head = new THREE.Mesh(headGeo, headMat);
+  head.position.y = beamHeight + radius * 0.28;
+  g.add(head);
+
+  // Optional Canvas Sprite Label
+  if (label && typeof document !== 'undefined') {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = 'rgba(26, 26, 24, 0.82)';
+      ctx.strokeStyle = `#${colorHex.toString(16).padStart(6, '0')}`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      if ((ctx as any).roundRect) {
+        (ctx as any).roundRect(4, 4, 248, 56, 10);
+      } else {
+        ctx.rect(4, 4, 248, 56);
+      }
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#FDFBF7';
+      ctx.font = 'bold 22px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, 128, 32);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.minFilter = THREE.LinearFilter;
+      const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false, transparent: true });
+      const sprite = new THREE.Sprite(spriteMat);
+      sprite.position.y = beamHeight + radius * 0.28 + 0.35;
+      sprite.scale.set(1.4, 0.35, 1);
+      g.add(sprite);
+    }
+  }
 
   return g;
 }

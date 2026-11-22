@@ -276,6 +276,14 @@ export default function Shell() {
     setUiTick((t) => (t + 1) & 0x3fffffff);
   }, []);
 
+  const restoreViewportFocus = useCallback(() => {
+    if (typeof document === 'undefined') return;
+    const vp = document.getElementById('viewport-container');
+    if (vp) {
+      vp.focus({ preventScroll: true });
+    }
+  }, []);
+
   // Load persisted settings, mission scores, coach state, URL params, and #s= share hash on mount
   useEffect(() => {
     const loaded = loadStudioSettings();
@@ -453,6 +461,14 @@ export default function Shell() {
       }
       case 'capture_screenshot':
         void handleScreenshot();
+        break;
+      case 'restart_episode':
+        setIsResultsOpen(false);
+        setIsPauseMenuOpen(false);
+        engine.resetEpisode(false);
+        restoreViewportFocus();
+        handleUiSync();
+        showToast('Episode restarted [R]', 'info');
         break;
       case 'toggle_editor':
         setIsEditorOpen((p) => {
@@ -1065,6 +1081,7 @@ export default function Shell() {
               onEmergencyStop={() => actionHandlerRef.current('emergency_stop')}
               onGaitOverride={(g: GaitMode) => { engine.inputs.setGaitOverride(g); handleUiSync(); }}
               onCameraMode={(m) => setCameraMode(m)}
+              onFrameCamera={() => actionHandlerRef.current('camera_frame')}
               onTogglePip={() =>
                 updateSettings({ ...settings, camera: { ...settings.camera, pipEnabled: !settings.camera.pipEnabled } })
               }
@@ -1185,6 +1202,17 @@ export default function Shell() {
                 </button>
               ))}
             </div>
+
+            {/* Screenshot Capture Button (Task 9) */}
+            <button
+              type="button"
+              onClick={() => void handleScreenshot()}
+              className="p-1 rounded hover:bg-charcoal text-cream-dim hover:text-cream ml-0.5 border border-cream/10"
+              title="Capture Screenshot (F12)"
+              aria-label="Capture Screenshot"
+            >
+              <Camera className="w-3.5 h-3.5" />
+            </button>
           </div>
         </main>
       </div>
@@ -1210,25 +1238,34 @@ export default function Shell() {
         progress={lastMissionResult || missionSnap}
         speedHistory={chartHistory.map((c) => c.speed)}
         onReplay={() => {
+          setIsResultsOpen(false);
           const rep = lastReplayRef.current || engine.recorder.exportReplay();
           engine.setGhostReplay(rep);
           engine.startReplay(rep);
+          restoreViewportFocus();
           handleUiSync();
         }}
         onRetry={() => {
+          setIsResultsOpen(false);
           engine.resetEpisode(true);
+          restoreViewportFocus();
           handleUiSync();
         }}
         onNextMission={() => {
+          setIsResultsOpen(false);
           const idx = BUILT_IN_MISSIONS.findIndex((m) => m.id === activeMission.id);
           const nextM = BUILT_IN_MISSIONS[(idx + 1) % BUILT_IN_MISSIONS.length];
           engine.loadMission(nextM.id);
           setTerrainVersion(engine.terrain.getVersion());
+          restoreViewportFocus();
           handleUiSync();
         }}
         onExportReplay={handleExportReplay}
         onShareScenario={handleShareScenario}
-        onClose={() => setIsResultsOpen(false)}
+        onClose={() => {
+          setIsResultsOpen(false);
+          restoreViewportFocus();
+        }}
       />
 
       <ScenarioEditorDrawer
@@ -1318,11 +1355,16 @@ export default function Shell() {
         isOpen={isPauseMenuOpen}
         onResume={() => {
           setIsPauseMenuOpen(false);
+          engine.arbiter.clearEmergencyStop();
+          engine.inputs.clearEmergencyStop();
           engine.clock.setPaused(false);
+          restoreViewportFocus();
           handleUiSync();
         }}
         onRestart={() => {
+          setIsPauseMenuOpen(false);
           engine.resetEpisode(true);
+          restoreViewportFocus();
           handleUiSync();
         }}
         onOpenMissions={() => setIsMissionsOpen(true)}

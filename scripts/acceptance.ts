@@ -166,6 +166,74 @@ check('AC-10', 'Persistence handles QuotaExceededError without crashing', () => 
   return 'QuotaExceededError caught cleanly with graceful warning.';
 });
 
+// 11. Multi-Episode Drive Test (Phase E5.1)
+check('AC-11', 'Multi-episode drive test: controls work in episodes 1 through 5', () => {
+  const eng = new SimEngine(new ShortcutRegistry(), { scenario: { episodeLength: 3.0, seed: 101 } });
+  const dists: number[] = [];
+  for (let ep = 1; ep <= 5; ep++) {
+    eng.inputs.handleKeyDown({ code: 'KeyW', key: 'w' });
+    const p0 = eng.gait.getSnapshot();
+    for (let s = 0; s < 30; s++) eng.tick(1 / 60);
+    const p1 = eng.gait.getSnapshot();
+    const d = Math.hypot(p1.posX - p0.posX, p1.posZ - p0.posZ);
+    dists.push(Number(d.toFixed(3)));
+    if (d < 0.3) throw new Error(`Episode ${ep} droid failed to drive (dist=${d.toFixed(3)}m)`);
+    eng.inputs.handleKeyUp({ code: 'KeyW' });
+    for (let s = 0; s < 180; s++) eng.tick(1 / 60);
+    eng.resetEpisode(true);
+  }
+  return `Episodes 1..5 driving distance: [${dists.join(', ')}]m under KeyW.`;
+});
+
+// 12. Golden Gait Kinematics Invariant (Phase E0.2)
+check('AC-12', 'Golden gait trace kinematics match baseline within 1e-6 error', () => {
+  const goldenPath = path.resolve(process.cwd(), 'test/golden/gait-before.json');
+  if (!fs.existsSync(goldenPath)) throw new Error('Golden trace file missing');
+  const raw = JSON.parse(fs.readFileSync(goldenPath, 'utf8'));
+  const eng = new SimEngine(new ShortcutRegistry(), {
+    scenario: { seed: 42, gravity: raw.gravity, episodeLength: 16.7, startPos: [0, 0], startHeading: 0 },
+  });
+  let maxPosErr = 0;
+  for (let s = 0; s < Math.min(100, raw.steps.length); s++) {
+    const gold = raw.steps[s];
+    const actual = eng.executeFixedStep(s, 1 / 60);
+    for (let i = 0; i < 3; i++) {
+      const posErr = Math.abs(actual.bodyPos[i] - gold.bodyPos[i]);
+      if (posErr > maxPosErr) maxPosErr = posErr;
+    }
+  }
+  if (maxPosErr >= 1e-6) throw new Error(`Golden gait divergence: ${maxPosErr.toExponential(3)}`);
+  return `Golden trace max error=${maxPosErr.toExponential(3)} (< 1.000e-6 tolerance).`;
+});
+
+// 13. Emergency Stop Latch & Paused Flag Reset (Phase E3.2)
+check('AC-13', 'Emergency stop and paused state cleared deterministically on restart', () => {
+  const eng = new SimEngine(new ShortcutRegistry(), { scenario: { episodeLength: 3.0 } });
+  eng.arbiter.triggerEmergencyStop();
+  eng.clock.setPaused(true);
+  eng.resetEpisode(true);
+  if (eng.getArbiterSnapshot().emergencyStop) throw new Error('Emergency stop latch persisted');
+  if (eng.clock.isPaused()) throw new Error('Paused flag persisted');
+  const stepRes = eng.tick(1 / 60);
+  if (stepRes.stepsExecuted === 0) throw new Error('Simulation failed to tick after reset');
+  return 'emergencyStop=false, paused=false, stepsExecuted=1 confirmed.';
+});
+
+// 14. EpisodeManager Two-Lifetime Architecture (Phase E2)
+check('AC-14', 'EpisodeManager lifecycle transitions and two-lifetime separation', () => {
+  const eng = new SimEngine(new ShortcutRegistry(), { scenario: { episodeLength: 5.0, seed: 999 } });
+  const mgr = eng.getEpisodeManager();
+  if (!mgr.episode) throw new Error('No active episode');
+  if (mgr.episode.getPhase() !== 'running') throw new Error(`Phase mismatch: ${mgr.episode.getPhase()}`);
+  mgr.end();
+  if (mgr.episode.getPhase() !== 'ended') throw new Error('Episode failed to transition to ended');
+  const ep2 = mgr.restart();
+  if (ep2.getPhase() !== 'running') throw new Error('Restarted episode not running');
+  mgr.disposeAll();
+  if (mgr.episode !== null) throw new Error('disposeAll failed to clear episode');
+  return 'running -> ended -> restart(running) -> disposeAll verified.';
+});
+
 // Print Matrix
 let failed = 0;
 console.log('\n=== OMNI-KINETIC STUDIO v2 ACCEPTANCE MATRIX ===\n');

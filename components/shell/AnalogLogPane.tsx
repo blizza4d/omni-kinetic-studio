@@ -313,6 +313,19 @@ export default function AnalogLogPane({
               role="tab"
               aria-selected={activeTab === tab.id}
               onClick={() => setActiveTab(tab.id)}
+              onKeyDown={(e) => {
+                if (e.key === 'ArrowRight') {
+                  e.preventDefault();
+                  const idx = TABS.findIndex((t) => t.id === tab.id);
+                  const nextTab = TABS[(idx + 1) % TABS.length];
+                  setActiveTab(nextTab.id);
+                } else if (e.key === 'ArrowLeft') {
+                  e.preventDefault();
+                  const idx = TABS.findIndex((t) => t.id === tab.id);
+                  const prevTab = TABS[(idx - 1 + TABS.length) % TABS.length];
+                  setActiveTab(prevTab.id);
+                }
+              }}
               className={`snap-start px-3 py-2 border-b-2 transition-colors whitespace-nowrap capitalize flex items-center space-x-1 shrink-0 ${
                 activeTab === tab.id
                   ? 'border-sage text-cream bg-charcoal/40 font-semibold'

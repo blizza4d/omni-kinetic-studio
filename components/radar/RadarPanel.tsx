@@ -24,13 +24,13 @@ interface RadarPanelProps {
 }
 
 const SIZE_PX: Record<RadarSize, number> = {
-  small: 148,
+  small: 152,
   medium: 208,
   large: 268,
 };
 
 export default function RadarPanel({
-  size,
+  size = 'medium',
   onSizeChange,
   field,
   terrainVersion,
@@ -48,7 +48,7 @@ export default function RadarPanel({
   const [showLegend, setShowLegend] = useState(false);
   const [hovered, setHovered] = useState(false);
 
-  const px = hovered && size === 'small' ? 196 : SIZE_PX[size];
+  const px = hovered && size === 'small' ? 196 : SIZE_PX[size] || 208;
 
   // 1. Pre-render offscreen terrain hillshade + density heat map whenever terrain/debris updates
   useEffect(() => {
@@ -111,21 +111,21 @@ export default function RadarPanel({
           if (c < 3) continue;
           const wx = -20 + (gx + 0.5) * (40 / gridN);
           const wz = -20 + (gz + 0.5) * (40 / gridN);
-          const alpha = Math.min(0.28, (c / 14) * 0.24);
+          const alpha = Math.min(0.25, (c / 16) * 0.22);
           ctx.fillStyle = colorblindSafe ? `rgba(147, 197, 253, ${alpha})` : `rgba(184, 165, 130, ${alpha})`;
           ctx.fillRect(cx + wx * scale - cellPx / 2, cy + wz * scale - cellPx / 2, cellPx, cellPx);
         }
       }
     }
 
-    // Sparse size-scaled hazard boulders (capped cleanly so radar stays crisp)
-    const stride = hazards.length > 220 ? Math.ceil(hazards.length / 220) : 1;
-    ctx.fillStyle = 'rgba(253, 251, 247, 0.48)';
+    // Sparse size-scaled hazard boulders (thin out dots visually so radar stays crisp)
+    const stride = hazards.length > 180 ? Math.ceil(hazards.length / 180) : 1;
+    ctx.fillStyle = 'rgba(253, 251, 247, 0.42)';
     for (let i = 0; i < hazards.length; i += stride) {
       const d = hazards[i];
       const rx = cx + d.x * scale;
       const ry = cy + d.z * scale;
-      const r = Math.max(1.2, Math.min(3.0, d.scale * 2.4));
+      const r = Math.max(1.0, Math.min(2.4, d.scale * 2.0));
       ctx.beginPath();
       ctx.arc(rx, ry, r, 0, Math.PI * 2);
       ctx.fill();
@@ -149,8 +149,18 @@ export default function RadarPanel({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const w = canvas.width;
-    const h = canvas.height;
+    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const bufferPx = Math.round(px * dpr);
+    if (canvas.width !== bufferPx || canvas.height !== bufferPx) {
+      canvas.width = bufferPx;
+      canvas.height = bufferPx;
+    }
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+
+    const w = px;
+    const h = px;
     const cx = w / 2;
     const cy = h / 2;
     const rangeM = 20.0;
@@ -174,7 +184,7 @@ export default function RadarPanel({
       ctx.drawImage(bgCanvasRef.current, offX, offY, 200 * bgScale, 200 * bgScale);
     }
 
-    // Range rings at 10m and 20m with labels
+    // Range rings at 10m and 20m with tiny labels
     for (const rMeters of [10, 20]) {
       const rPx = rMeters * scale;
       ctx.strokeStyle = 'rgba(253, 251, 247, 0.16)';
@@ -269,7 +279,7 @@ export default function RadarPanel({
     ctx.fill();
     ctx.restore();
 
-    ctx.restore();
+    ctx.restore(); // end clip
 
     // Outer aperture bezel
     ctx.strokeStyle = 'rgba(253, 251, 247, 0.22)';
@@ -277,6 +287,8 @@ export default function RadarPanel({
     ctx.beginPath();
     ctx.arc(cx, cy, w * 0.46, 0, Math.PI * 2);
     ctx.stroke();
+
+    ctx.restore(); // end DPR scale
   }, [robotPos, robotYaw, trailPoints, waypoints, missionMarkers, completedMarkerIds, colorblindSafe, px]);
 
   const cycleSize = () => {
@@ -324,12 +336,10 @@ export default function RadarPanel({
         </div>
       </div>
 
-      {/* Radar Canvas */}
+      {/* Radar Canvas (DPR scaled) */}
       <canvas
         ref={canvasRef}
-        width={px}
-        height={px}
-        style={{ width: px, height: px }}
+        style={{ width: `${px}px`, height: `${px}px` }}
         className="block rounded-lg"
       />
 

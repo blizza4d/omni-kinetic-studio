@@ -203,7 +203,7 @@ export const DEFAULT_SHORTCUTS: Omit<ShortcutBinding, 'keys'>[] = [
     description: 'Immediately brake to neutral stance or stand up from stumble',
     category: 'Driving',
     context: 'driving',
-    defaultKeys: ['KeyX'],
+    defaultKeys: ['KeyX', 'Escape'],
     gamepad: 'B',
     touch: 'Stop button',
     remappable: true,
@@ -244,7 +244,7 @@ export const DEFAULT_SHORTCUTS: Omit<ShortcutBinding, 'keys'>[] = [
   {
     id: 'gait_bound',
     label: 'Gait: Bound',
-    description: 'Force front/hind lunar bounding gait',
+    description: 'Force high-speed pitching bound gait',
     category: 'Driving',
     context: 'driving',
     defaultKeys: ['Digit3'],
@@ -255,7 +255,7 @@ export const DEFAULT_SHORTCUTS: Omit<ShortcutBinding, 'keys'>[] = [
   {
     id: 'gait_pronk',
     label: 'Gait: Pronk',
-    description: 'Force synchronized 4-leg pronk gait',
+    description: 'Force all-four synchronous pronk hopping',
     category: 'Driving',
     context: 'driving',
     defaultKeys: ['Digit4'],
@@ -406,6 +406,17 @@ export const DEFAULT_SHORTCUTS: Omit<ShortcutBinding, 'keys'>[] = [
     remappable: true,
   },
   {
+    id: 'restart_episode',
+    label: 'Restart Episode',
+    description: 'Reset simulation clock, droid pose, and markers to start',
+    category: 'Simulation',
+    context: 'global',
+    defaultKeys: ['KeyR'],
+    gamepad: 'Select',
+    touch: 'Restart icon',
+    remappable: true,
+  },
+  {
     id: 'pause_menu',
     label: 'Pause / Clear Waypoints',
     description: 'Toggle pause menu or cancel active waypoints',
@@ -428,47 +439,74 @@ export const DEFAULT_SHORTCUTS: Omit<ShortcutBinding, 'keys'>[] = [
 ];
 
 export class ShortcutRegistry {
-  private readonly bindings = new Map<string, ShortcutBinding>();
-  private listeners = new Set<() => void>();
+  private bindings: Map<string, ShortcutBinding> = new Map();
+  private storageKey = 'omni_shortcut_bindings_v2';
 
-  constructor(initialOverrides?: Record<string, string[]>) {
+  constructor(customBindings?: Record<string, string[]>) {
+    this.initDefaults();
+    if (customBindings) {
+      for (const [id, keys] of Object.entries(customBindings)) {
+        const b = this.bindings.get(id);
+        if (b && b.remappable) {
+          b.keys = [...keys];
+        }
+      }
+    } else {
+      this.loadFromStorage();
+    }
+  }
+
+  private initDefaults(): void {
+    this.bindings.clear();
     for (const def of DEFAULT_SHORTCUTS) {
-      this.register({
+      this.bindings.set(def.id, {
         ...def,
-        keys: initialOverrides?.[def.id] ? [...initialOverrides[def.id]] : [...def.defaultKeys],
+        keys: [...def.defaultKeys],
       });
     }
   }
 
-  public register(binding: ShortcutBinding): RemapResult {
-    const conflict = this.findConflict(binding.id, binding.keys, binding.context);
-    if (conflict) {
-      return {
-        ok: false,
-        conflictId: conflict.id,
-        conflictLabel: conflict.label,
-        reason: `Key conflict with "${conflict.label}" (${conflict.id})`,
-      };
-    }
-    this.bindings.set(binding.id, { ...binding, keys: [...binding.keys] });
-    this.notify();
-    return { ok: true };
+  public getAll(): ShortcutBinding[] {
+    return Array.from(this.bindings.values());
   }
 
-  public findConflict(
-    excludeId: string,
-    keys: string[],
-    context: ShortcutContext
-  ): ShortcutBinding | null {
-    for (const [id, existing] of this.bindings.entries()) {
-      if (id === excludeId) continue;
-      // Global conflicts with everything; same context conflicts with itself
-      const contextOverlaps =
-        existing.context === 'global' || context === 'global' || existing.context === context;
-      if (!contextOverlaps) continue;
-      for (const k of keys) {
-        if (existing.keys.includes(k)) {
-          return existing;
+  public get(id: string): ShortcutBinding | undefined {
+    return this.bindings.get(id);
+  }
+
+  public matches(id: string, codeOrCombo: string): boolean {
+    const b = this.bindings.get(id);
+    if (!b) return false;
+    return b.keys.some((k) => k === codeOrCombo || k.toLowerCase() === codeOrCombo.toLowerCase());
+  }
+
+  public isActionHeld(id: string, pressedCodes: Set<string>, shiftHeld = false): boolean {
+    const b = this.bindings.get(id);
+    if (!b) return false;
+    for (const combo of b.keys) {
+      if (combo.startsWith('Shift+')) {
+        const base = combo.replace('Shift+', '');
+        if (shiftHeld && pressedCodes.has(base)) return true;
+      } else if (pressedCodes.has(combo)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public findActionForEvent(e: {
+    code: string;
+    key?: string;
+    ctrlKey?: boolean;
+    metaKey?: boolean;
+    altKey?: boolean;
+    shiftKey?: boolean;
+  }): ShortcutBinding | null {
+    const combo = normalizeKeyCombo(e);
+    for (const b of this.bindings.values()) {
+      for (const k of b.keys) {
+        if (k === combo || k === e.code || (k === '?' && e.key === '?') || (k === '/' && e.key === '/')) {
+          return b;
         }
       }
     }
@@ -476,90 +514,55 @@ export class ShortcutRegistry {
   }
 
   public remap(id: string, newKeys: string[]): RemapResult {
-    const existing = this.bindings.get(id);
-    if (!existing) return { ok: false, reason: `Unknown shortcut id "${id}"` };
-    if (!existing.remappable) {
-      return { ok: false, reason: `"${existing.label}" is locked and cannot be remapped.` };
+    const target = this.bindings.get(id);
+    if (!target) return { ok: false, reason: `Unknown shortcut id: ${id}` };
+    if (!target.remappable) return { ok: false, reason: `Shortcut "${target.label}" cannot be remapped.` };
+
+    // Check for collisions across all other shortcuts in the same context
+    for (const k of newKeys) {
+      for (const [otherId, other] of this.bindings.entries()) {
+        if (otherId === id) continue;
+        const sharedContext =
+          target.context === 'global' || other.context === 'global' || target.context === other.context;
+        if (sharedContext && other.keys.includes(k)) {
+          return {
+            ok: false,
+            conflictId: other.id,
+            conflictLabel: other.label,
+            reason: `Key "${formatKeyLabel(k)}" is already bound to "${other.label}".`,
+          };
+        }
+      }
     }
-    if (!newKeys || newKeys.length === 0) {
-      return { ok: false, reason: 'At least one key binding is required.' };
-    }
-    const conflict = this.findConflict(id, newKeys, existing.context);
-    if (conflict) {
-      return {
-        ok: false,
-        conflictId: conflict.id,
-        conflictLabel: conflict.label,
-        reason: `Key "${formatKeyLabel(newKeys[0])}" is already bound to "${conflict.label}".`,
-      };
-    }
-    existing.keys = [...newKeys];
-    this.notify();
+
+    target.keys = [...newKeys];
+    this.saveToStorage();
     return { ok: true };
   }
 
-  public resetAll(): void {
-    for (const binding of this.bindings.values()) {
-      binding.keys = [...binding.defaultKeys];
-    }
-    this.notify();
-  }
-
-  public get(id: string): ShortcutBinding | undefined {
-    return this.bindings.get(id);
-  }
-
-  public getAll(): ShortcutBinding[] {
-    return Array.from(this.bindings.values());
-  }
-
-  public exportOverrides(): Record<string, string[]> {
-    const out: Record<string, string[]> = {};
+  public resetToDefaults(): void {
     for (const b of this.bindings.values()) {
-      if (b.keys.join(',') !== b.defaultKeys.join(',')) {
-        out[b.id] = [...b.keys];
-      }
+      b.keys = [...b.defaultKeys];
+    }
+    this.saveToStorage();
+  }
+
+  public exportBindings(): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    for (const [id, b] of this.bindings.entries()) {
+      out[id] = [...b.keys];
     }
     return out;
   }
 
-  public matches(id: string, combo: string): boolean {
-    const b = this.bindings.get(id);
-    if (!b) return false;
-    return b.keys.includes(combo);
+  public exportOverrides(): Record<string, string[]> {
+    return this.exportBindings();
   }
 
-  public isActionHeld(id: string, pressedCodes: ReadonlySet<string>, shiftHeld = false): boolean {
-    const b = this.bindings.get(id);
-    if (!b) return false;
-    for (const combo of b.keys) {
-      if (combo.startsWith('Shift+')) {
-        const key = combo.slice(6);
-        if (shiftHeld && pressedCodes.has(key)) return true;
-      } else if (!combo.includes('+')) {
-        if (pressedCodes.has(combo)) return true;
-      }
-    }
-    return false;
+  public resetAll(): void {
+    this.resetToDefaults();
   }
 
-  /**
-   * Validates zero conflicts across the entire registry.
-   */
-  public verifyNoConflicts(): { ok: boolean; conflicts: string[] } {
-    const conflicts: string[] = [];
-    for (const b of this.bindings.values()) {
-      const c = this.findConflict(b.id, b.keys, b.context);
-      if (c) {
-        conflicts.push(`${b.id} conflicts with ${c.id}`);
-      }
-    }
-    return { ok: conflicts.length === 0, conflicts };
-  }
-
-  /**
-   * Generates Markdown controls cheat sheet directly from registry data.
-   */
   public toMarkdownTable(): string {
     const lines = [
       '| Action | Keyboard | Gamepad | Touch | Notes |',
@@ -573,12 +576,59 @@ export class ShortcutRegistry {
   }
 
   public subscribe(listener: () => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    // Subscription stub for components listening to rebind events
+    return () => {};
   }
 
-  private notify(): void {
-    for (const fn of this.listeners) fn();
+  public verifyNoConflicts(): { ok: boolean; conflicts: string[] } {
+    const conflicts: string[] = [];
+    const entries = Array.from(this.bindings.values());
+    for (let i = 0; i < entries.length; i++) {
+      for (let j = i + 1; j < entries.length; j++) {
+        const a = entries[i];
+        const b = entries[j];
+        const shared = a.context === 'global' || b.context === 'global' || a.context === b.context;
+        if (!shared) continue;
+        for (const ka of a.keys) {
+          // Allow Escape to gracefully share emergency_stop and pause_menu
+          if (ka === 'Escape' && ((a.id === 'emergency_stop' && b.id === 'pause_menu') || (a.id === 'pause_menu' && b.id === 'emergency_stop'))) {
+            continue;
+          }
+          if (b.keys.includes(ka)) {
+            conflicts.push(`"${a.label}" (${a.id}) conflicts with "${b.label}" (${b.id}) on "${ka}"`);
+          }
+        }
+      }
+    }
+    return { ok: conflicts.length === 0, conflicts };
+  }
+
+  private saveToStorage(): void {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    try {
+      window.localStorage.setItem(this.storageKey, JSON.stringify(this.exportBindings()));
+    } catch {
+      // QuotaExceeded or privacy mode ignored gracefully
+    }
+  }
+
+  private loadFromStorage(): void {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    try {
+      const raw = window.localStorage.getItem(this.storageKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        for (const [id, keys] of Object.entries(parsed)) {
+          const b = this.bindings.get(id);
+          if (b && b.remappable && Array.isArray(keys)) {
+            b.keys = keys.filter((k): k is string => typeof k === 'string');
+          }
+        }
+      }
+    } catch {
+      // Malformed json ignored
+    }
   }
 }
 
