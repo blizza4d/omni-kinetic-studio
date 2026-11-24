@@ -136,6 +136,10 @@ export class TelemetryStore {
     return this.latestFrame;
   }
 
+  public getLatest(): TelemetryFrame | null {
+    return this.latestFrame;
+  }
+
   public getFrameAtIndex(index: number): TelemetryFrame | null {
     if (index < 0 || index >= this.history.length) return null;
     return this.history[index];

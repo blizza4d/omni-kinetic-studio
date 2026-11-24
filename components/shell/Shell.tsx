@@ -41,6 +41,12 @@ import RunSummaryCard from '@/components/shell/RunSummaryCard';
 import FpsBadge from '@/components/shell/FpsBadge';
 import PerfPanel from '@/components/shell/PerfPanel';
 import ControlHUD, { SensorOverlayFlags } from '@/components/control/ControlHUD';
+import RoboticsTelemetryPanel from '@/components/robotics/RoboticsTelemetryPanel';
+import PhysicsDomainPanel, { PhysicsDomainState } from '@/components/robotics/PhysicsDomainPanel';
+import NemotronPlannerPanel from '@/components/robotics/NemotronPlannerPanel';
+import DatasetRecorderPanel from '@/components/robotics/DatasetRecorderPanel';
+import { NemotronTaskPlan } from '@/lib/nebius/taskPlanner';
+import { globalEpisodeRecorder } from '@/lib/dataset/episodeRecorder';
 import {
   MissionObjectiveHUD,
   MissionPickerModal,
@@ -196,6 +202,11 @@ export default function Shell() {
     adaptiveQuality: true,
   });
   const [logPaneWidth, setLogPaneWidth] = useState<number>(400);
+  const [leftWorkbenchTab, setLeftWorkbenchTab] = useState<'telemetry' | 'physics' | 'architect'>('telemetry');
+  const [showRightSidebar, setShowRightSidebar] = useState<boolean>(true);
+  const [rightWorkbenchTab, setRightWorkbenchTab] = useState<'planner' | 'dataset'>('planner');
+  const [activePlan, setActivePlan] = useState<NemotronTaskPlan | null>(null);
+  const [rightSidebarWidth, setRightSidebarWidth] = useState<number>(360);
 
   // Toast alert (accessible aria-live)
   const [toast, setToast] = useState<{ text: string; level: 'info' | 'warn' } | null>(null);
@@ -443,11 +454,18 @@ export default function Shell() {
         handleUiSync();
         break;
       }
-      case 'emergency_stop':
-        engine.arbiter.triggerEmergencyStop();
-        showToast('Emergency Stop engaged — settling to neutral stance.', 'warn');
+      case 'emergency_stop': {
+        const snap = engine.arbiter.snapshot();
+        if (snap.emergencyStop) {
+          engine.arbiter.clearEmergencyStop();
+          showToast('E-STOP released — actuators re-armed.', 'info');
+        } else {
+          engine.arbiter.triggerEmergencyStop();
+          showToast('EMERGENCY STOP ENGAGED: Actuators halted via Spacebar override.', 'warn');
+        }
         handleUiSync();
         break;
+      }
       case 'open_palette':
         setIsPaletteOpen((p) => !p);
         break;
@@ -783,6 +801,28 @@ export default function Shell() {
     addLog('Specification rejected.', 'warn');
   }, [addLog]);
 
+  const handleExecutePlan = useCallback((plan: NemotronTaskPlan) => {
+    setActivePlan(plan);
+    const waypoints = plan.waypoints.map((w) => ({
+      id: `wp_${w.id}`,
+      x: w.position[0],
+      z: w.position[2],
+      label: `WP ${w.id}`,
+      reachable: true,
+    }));
+    engine.inputs.setWaypoints(waypoints);
+    engine.arbiter.releaseToPolicy();
+    showToast(`Executing Nemotron Plan: ${plan.task_name} (${waypoints.length} waypoints)`, 'info');
+    handleUiSync();
+  }, [engine, showToast, handleUiSync]);
+
+  const handleClearPlan = useCallback(() => {
+    setActivePlan(null);
+    engine.inputs.clearWaypoints();
+    showToast('Autonomous plan cleared.', 'info');
+    handleUiSync();
+  }, [engine, showToast, handleUiSync]);
+
   // Read unified snapshots for current render
   const clockSnap = engine.getClockSnapshot();
   const arbiterSnap = engine.getArbiterSnapshot();
@@ -849,8 +889,78 @@ export default function Shell() {
           )}
         </div>
 
-        {/* Center: Task Prompt, Control Toggle [T], and CV Cam */}
+        {/* Center: E-STOP, Mode Selector, Task Prompt, and CV Cam */}
         <div className="flex items-center gap-1.5 shrink-0">
+          {/* Prominent E-STOP Button */}
+          <button
+            type="button"
+            onClick={() => actionHandlerRef.current('emergency_stop')}
+            title="Emergency Stop: Halt all actuators immediately [Spacebar]"
+            className={`flex items-center space-x-1.5 px-3 py-1 rounded text-xs font-mono font-bold uppercase tracking-wider transition-all border ${
+              arbiterSnap.emergencyStop
+                ? 'bg-brick border-brick text-cream animate-pulse shadow-lg shadow-brick/40'
+                : 'bg-brick/20 hover:bg-brick/30 border-brick/40 text-cream hover:border-brick/70'
+            }`}
+          >
+            <ShieldAlert className="w-3.5 h-3.5 text-brick" />
+            <span>{arbiterSnap.emergencyStop ? 'E-STOP ENGAGED' : 'E-STOP'}</span>
+            <kbd className="bg-charcoal-deep px-1.5 py-0.5 rounded text-[10px] text-cream-dim border border-cream/10">
+              SPACE
+            </kbd>
+          </button>
+
+          {/* Robotics Mode Switcher */}
+          <div className="hidden md:flex items-center space-x-1 border border-cream/15 rounded bg-charcoal p-0.5 text-[10px]">
+            <button
+              type="button"
+              onClick={() => {
+                if (!arbiterSnap.isManual || arbiterSnap.activeSource !== 'keyboard') {
+                  engine.arbiter.takeManualControl('keyboard', engine.clock.getElapsed());
+                  handleUiSync();
+                }
+              }}
+              title="Drive robot with WASD keyboard controls [T]"
+              className={`px-2 py-0.5 rounded font-bold uppercase transition-colors ${
+                arbiterSnap.isManual && arbiterSnap.activeSource === 'keyboard'
+                  ? 'bg-sage text-charcoal-deep shadow-sm'
+                  : 'text-cream-dim hover:text-cream'
+              }`}
+            >
+              Manual (T)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsTeleopOpen(true);
+                engine.arbiter.takeManualControl('cv', engine.clock.getElapsed());
+                handleUiSync();
+              }}
+              title="Teleoperate robot using MediaPipe vision hand gestures"
+              className={`px-2 py-0.5 rounded font-bold uppercase transition-colors ${
+                arbiterSnap.activeSource === 'cv'
+                  ? 'bg-sage text-charcoal-deep shadow-sm'
+                  : 'text-cream-dim hover:text-cream'
+              }`}
+            >
+              Gesture
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                engine.arbiter.releaseToPolicy();
+                handleUiSync();
+              }}
+              title="Autonomous navigation using NVIDIA Nemotron trajectory waypoints"
+              className={`px-2 py-0.5 rounded font-bold uppercase transition-colors ${
+                !arbiterSnap.isManual
+                  ? 'bg-sage text-charcoal-deep shadow-sm'
+                  : 'text-cream-dim hover:text-cream'
+              }`}
+            >
+              Autonomous
+            </button>
+          </div>
+
           <button
             type="button"
             onClick={() => setIsPaletteOpen(true)}
@@ -858,26 +968,9 @@ export default function Shell() {
             className="flex items-center space-x-1.5 bg-charcoal hover:bg-charcoal-light border border-cream/15 px-2.5 py-1 rounded text-xs font-mono text-cream transition-colors"
           >
             <Sparkles className="w-3.5 h-3.5 text-sage" />
-            <span className="hidden sm:inline">Task Prompt</span>
+            <span className="hidden sm:inline">Prompt</span>
             <kbd className="bg-charcoal-deep px-1.5 py-0.5 rounded text-[10px] text-cream-dim border border-cream/10">
               Ctrl+K
-            </kbd>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => actionHandlerRef.current('toggle_control')}
-            title="Take / Release manual droid control [T]"
-            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded text-xs font-mono transition-colors border ${
-              arbiterSnap.isManual
-                ? 'bg-sage border-sage text-cream font-bold shadow-lg shadow-sage/25'
-                : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream hover:border-sage'
-            }`}
-          >
-            <Gamepad2 className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">{arbiterSnap.isManual ? 'Driving' : 'Control'}</span>
-            <kbd className="bg-charcoal-deep px-1.5 py-0.5 rounded text-[10px] border border-cream/10 text-cream">
-              T
             </kbd>
           </button>
 
@@ -990,6 +1083,52 @@ export default function Shell() {
 
           <FpsBadge tier={qualityTier} onTogglePanel={() => setIsPerfPanelOpen((p) => !p)} />
 
+          {/* Performance Tier Toggle */}
+          <div className="hidden sm:flex items-center space-x-1 border border-cream/15 rounded bg-charcoal p-0.5 text-[10px]">
+            {(['high', 'medium', 'low'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => {
+                  setQualityTier(t);
+                  PerfProbe.getInstance().setTier(t);
+                  showToast(`Tier: ${t.toUpperCase()}`, 'info');
+                }}
+                className={`px-1.5 py-0.5 rounded font-bold uppercase transition-colors ${
+                  qualityTier === t ? 'bg-sage text-charcoal-deep' : 'text-cream-dim hover:text-cream'
+                }`}
+              >
+                {t === 'medium' ? 'BAL' : t.toUpperCase()}
+              </button>
+            ))}
+          </div>
+
+          {/* Workbench Sidebar Toggles */}
+          <button
+            type="button"
+            onClick={() => setLayoutSettings((s) => ({ ...s, showLogPanel: !s.showLogPanel }))}
+            title="Toggle Left Workbench (Telemetry & Physics)"
+            className={`px-2 py-0.5 rounded border text-[11px] font-mono transition-colors ${
+              layoutSettings.showLogPanel
+                ? 'bg-sage/20 border-sage text-sage font-bold'
+                : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream-dim hover:text-cream'
+            }`}
+          >
+            Left WB
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowRightSidebar((p) => !p)}
+            title="Toggle Right Workbench (Planner & Dataset)"
+            className={`hidden lg:block px-2 py-0.5 rounded border text-[11px] font-mono transition-colors ${
+              showRightSidebar
+                ? 'bg-sage/20 border-sage text-sage font-bold'
+                : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream-dim hover:text-cream'
+            }`}
+          >
+            Right WB
+          </button>
+
           <button
             type="button"
             onClick={() => setIsTokenSpendOpen(true)}
@@ -1062,29 +1201,97 @@ export default function Shell() {
 
       {/* Main Studio Split Viewport */}
       <div className="relative flex-1 flex overflow-hidden p-2 pt-1 gap-2">
-        {/* Left Resizable Console & Analysis Pane (Single SimClock progress source — R-01 fixed!) */}
-        <AnalogLogPane
-          logs={logs}
-          currentStage={currentStage}
-          architectOutput={architectOutput}
-          currentSpec={envSpec}
-          activeJobStatus={jobStatus}
-          clockSnapshot={clockSnap}
-          runModeDescription={`${runModeDesc.consolePrefix} · ${arbiterSnap.modeLabel}`}
-          chartHistory={chartHistory}
-          safetyEvents={engine.getSafetyEvents()}
-          onExportDatasetJsonl={() => handleExportDataset('jsonl')}
-          onExportDatasetCsv={() => handleExportDataset('csv')}
-          onApprove={handleApproveJob}
-          onReject={handleRejectJob}
-          onUpdateSpec={(spec) => setEnvSpec(spec)}
-          onOpenPrompt={() => setIsPaletteOpen(true)}
-          isStreaming={isStreamingArchitect}
-          isOpen={layoutSettings.showLogPanel}
-          onToggleOpen={() => setLayoutSettings((s) => ({ ...s, showLogPanel: !s.showLogPanel }))}
-          width={logPaneWidth}
-          onWidthChange={handleLogWidthChange}
-        />
+        {/* Left Resizable Robotics & Analysis Workbench Pane */}
+        {layoutSettings.showLogPanel && (
+          <aside
+            style={{ width: `${logPaneWidth}px` }}
+            className="flex flex-col shrink-0 gap-1.5 overflow-hidden transition-all duration-150 h-full"
+          >
+            {/* Left Workbench Tab Selector */}
+            <div className="flex items-center space-x-1 p-1 bg-charcoal-deep rounded-lg border border-cream/10 text-[10px] font-mono shrink-0">
+              <button
+                type="button"
+                onClick={() => setLeftWorkbenchTab('telemetry')}
+                className={`flex-1 py-1 px-1.5 rounded font-bold uppercase transition-colors text-center ${
+                  leftWorkbenchTab === 'telemetry'
+                    ? 'bg-sage text-charcoal-deep shadow-sm'
+                    : 'text-cream-dim hover:text-cream'
+                }`}
+              >
+                Telemetry
+              </button>
+              <button
+                type="button"
+                onClick={() => setLeftWorkbenchTab('physics')}
+                className={`flex-1 py-1 px-1.5 rounded font-bold uppercase transition-colors text-center ${
+                  leftWorkbenchTab === 'physics'
+                    ? 'bg-sage text-charcoal-deep shadow-sm'
+                    : 'text-cream-dim hover:text-cream'
+                }`}
+              >
+                Physics
+              </button>
+              <button
+                type="button"
+                onClick={() => setLeftWorkbenchTab('architect')}
+                className={`flex-1 py-1 px-1.5 rounded font-bold uppercase transition-colors text-center ${
+                  leftWorkbenchTab === 'architect'
+                    ? 'bg-sage text-charcoal-deep shadow-sm'
+                    : 'text-cream-dim hover:text-cream'
+                }`}
+              >
+                Architect
+              </button>
+            </div>
+
+            {leftWorkbenchTab === 'telemetry' ? (
+              <RoboticsTelemetryPanel
+                telemetryStore={TelemetryStore.getInstance()}
+                onEmergencyStop={() => actionHandlerRef.current('emergency_stop')}
+                onClearEmergencyStop={() => {
+                  engine.arbiter.clearEmergencyStop();
+                  handleUiSync();
+                }}
+                eStopActive={arbiterSnap.emergencyStop}
+                controlLatencyMs={engine.getLastInputLatencyMs()}
+                webglFps={60}
+                className="flex-1"
+              />
+            ) : leftWorkbenchTab === 'physics' ? (
+              <PhysicsDomainPanel
+                engine={engine}
+                onDomainChange={(d) => {
+                  engine.scenario.gravity = d.gravityMps2;
+                  handleUiSync();
+                }}
+                className="flex-1"
+              />
+            ) : (
+              <AnalogLogPane
+                logs={logs}
+                currentStage={currentStage}
+                architectOutput={architectOutput}
+                currentSpec={envSpec}
+                activeJobStatus={jobStatus}
+                clockSnapshot={clockSnap}
+                runModeDescription={`${runModeDesc.consolePrefix} · ${arbiterSnap.modeLabel}`}
+                chartHistory={chartHistory}
+                safetyEvents={engine.getSafetyEvents()}
+                onExportDatasetJsonl={() => handleExportDataset('jsonl')}
+                onExportDatasetCsv={() => handleExportDataset('csv')}
+                onApprove={handleApproveJob}
+                onReject={handleRejectJob}
+                onUpdateSpec={(spec) => setEnvSpec(spec)}
+                onOpenPrompt={() => setIsPaletteOpen(true)}
+                isStreaming={isStreamingArchitect}
+                isOpen={true}
+                onToggleOpen={() => setLayoutSettings((s) => ({ ...s, showLogPanel: false }))}
+                width={logPaneWidth}
+                onWidthChange={handleLogWidthChange}
+              />
+            )}
+          </aside>
+        )}
 
         {/* Center 3D Spatial Viewport */}
         <main className="relative flex-1 h-full rounded-xl overflow-hidden border border-cream/10 shadow-2xl">
@@ -1314,6 +1521,66 @@ export default function Shell() {
             </button>
           </div>
         </main>
+
+        {/* Right Robotics Workbench Panel (Nemotron Planner & Dataset Recorder) */}
+        {showRightSidebar && (
+          <aside
+            style={{ width: `${rightSidebarWidth}px` }}
+            className="hidden xl:flex flex-col shrink-0 gap-1.5 overflow-hidden transition-all duration-150 h-full"
+          >
+            {/* Right Tab Switch Header */}
+            <div className="flex items-center space-x-1 p-1 bg-charcoal-deep rounded-lg border border-cream/10 text-[10px] font-mono shrink-0">
+              <button
+                type="button"
+                onClick={() => setRightWorkbenchTab('planner')}
+                className={`flex-1 py-1 px-2 rounded font-bold uppercase transition-colors text-center ${
+                  rightWorkbenchTab === 'planner'
+                    ? 'bg-sage text-charcoal-deep shadow-sm'
+                    : 'text-cream-dim hover:text-cream'
+                }`}
+              >
+                Nemotron Planner
+              </button>
+              <button
+                type="button"
+                onClick={() => setRightWorkbenchTab('dataset')}
+                className={`flex-1 py-1 px-2 rounded font-bold uppercase transition-colors text-center ${
+                  rightWorkbenchTab === 'dataset'
+                    ? 'bg-sage text-charcoal-deep shadow-sm'
+                    : 'text-cream-dim hover:text-cream'
+                }`}
+              >
+                Dataset Recorder
+              </button>
+            </div>
+
+            {rightWorkbenchTab === 'planner' ? (
+              <NemotronPlannerPanel
+                currentPose={latestChart ? [latestChart.speed, 0.44, 0] : [0, 0.44, 0]}
+                onExecutePlan={handleExecutePlan}
+                onClearPlan={handleClearPlan}
+                activePlan={activePlan}
+                isExecuting={engine.inputs.getWaypoints().length > 0}
+                className="flex-1"
+              />
+            ) : (
+              <DatasetRecorderPanel
+                currentSource={
+                  arbiterSnap.activeSource === 'cv'
+                    ? 'gesture'
+                    : arbiterSnap.activeSource === 'keyboard'
+                    ? 'keyboard'
+                    : arbiterSnap.activeSource === 'pointer'
+                    ? 'nemotron'
+                    : 'keyboard'
+                }
+                gravityMps2={scenario.gravity}
+                terrainSeed={scenario.seed}
+                className="flex-1"
+              />
+            )}
+          </aside>
+        )}
       </div>
 
       {/* v2 Interactive Modals & Drawers */}

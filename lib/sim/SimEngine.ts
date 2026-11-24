@@ -49,6 +49,7 @@ import {
 } from '../missions/missions';
 import { ScenarioConfig, DEFAULT_SCENARIO_CONFIG } from '../scenario/sharing';
 import { slerpShortest } from '../anim/math/quaternion';
+import { globalEpisodeRecorder, DatasetControlSource } from '../dataset/episodeRecorder';
 
 export interface InterpolatedDroidRenderState {
   time: number;
@@ -108,7 +109,7 @@ export class SimEngine {
   public readonly recorder: DeterministicRecorder;
   public readonly missionRuntime: MissionRuntime;
 
-  private scenario: ScenarioConfig;
+  public scenario: ScenarioConfig;
   private debris: DebrisInstance[] = [];
   private hazardObstacles: ObstaclePoint[] = [];
 
@@ -255,6 +256,10 @@ export class SimEngine {
 
   public getScenario(): ScenarioConfig {
     return { ...this.scenario };
+  }
+
+  public setGravity(gravityMps2: number): void {
+    this.scenario.gravity = gravityMps2;
   }
 
   public getDebris(): readonly DebrisInstance[] {
@@ -841,6 +846,19 @@ export class SimEngine {
         status: collided ? 'collision' : 'running',
       };
       this.onFrameCallback(frame);
+
+      if (globalEpisodeRecorder.getIsRecording()) {
+        const currentSource = this.arbiter.getActiveSource();
+        const datasetSource: DatasetControlSource =
+          currentSource === 'cv'
+            ? 'gesture'
+            : currentSource === 'keyboard'
+            ? 'keyboard'
+            : currentSource === 'pointer'
+            ? 'nemotron'
+            : 'manual';
+        globalEpisodeRecorder.recordStep(frame, shaped, datasetSource, collided);
+      }
     }
 
     return kin;
