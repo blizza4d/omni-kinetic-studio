@@ -19,6 +19,7 @@ import { EditorToolMode } from '@/components/missions/MissionPanels';
 import RadarPanel from '@/components/radar/RadarPanel';
 import { MissionMarker } from '@/lib/missions/missions';
 import { Waypoint } from '@/lib/control/types';
+import { globalAudioSynthesizer } from '@/lib/audio/synthesizer';
 
 export type CameraPreset = 'chase' | 'top' | 'side' | 'free';
 export type QualityTier = 'ultra' | 'high' | 'medium' | 'low' | 'potato';
@@ -673,14 +674,18 @@ export default function ThreeViewer({
         const sMat = sh.material as THREE.MeshBasicMaterial;
         sMat.opacity = f.contact ? 0.42 : Math.max(0, 0.22 * (1 - clearance / 0.28));
 
-        if (f.contact && !prevContacts[i] && showDustRef.current && !isLow && !reducedMotionRef.current) {
-          lunarDust.emit(f.pos, 4);
+        if (f.contact && !prevContacts[i]) {
+          globalAudioSynthesizer.triggerFootThump(0.4);
+          if (showDustRef.current && !isLow && !reducedMotionRef.current) {
+            lunarDust.emit(f.pos, 4);
+          }
         }
         prevContacts[i] = f.contact;
       }
 
       // Landing impact dust burst & seeded camera shake
       if (renderState.justLanded) {
+        globalAudioSynthesizer.triggerHopThud(0.7);
         if (showDustRef.current && !isLow && !reducedMotionRef.current) {
           lunarDust.emit([sanitized.pos[0], field.sampleHeight(sanitized.pos[0], sanitized.pos[2]) + 0.02, sanitized.pos[2]], 14);
         }

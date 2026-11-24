@@ -1,0 +1,17 @@
+{
+  "name": "Omni-Kinetic: Sim-to-Real Embodied AI Studio",
+  "short_name": "Omni-Kinetic",
+  "description": "Browser-native robotics training studio with Nemotron physical reasoning, WebGL spatial simulation, and procedural gait control.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1F1F1F",
+  "theme_color": "#2A2A2A",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

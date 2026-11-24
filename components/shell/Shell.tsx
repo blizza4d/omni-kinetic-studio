@@ -15,7 +15,20 @@ import {
   Layers,
   AlertTriangle,
   RotateCcw,
+  Volume2,
+  VolumeX,
+  Radio,
+  Trophy,
+  ShieldAlert,
+  Wrench,
 } from 'lucide-react';
+import { isFeatureEnabled } from '@/lib/flags';
+import { globalAudioSynthesizer } from '@/lib/audio/synthesizer';
+import { DroidWorkshopModal } from '@/components/shell/modals/DroidWorkshopModal';
+import { CommsDelayModal } from '@/components/shell/modals/CommsDelayModal';
+import { SimToRealModal } from '@/components/shell/modals/SimToRealModal';
+import { DailyChallengeModal } from '@/components/shell/modals/DailyChallengeModal';
+import { CommsPresetKey } from '@/lib/comms/delay';
 import ThreeViewer, { QualityTier } from '@/components/viewer/ThreeViewer';
 import CommandPalette from '@/components/shell/CommandPalette';
 import AnalogLogPane from '@/components/shell/AnalogLogPane';
@@ -235,6 +248,14 @@ export default function Shell() {
   const [showRunSummary, setShowRunSummary] = useState(false);
   const [tokenSpend, setTokenSpend] = useState({ promptTokens: 0, completionTokens: 0, costUsd: 0.0 });
   const [collisionAlert, setCollisionAlert] = useState(false);
+
+  // Expansion Packs UI state (Packs C, D, E, I, K)
+  const [isAudioMuted, setIsAudioMuted] = useState(true);
+  const [isWorkshopOpen, setIsWorkshopOpen] = useState(false);
+  const [isCommsDelayOpen, setIsCommsDelayOpen] = useState(false);
+  const [commsPreset, setCommsPreset] = useState<CommsPresetKey>('off');
+  const [isSimToRealOpen, setIsSimToRealOpen] = useState(false);
+  const [isDailyChallengeOpen, setIsDailyChallengeOpen] = useState(false);
 
   // Action handler ref so SimEngine InputManager invokes live React callbacks
   const actionHandlerRef = useRef<(actionId: string) => void>(() => {});
@@ -650,6 +671,15 @@ export default function Shell() {
     [engine, showToast]
   );
 
+  // Structure-Borne Vacuum Audio Synthesizer Toggle (Pack K)
+  const toggleAudio = useCallback(() => {
+    globalAudioSynthesizer.initialize();
+    const next = !isAudioMuted;
+    setIsAudioMuted(next);
+    globalAudioSynthesizer.setMuted(next);
+    showToast(next ? 'Vacuum structure-borne audio muted.' : 'Structure-borne audio enabled (WebAudio synthesis).', 'info');
+  }, [isAudioMuted, showToast]);
+
   // Clip Recording Toggle
   const handleToggleClipRecord = useCallback(() => {
     const rec = clipRecorderRef.current;
@@ -864,6 +894,75 @@ export default function Shell() {
           >
             <Camera className="w-3.5 h-3.5" />
           </button>
+
+          {/* Pack Expansion Chips */}
+          {isFeatureEnabled('droid_workshop') && (
+            <button
+              type="button"
+              onClick={() => setIsWorkshopOpen(true)}
+              title="Droid Workshop & Morphology [Pack C]"
+              className="hidden lg:flex items-center space-x-1 px-2 py-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/15 text-cream-dim hover:text-cream text-xs font-mono"
+            >
+              <Wrench className="w-3.5 h-3.5 text-sage" />
+              <span>Workshop</span>
+            </button>
+          )}
+
+          {isFeatureEnabled('comms_delay') && (
+            <button
+              type="button"
+              onClick={() => setIsCommsDelayOpen(true)}
+              title="Earth-Moon Comms Delay [Pack E]"
+              className={`hidden lg:flex items-center space-x-1 px-2 py-1 rounded border text-xs font-mono ${
+                commsPreset !== 'off'
+                  ? 'bg-sage/20 border-sage text-sage font-bold'
+                  : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream-dim hover:text-cream'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              <span>Comms{commsPreset !== 'off' ? ' (Lag)' : ''}</span>
+            </button>
+          )}
+
+          {isFeatureEnabled('sim_to_real') && (
+            <button
+              type="button"
+              onClick={() => setIsSimToRealOpen(true)}
+              title="Sim-to-Real Toolkit & Evaluator [Pack D]"
+              className="hidden xl:flex items-center space-x-1 px-2 py-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/15 text-cream-dim hover:text-cream text-xs font-mono"
+            >
+              <ShieldAlert className="w-3.5 h-3.5 text-sage" />
+              <span>Sim2Real</span>
+            </button>
+          )}
+
+          {isFeatureEnabled('daily_challenge') && (
+            <button
+              type="button"
+              onClick={() => setIsDailyChallengeOpen(true)}
+              title="Daily Challenge & Achievements [Pack I]"
+              className="hidden xl:flex items-center space-x-1 px-2 py-1 rounded bg-charcoal hover:bg-charcoal-light border border-cream/15 text-cream-dim hover:text-cream text-xs font-mono"
+            >
+              <Trophy className="w-3.5 h-3.5 text-amber-400" />
+              <span>Daily</span>
+            </button>
+          )}
+
+          {isFeatureEnabled('audio') && (
+            <button
+              type="button"
+              onClick={toggleAudio}
+              title={isAudioMuted ? 'Unmute Structure-Borne Audio [Pack K]' : 'Mute Audio'}
+              aria-label={isAudioMuted ? 'Unmute Audio' : 'Mute Audio'}
+              className={`p-1.5 rounded border text-xs font-mono transition-colors ${
+                !isAudioMuted
+                  ? 'bg-sage/20 border-sage text-sage font-bold'
+                  : 'bg-charcoal hover:bg-charcoal-light border-cream/15 text-cream-dim hover:text-cream'
+              }`}
+            >
+              {!isAudioMuted ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+            </button>
+          )}
         </div>
 
         {/* Right: Unified Run-Mode Chip, Honest FPS, Token Meter, Shortcuts, Layout */}
@@ -1477,6 +1576,44 @@ export default function Shell() {
           onClose={() => setShowGaitLab(false)}
         />
       )}
+
+      {/* Pack Expansion Modals */}
+      <DroidWorkshopModal
+        isOpen={isWorkshopOpen}
+        onClose={() => setIsWorkshopOpen(false)}
+        onSelectMorphology={(presetKey, spec) => {
+          showToast(`Applied ${spec.name} morphology preset.`, 'info');
+        }}
+      />
+
+      <CommsDelayModal
+        isOpen={isCommsDelayOpen}
+        activePreset={commsPreset}
+        onClose={() => setIsCommsDelayOpen(false)}
+        onSelectPreset={(presetKey, customSec) => {
+          setCommsPreset(presetKey);
+          showToast(`Comms delay set to ${presetKey.toUpperCase()}${customSec ? ` (${customSec}s)` : ''}.`, 'info');
+        }}
+      />
+
+      <SimToRealModal
+        isOpen={isSimToRealOpen}
+        onClose={() => setIsSimToRealOpen(false)}
+        onApplyConfig={(cfg) => {
+          showToast(`Domain randomization applied: latency=${cfg.motorLatencyMs.max}ms, noise=${cfg.rangeNoiseStd.max}m.`, 'info');
+        }}
+      />
+
+      <DailyChallengeModal
+        isOpen={isDailyChallengeOpen}
+        onClose={() => setIsDailyChallengeOpen(false)}
+        onStartChallenge={(ch) => {
+          engine.applyScenario({ seed: ch.seed, gravity: ch.gravity }, true);
+          setTerrainVersion(engine.terrain.getVersion());
+          engine.resetEpisode(true);
+          showToast(`Launched Daily Challenge: "${ch.title}" (Seed #${ch.seed})`, 'info');
+        }}
+      />
     </div>
   );
 }

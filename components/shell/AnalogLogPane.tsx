@@ -38,6 +38,10 @@ import { TelemetryStore } from '@/lib/telemetry/store';
 import { SimClockSnapshot, clampProgress, formatClockDisplay, formatProgressPct } from '@/lib/sim/SimClock';
 import { TelemetryChartSample } from '@/lib/sim/SimEngine';
 import { SafetyEvent } from '@/lib/control/types';
+import { isFeatureEnabled } from '@/lib/flags';
+import { ControllerPlaygroundTab } from '@/components/shell/tabs/ControllerPlaygroundTab';
+import { PolicyLabTab } from '@/components/shell/tabs/PolicyLabTab';
+import { ExperimentsTab } from '@/components/shell/tabs/ExperimentsTab';
 
 export type LogTab =
   | 'console'
@@ -48,7 +52,10 @@ export type LogTab =
   | 'critique'
   | 'safety'
   | 'jobs'
-  | 'metrics';
+  | 'metrics'
+  | 'controller'
+  | 'policylab'
+  | 'experiments';
 
 interface LogEntry {
   id: string;
@@ -232,6 +239,9 @@ export default function AnalogLogPane({
     { id: 'safety', label: 'Safety' },
     { id: 'jobs', label: 'Jobs' },
     { id: 'metrics', label: 'Metrics' },
+    ...(isFeatureEnabled('controller_playground') ? [{ id: 'controller' as const, label: 'Controller' }] : []),
+    ...(isFeatureEnabled('policy_lab') ? [{ id: 'policylab' as const, label: 'Policy Lab' }] : []),
+    ...(isFeatureEnabled('experiments') ? [{ id: 'experiments' as const, label: 'Experiments' }] : []),
   ];
 
   return (
@@ -1017,6 +1027,15 @@ export default function AnalogLogPane({
             <MetricsTabContent onOpenPrompt={onOpenPrompt} chartHistory={chartHistory} />
           </div>
         )}
+
+        {/* CONTROLLER PLAYGROUND TAB (Pack A) */}
+        {activeTab === 'controller' && <ControllerPlaygroundTab />}
+
+        {/* POLICY LAB TAB (Pack B) */}
+        {activeTab === 'policylab' && <PolicyLabTab />}
+
+        {/* EXPERIMENTS TAB (Pack M) */}
+        {activeTab === 'experiments' && <ExperimentsTab />}
       </div>
 
       {/* Action Approval Bar when not in Diff tab */}
