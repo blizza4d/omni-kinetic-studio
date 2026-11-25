@@ -8,15 +8,11 @@ import {
   RotateCcw,
   ChevronDown,
   ChevronUp,
-  Cpu,
-  Clock,
-  Waves,
 } from 'lucide-react';
 import { SimEngine } from '@/lib/sim/SimEngine';
 import {
   sampleDomain,
   DEFAULT_RANDOMIZATION_CONFIG,
-  DomainRandomizationConfig,
 } from '@/lib/sim2real/toolkit';
 
 export interface PhysicsDomainState {
@@ -58,9 +54,7 @@ export default function PhysicsDomainPanel({
     const next = { ...domain, ...updated };
     setDomain(next);
     if (engine) {
-      if (updated.gravityMps2 !== undefined) {
-        engine.scenario.gravity = next.gravityMps2;
-      }
+      engine.applyDomainPhysics(next);
     }
     if (onDomainChange) {
       onDomainChange(next);

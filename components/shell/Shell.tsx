@@ -42,13 +42,16 @@ import FpsBadge from '@/components/shell/FpsBadge';
 import PerfPanel from '@/components/shell/PerfPanel';
 import ControlHUD, { SensorOverlayFlags } from '@/components/control/ControlHUD';
 import RoboticsTelemetryPanel from '@/components/robotics/RoboticsTelemetryPanel';
-import PhysicsDomainPanel, { PhysicsDomainState } from '@/components/robotics/PhysicsDomainPanel';
+import PhysicsDomainPanel from '@/components/robotics/PhysicsDomainPanel';
 import NemotronPlannerPanel from '@/components/robotics/NemotronPlannerPanel';
 import DatasetRecorderPanel from '@/components/robotics/DatasetRecorderPanel';
+import BenchmarkPanel from '@/components/robotics/BenchmarkPanel';
+import HardwareBridgePanel from '@/components/robotics/HardwareBridgePanel';
 import { NemotronTaskPlan } from '@/lib/nebius/taskPlanner';
-import { globalEpisodeRecorder } from '@/lib/dataset/episodeRecorder';
+import { HardwareBridgeClient } from '@/lib/bridge/rosBridge';
+import { RobotProfileId, getRobotProfile } from '@/lib/robotics/profiles';
+import { BENCHMARK_SCENARIOS, BenchmarkScenarioId } from '@/lib/sim2real/benchmark';
 import {
-  MissionObjectiveHUD,
   MissionPickerModal,
   EpisodeResultsModal,
   ScenarioEditorDrawer,
@@ -204,9 +207,11 @@ export default function Shell() {
   const [logPaneWidth, setLogPaneWidth] = useState<number>(400);
   const [leftWorkbenchTab, setLeftWorkbenchTab] = useState<'telemetry' | 'physics' | 'architect'>('telemetry');
   const [showRightSidebar, setShowRightSidebar] = useState<boolean>(true);
-  const [rightWorkbenchTab, setRightWorkbenchTab] = useState<'planner' | 'dataset'>('planner');
+  const [rightWorkbenchTab, setRightWorkbenchTab] = useState<'planner' | 'benchmark' | 'bridge' | 'dataset'>('planner');
   const [activePlan, setActivePlan] = useState<NemotronTaskPlan | null>(null);
-  const [rightSidebarWidth, setRightSidebarWidth] = useState<number>(360);
+  const [activeProfileId, setActiveProfileId] = useState<RobotProfileId>('quadruped_scout');
+  const [digitalTwinEnabled, setDigitalTwinEnabled] = useState<boolean>(false);
+  const [rightSidebarWidth] = useState<number>(380);
 
   // Toast alert (accessible aria-live)
   const [toast, setToast] = useState<{ text: string; level: 'info' | 'warn' } | null>(null);
@@ -301,6 +306,30 @@ export default function Shell() {
     });
   }
   const engine = engineRef.current;
+
+  // ROS 2 / HIL WebSocket Bridge singleton ref (zero React overhead)
+  const bridgeClientRef = useRef<HardwareBridgeClient | null>(null);
+  if (!bridgeClientRef.current) {
+    bridgeClientRef.current = new HardwareBridgeClient({
+      onTelemetry: (tel) => {
+        engineRef.current?.applyDigitalTwinTelemetry(tel);
+      },
+    });
+  }
+  const bridgeClient = bridgeClientRef.current;
+
+  // Stream outbound geometry_msgs/Twist at bridge's configured rate (respecting E-STOP immediately)
+  useEffect(() => {
+    const id = setInterval(() => {
+      const cmd = engine.getLastShapedCommand();
+      const eStop = engine.getArbiterSnapshot().emergencyStop;
+      bridgeClient.sendCommand(cmd.vx, cmd.vy, cmd.yawRate, eStop, performance.now());
+    }, 33);
+    return () => {
+      clearInterval(id);
+      bridgeClient.dispose();
+    };
+  }, [engine, bridgeClient]);
 
   // Throttled UI sync tick (~10 Hz driven by ThreeViewer onUiSync — zero per-frame React state!)
   const [, setUiTick] = useState(0);
@@ -461,6 +490,7 @@ export default function Shell() {
           showToast('E-STOP released — actuators re-armed.', 'info');
         } else {
           engine.arbiter.triggerEmergencyStop();
+          bridgeClient.sendCommand(0, 0, 0, true, performance.now() + 1000);
           showToast('EMERGENCY STOP ENGAGED: Actuators halted via Spacebar override.', 'warn');
         }
         handleUiSync();
@@ -807,10 +837,11 @@ export default function Shell() {
       id: `wp_${w.id}`,
       x: w.position[0],
       z: w.position[2],
-      label: `WP ${w.id}`,
-      reachable: true,
+      targetSpeed: w.target_speed,
+      tolerance: w.arrival_tolerance,
     }));
-    engine.inputs.setWaypoints(waypoints);
+    engine.inputs.clearWaypoints();
+    engine.setAutonomousPlan(waypoints);
     engine.arbiter.releaseToPolicy();
     showToast(`Executing Nemotron Plan: ${plan.task_name} (${waypoints.length} waypoints)`, 'info');
     handleUiSync();
@@ -819,7 +850,41 @@ export default function Shell() {
   const handleClearPlan = useCallback(() => {
     setActivePlan(null);
     engine.inputs.clearWaypoints();
+    engine.clearAutonomousPlan();
     showToast('Autonomous plan cleared.', 'info');
+    handleUiSync();
+  }, [engine, showToast, handleUiSync]);
+
+  const handleProfileChange = useCallback((id: RobotProfileId) => {
+    const prof = engine.setRobotProfile(id);
+    setActiveProfileId(id);
+    showToast(`Switched Hardware Profile: ${prof.name} (${prof.massKg}kg, ${prof.maxTorqueNm}N·m)`, 'info');
+    addLog(`Robot profile updated -> ${prof.name} [${prof.locomotionType}, maxTorque=${prof.maxTorqueNm}N*m]`, 'info');
+    handleUiSync();
+  }, [engine, showToast, addLog, handleUiSync]);
+
+  const handleStageBenchmarkScenario = useCallback((scenarioId: BenchmarkScenarioId) => {
+    const spec = BENCHMARK_SCENARIOS[scenarioId];
+    engine.applyScenario(
+      {
+        name: spec.name,
+        seed: spec.baseSeed,
+        gravity: spec.gravityRange[0],
+        roughness: spec.roughness,
+        craterCount: spec.craterCount,
+        rockCount: spec.rockCount,
+        startPos: spec.startPos,
+        startHeading: spec.startHeading,
+        episodeLength: spec.timeLimitSec,
+      },
+      true
+    );
+    engine.applyDomainPhysics({ frictionCoeff: (spec.frictionRange[0] + spec.frictionRange[1]) * 0.5 });
+    setTerrainVersion(engine.terrain.getVersion());
+    engine.resetEpisode(true);
+    engine.setAutonomousPlan(spec.waypoints);
+    engine.arbiter.releaseToPolicy();
+    showToast(`Staged Benchmark Scenario: ${spec.name}`, 'info');
     handleUiSync();
   }, [engine, showToast, handleUiSync]);
 
@@ -1254,14 +1319,17 @@ export default function Shell() {
                 }}
                 eStopActive={arbiterSnap.emergencyStop}
                 controlLatencyMs={engine.getLastInputLatencyMs()}
-                webglFps={60}
+                webglFps={PerfProbe.getInstance().getMetrics().fps || 60}
+                robotProfile={getRobotProfile(activeProfileId)}
+                gravityMps2={scenario.gravity}
+                onProfileChange={handleProfileChange}
                 className="flex-1"
               />
             ) : leftWorkbenchTab === 'physics' ? (
               <PhysicsDomainPanel
                 engine={engine}
                 onDomainChange={(d) => {
-                  engine.scenario.gravity = d.gravityMps2;
+                  engine.applyDomainPhysics(d);
                   handleUiSync();
                 }}
                 className="flex-1"
@@ -1335,12 +1403,23 @@ export default function Shell() {
             onBoundaryWarning={(st, dist) => showToast(`Arena ${st} edge (${dist.toFixed(1)}m) — safety layer active.`, 'warn')}
           />
 
-          {/* Top-Center Mission Objectives HUD */}
-          <MissionObjectiveHUD
-            mission={activeMission}
-            progress={missionSnap}
-            onOpenPicker={() => setIsMissionsOpen(true)}
-          />
+          {/* Top-Center Hardware Profile / Digital Twin Mode Indicator */}
+          <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center space-x-2">
+            <div className="analog-glass px-3 py-1 text-[10px] font-mono text-cream flex items-center space-x-2 border border-cream/15 shadow-lg">
+              <span className="text-cream-dim uppercase">Platform:</span>
+              <span className="font-bold text-sage">{getRobotProfile(activeProfileId).shortLabel}</span>
+              {digitalTwinEnabled && (
+                <span className="px-1.5 py-0.5 rounded bg-amber-400/20 border border-amber-400/40 text-amber-300 font-bold uppercase animate-pulse">
+                  HIL Digital Twin
+                </span>
+              )}
+              {engine.getAutonomousPlanState().active && (
+                <span className="px-1.5 py-0.5 rounded bg-sage/20 border border-sage/40 text-sage font-bold uppercase">
+                  Nemotron Auto ({engine.getAutonomousPlanState().currentIndex + 1}/{engine.getAutonomousPlanState().totalWaypoints})
+                </span>
+              )}
+            </div>
+          </div>
 
           {/* Accessible Rate-Limited Toast Banner */}
           {toast && (
@@ -1522,45 +1601,68 @@ export default function Shell() {
           </div>
         </main>
 
-        {/* Right Robotics Workbench Panel (Nemotron Planner & Dataset Recorder) */}
+        {/* Right Robotics Workbench Panel (Nemotron Planner, Benchmark Suite, HIL Bridge, Dataset) */}
         {showRightSidebar && (
           <aside
             style={{ width: `${rightSidebarWidth}px` }}
-            className="hidden xl:flex flex-col shrink-0 gap-1.5 overflow-hidden transition-all duration-150 h-full"
+            className="hidden lg:flex flex-col shrink-0 gap-1.5 overflow-hidden transition-all duration-150 h-full"
           >
             {/* Right Tab Switch Header */}
-            <div className="flex items-center space-x-1 p-1 bg-charcoal-deep rounded-lg border border-cream/10 text-[10px] font-mono shrink-0">
-              <button
-                type="button"
-                onClick={() => setRightWorkbenchTab('planner')}
-                className={`flex-1 py-1 px-2 rounded font-bold uppercase transition-colors text-center ${
-                  rightWorkbenchTab === 'planner'
-                    ? 'bg-sage text-charcoal-deep shadow-sm'
-                    : 'text-cream-dim hover:text-cream'
-                }`}
-              >
-                Nemotron Planner
-              </button>
-              <button
-                type="button"
-                onClick={() => setRightWorkbenchTab('dataset')}
-                className={`flex-1 py-1 px-2 rounded font-bold uppercase transition-colors text-center ${
-                  rightWorkbenchTab === 'dataset'
-                    ? 'bg-sage text-charcoal-deep shadow-sm'
-                    : 'text-cream-dim hover:text-cream'
-                }`}
-              >
-                Dataset Recorder
-              </button>
+            <div className="grid grid-cols-4 gap-1 p-1 bg-charcoal-deep rounded-lg border border-cream/10 text-[9px] font-mono shrink-0">
+              {([
+                { id: 'planner', label: 'Planner' },
+                { id: 'benchmark', label: 'Benchmark' },
+                { id: 'bridge', label: 'HIL Bridge' },
+                { id: 'dataset', label: 'Dataset' },
+              ] as const).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setRightWorkbenchTab(tab.id)}
+                  className={`py-1 px-1 rounded font-bold uppercase transition-colors text-center truncate ${
+                    rightWorkbenchTab === tab.id
+                      ? 'bg-sage text-charcoal-deep shadow-sm'
+                      : 'text-cream-dim hover:text-cream'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
             </div>
 
             {rightWorkbenchTab === 'planner' ? (
               <NemotronPlannerPanel
-                currentPose={latestChart ? [latestChart.speed, 0.44, 0] : [0, 0.44, 0]}
+                currentPose={
+                  TelemetryStore.getInstance().getLatestFrame()?.bodies?.[0]?.pos ?? [0, 0.44, 0]
+                }
                 onExecutePlan={handleExecutePlan}
                 onClearPlan={handleClearPlan}
                 activePlan={activePlan}
-                isExecuting={engine.inputs.getWaypoints().length > 0}
+                isExecuting={engine.getAutonomousPlanState().active || engine.inputs.getWaypoints().length > 0}
+                className="flex-1"
+              />
+            ) : rightWorkbenchTab === 'benchmark' ? (
+              <BenchmarkPanel
+                profileId={activeProfileId}
+                activePlan={activePlan}
+                onPreviewScenario={handleStageBenchmarkScenario}
+                className="flex-1"
+              />
+            ) : rightWorkbenchTab === 'bridge' ? (
+              <HardwareBridgePanel
+                bridgeClient={bridgeClient}
+                digitalTwinEnabled={digitalTwinEnabled}
+                onToggleDigitalTwin={(en) => {
+                  setDigitalTwinEnabled(en);
+                  engine.setDigitalTwinEnabled(en);
+                  showToast(
+                    en ? 'Digital Twin Mode ACTIVE — 3D robot driven by inbound WebSocket pose' : 'Digital Twin Mode OFF — local physics active',
+                    'info'
+                  );
+                }}
+                eStopActive={arbiterSnap.emergencyStop}
+                robotPose={TelemetryStore.getInstance().getLatestFrame()?.bodies?.[0]?.pos ?? [0, 0.44, 0]}
+                robotYaw={0}
                 className="flex-1"
               />
             ) : (
@@ -1570,7 +1672,7 @@ export default function Shell() {
                     ? 'gesture'
                     : arbiterSnap.activeSource === 'keyboard'
                     ? 'keyboard'
-                    : arbiterSnap.activeSource === 'pointer'
+                    : arbiterSnap.activeSource === 'pointer' || engine.getAutonomousPlanState().active
                     ? 'nemotron'
                     : 'keyboard'
                 }

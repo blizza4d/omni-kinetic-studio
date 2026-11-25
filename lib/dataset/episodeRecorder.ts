@@ -10,6 +10,7 @@
 
 import { TelemetryFrame } from '@/contracts';
 import { quaternionToEuler, Quaternion4 } from '@/lib/frames';
+import { PerceptionStore } from '@/lib/perception/lidar';
 
 export type DatasetControlSource = 'keyboard' | 'gesture' | 'nemotron' | 'gamepad' | 'manual';
 
@@ -25,6 +26,7 @@ export interface LeRobotObservation {
   ground_contacts: [boolean, boolean, boolean, boolean]; // [FL, FR, RL, RR]
   imu_accel: [number, number, number]; // [ax, ay, az] in m/s^2
   imu_gyro: [number, number, number]; // [gx, gy, gz] in deg/s
+  lidar_ranges: number[]; // Raycast LiDAR range vector in meters
 }
 
 export interface LeRobotAction {
@@ -105,7 +107,8 @@ export class EpisodeDemonstrationRecorder {
     frame: TelemetryFrame,
     cmd: { vx: number; vy: number; yawRate: number; gait?: string },
     controlSource: DatasetControlSource = this.currentSource,
-    isTerminal = false
+    isTerminal = false,
+    lidarRanges?: number[]
   ): void {
     if (!this.isRecording) return;
 
@@ -124,6 +127,12 @@ export class EpisodeDemonstrationRecorder {
       Boolean(frame.feet?.[2]?.contact),
       Boolean(frame.feet?.[3]?.contact),
     ];
+
+    const rawRanges =
+      lidarRanges && lidarRanges.length > 0
+        ? lidarRanges
+        : PerceptionStore.getInstance().getLatestLidarRanges();
+    const capturedRanges = rawRanges.map((r) => Number(r.toFixed(3)));
 
     const demoFrame: RoboticsDemonstrationFrame = {
       step: this.frames.length,
@@ -157,6 +166,7 @@ export class EpisodeDemonstrationRecorder {
           Number((pitchRad * toDeg).toFixed(2)),
           Number((yawRad * toDeg).toFixed(2)),
         ],
+        lidar_ranges: capturedRanges,
       },
       action: {
         linear_vel_cmd: [Number(cmd.vx.toFixed(3)), Number(cmd.vy.toFixed(3))],
@@ -241,6 +251,8 @@ export class EpisodeDemonstrationRecorder {
             'observation.state.ground_contacts': f.observation.ground_contacts,
             'observation.sensor.imu_accel': f.observation.imu_accel,
             'observation.sensor.imu_gyro': f.observation.imu_gyro,
+            'observation.lidar_ranges': f.observation.lidar_ranges,
+            lidar_ranges: f.observation.lidar_ranges,
           },
           action: [
             f.action.linear_vel_cmd[0],
@@ -301,6 +313,8 @@ export class EpisodeDemonstrationRecorder {
       'imu_gyro_x',
       'imu_gyro_y',
       'imu_gyro_z',
+      'lidar_min_range_m',
+      'lidar_ray_count',
       'reward',
     ];
 
@@ -310,6 +324,7 @@ export class EpisodeDemonstrationRecorder {
       for (const f of ep.frames) {
         const o = f.observation;
         const speed = Math.hypot(o.linear_velocity[0], o.linear_velocity[2]).toFixed(3);
+        const minLidar = o.lidar_ranges.length > 0 ? Math.min(...o.lidar_ranges) : 15.0;
         const row = [
           ep.meta.id,
           f.step,
@@ -342,6 +357,8 @@ export class EpisodeDemonstrationRecorder {
           o.imu_gyro[0].toFixed(2),
           o.imu_gyro[1].toFixed(2),
           o.imu_gyro[2].toFixed(2),
+          minLidar.toFixed(3),
+          o.lidar_ranges.length,
           (f.reward ?? 0).toFixed(3),
         ];
         rows.push(row.join(','));

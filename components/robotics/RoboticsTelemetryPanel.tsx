@@ -10,7 +10,6 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronUp,
-  Cpu,
   Power,
   RotateCcw,
 } from 'lucide-react';
@@ -20,6 +19,13 @@ import {
   RoboticsTelemetryData,
   DEFAULT_ROBOTICS_TELEMETRY,
 } from '@/lib/telemetry/robotics';
+import {
+  DEFAULT_ROBOT_PROFILE,
+  ROBOT_PROFILE_LIST,
+  RobotProfile,
+  RobotProfileId,
+} from '@/lib/robotics/profiles';
+import LidarMiniRadar from './LidarMiniRadar';
 
 interface RoboticsTelemetryPanelProps {
   telemetryStore: TelemetryStore;
@@ -28,6 +34,9 @@ interface RoboticsTelemetryPanelProps {
   eStopActive: boolean;
   controlLatencyMs?: number;
   webglFps?: number;
+  robotProfile?: RobotProfile;
+  gravityMps2?: number;
+  onProfileChange?: (id: RobotProfileId) => void;
   isCollapsed?: boolean;
   onToggleCollapse?: () => void;
   className?: string;
@@ -40,6 +49,9 @@ export default function RoboticsTelemetryPanel({
   eStopActive,
   controlLatencyMs = 2.1,
   webglFps = 60,
+  robotProfile = DEFAULT_ROBOT_PROFILE,
+  gravityMps2 = 1.62,
+  onProfileChange,
   isCollapsed = false,
   onToggleCollapse,
   className = '',
@@ -61,7 +73,9 @@ export default function RoboticsTelemetryPanel({
           latestFrame,
           eStopActive,
           controlLatencyMs,
-          webglFps
+          webglFps,
+          robotProfile,
+          gravityMps2
         );
         setData(telemetry);
       }
@@ -76,7 +90,7 @@ export default function RoboticsTelemetryPanel({
         cancelAnimationFrame(rafId.current);
       }
     };
-  }, [telemetryStore, eStopActive, controlLatencyMs, webglFps]);
+  }, [telemetryStore, eStopActive, controlLatencyMs, webglFps, robotProfile, gravityMps2]);
 
   const { pose, velocity, actuators, safety, system } = data;
 
@@ -156,6 +170,36 @@ export default function RoboticsTelemetryPanel({
 
       {!isCollapsed && (
         <div className="p-3.5 space-y-4 overflow-y-auto max-h-[calc(100vh-280px)] custom-scrollbar">
+          {/* Multi-Robot Profile Switcher */}
+          <div className="p-2 rounded-lg bg-charcoal-deep/65 border border-cream/10 space-y-1.5">
+            <div className="flex items-center justify-between text-[9px] text-cream-dim uppercase font-bold">
+              <span>Hardware Profile</span>
+              <span className="tabular-nums text-cream">
+                {robotProfile.massKg}kg · {robotProfile.maxTorqueNm}N·m · wb {robotProfile.wheelbaseM}m
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-1">
+              {ROBOT_PROFILE_LIST.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => onProfileChange?.(p.id)}
+                  className={`py-1 px-1.5 rounded text-[9px] font-bold uppercase border transition-colors truncate ${
+                    robotProfile.id === p.id
+                      ? 'bg-sage text-charcoal-deep border-sage'
+                      : 'bg-charcoal text-cream-dim border-cream/10 hover:text-cream'
+                  }`}
+                  title={p.description}
+                >
+                  {p.shortLabel}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Synthetic Perception: Live 2D LiDAR Mini-Radar & Camera Controls */}
+          <LidarMiniRadar />
+
           {/* Section 1: Pose & Kinematics */}
           <div className="space-y-1.5">
             <div className="flex items-center justify-between text-[10px] font-bold uppercase text-cream-dim tracking-wider border-b border-cream/5 pb-1">
@@ -263,13 +307,14 @@ export default function RoboticsTelemetryPanel({
                       <div className="space-y-1">
                         {limbActuators.map((a) => {
                           const torqueAbs = Math.abs(a.torqueNm);
+                          const maxT = Math.max(10, system.maxTorqueNm || 45);
                           const torqueColor =
-                            torqueAbs > 25
+                            torqueAbs > maxT * 0.78
                               ? 'bg-brick'
-                              : torqueAbs > 15
+                              : torqueAbs > maxT * 0.45
                               ? 'bg-amber-400'
                               : 'bg-sage';
-                          const torquePercent = Math.min(100, (torqueAbs / 35) * 100);
+                          const torquePercent = Math.min(100, (torqueAbs / maxT) * 100);
 
                           return (
                             <div key={a.id} className="text-[9px] space-y-0.5">

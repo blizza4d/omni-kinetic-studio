@@ -20,6 +20,8 @@ import RadarPanel from '@/components/radar/RadarPanel';
 import { MissionMarker } from '@/lib/missions/missions';
 import { Waypoint } from '@/lib/control/types';
 import { globalAudioSynthesizer } from '@/lib/audio/synthesizer';
+import { PerceptionStore } from '@/lib/perception/lidar';
+import { buildRobotForProfile, disposeObjectTree, BuiltRobotRig } from './robotModels';
 
 export type CameraPreset = 'chase' | 'top' | 'side' | 'free';
 export type QualityTier = 'ultra' | 'high' | 'medium' | 'low' | 'potato';
@@ -112,6 +114,23 @@ export default function ThreeViewer({
 }: ThreeViewerProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [contextLost, setContextLost] = useState(false);
+
+  // Sync PiP toggle & Depth Map mode from PerceptionStore
+  const [pipCfg, setPipCfg] = useState(() => PerceptionStore.getInstance().getPipConfig());
+  const pipFirstSyncRef = useRef(true);
+  useEffect(() => {
+    const store = PerceptionStore.getInstance();
+    return store.subscribeConfig(() => {
+      setPipCfg(store.getPipConfig());
+    });
+  }, []);
+  useEffect(() => {
+    if (pipFirstSyncRef.current) {
+      pipFirstSyncRef.current = false;
+      return;
+    }
+    PerceptionStore.getInstance().setPipConfig({ enabled: pipEnabled });
+  }, [pipEnabled]);
 
   // Throttled radar pose state (15 Hz) to avoid per-frame React commits
   const [radarState, setRadarState] = useState<{
@@ -316,12 +335,70 @@ export default function ThreeViewer({
     // Instanced Debris Boulders (white base material 0xffffff for true lit/shadow shading)
     debrisMeshesRef.current = buildChunkedDebris(scene, engineRef.current.getDebris(), shadowsEnabled);
 
-    // Upgraded Detailed 12-DOF Quadruped Droid + Ghost Droid
-    const { robotGroup, jointGroups, colliderSphere, antennaGroup, actuatorLeds } = buildDetailedQuadruped(false);
-    scene.add(robotGroup);
-    const { robotGroup: ghostGroup, jointGroups: ghostJoints } = buildDetailedQuadruped(true);
-    ghostGroup.visible = false;
-    scene.add(ghostGroup);
+    // Dynamic Multi-Robot Profile Rig + Ghost Droid (with clean disposal on profile change)
+    let activeProfileId = engineRef.current.getRobotProfile().id;
+    let mainRig: BuiltRobotRig = buildRobotForProfile(engineRef.current.getRobotProfile(), false);
+    scene.add(mainRig.robotGroup);
+    let ghostRig: BuiltRobotRig = buildRobotForProfile(engineRef.current.getRobotProfile(), true);
+    ghostRig.robotGroup.visible = false;
+    scene.add(ghostRig.robotGroup);
+
+    // Offscreen Picture-in-Picture RenderTarget (15-20 FPS throttled) + Depth Shader Override + Quad Blitter
+    const pipRenderTarget = new THREE.WebGLRenderTarget(320, 180, {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      format: THREE.RGBAFormat,
+    });
+    const pipDepthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.BasicDepthPacking });
+    pipDepthMat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying float vLinearViewZ;')
+        .replace('#include <project_vertex>', '#include <project_vertex>\nvLinearViewZ = -mvPosition.z;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying float vLinearViewZ;')
+        .replace(
+          'float fragCoordZ = 0.5 * vHighPrecisionZW[0] / vHighPrecisionZW[1] + 0.5;',
+          `float dNorm = clamp((vLinearViewZ - 0.15) / 14.0, 0.0, 1.0);
+           float g = pow(1.0 - dNorm, 0.85);
+           gl_FragColor = vec4(g * 0.82, g * 0.98, min(1.0, g * 1.15), 1.0);
+           return;`
+        );
+    };
+    const pipOrthoScene = new THREE.Scene();
+    const pipOrthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const pipQuadGeo = new THREE.PlaneGeometry(2, 2);
+    const pipQuadMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: pipRenderTarget.texture },
+        uIsDepth: { value: 0.0 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float uIsDepth;
+        varying vec2 vUv;
+        void main() {
+          vec4 tex = texture2D(tDiffuse, vUv);
+          if (uIsDepth > 0.5) {
+            gl_FragColor = vec4(tex.rgb, 1.0);
+          } else {
+            vec3 c = tex.rgb / (1.0 + tex.rgb * 0.35);
+            gl_FragColor = vec4(pow(max(c, vec3(0.0)), vec3(1.0 / 2.1)), 1.0);
+          }
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const pipQuadMesh = new THREE.Mesh(pipQuadGeo, pipQuadMat);
+    pipOrthoScene.add(pipQuadMesh);
+    let lastPipRenderMs = 0;
 
     // Subtle Ground Contact Shadows (shrinking & fading cleanly during flight — R-03 fixed!)
     const footShadows = buildFootContactShadows(scene);
@@ -352,18 +429,43 @@ export default function ThreeViewer({
     scene.add(markerGroup);
     let lastMarkerSig = '';
 
-    // Sensor Overlays Group (LiDAR rays, GRF arrows, Support Polygon, Planned Path — Phase W9.1)
-    const lidarMaxVerts = 64;
+    // Sensor Overlays Group (Three.js Raycaster LiDAR Beams + Point Cloud Hit Markers + GRF Arrows + Support Polygon)
+    const lidarMaxRays = 96;
+    const lidarMaxVerts = lidarMaxRays * 2;
     const lidarPositions = new Float32Array(lidarMaxVerts * 3);
     const lidarColors = new Float32Array(lidarMaxVerts * 3);
     const lidarGeo = new THREE.BufferGeometry();
     lidarGeo.setAttribute('position', new THREE.BufferAttribute(lidarPositions, 3));
     lidarGeo.setAttribute('color', new THREE.BufferAttribute(lidarColors, 3));
-    const lidarMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.72 });
+    const lidarMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.42 });
     const lidarLines = new THREE.LineSegments(lidarGeo, lidarMat);
     lidarLines.visible = false;
     lidarLines.frustumCulled = false;
     scene.add(lidarLines);
+
+    const lidarPtsPositions = new Float32Array(lidarMaxRays * 3);
+    const lidarPtsColors = new Float32Array(lidarMaxRays * 3);
+    const lidarPtsGeo = new THREE.BufferGeometry();
+    lidarPtsGeo.setAttribute('position', new THREE.BufferAttribute(lidarPtsPositions, 3));
+    lidarPtsGeo.setAttribute('color', new THREE.BufferAttribute(lidarPtsColors, 3));
+    const lidarPtsMat = new THREE.PointsMaterial({
+      size: 0.14,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.92,
+      sizeAttenuation: true,
+    });
+    const lidarHitPoints = new THREE.Points(lidarPtsGeo, lidarPtsMat);
+    lidarHitPoints.visible = false;
+    lidarHitPoints.frustumCulled = false;
+    scene.add(lidarHitPoints);
+
+    // Preallocated Three.js Raycaster scratch structures for zero-GC 18 Hz scanning
+    const lidarRaycaster = new THREE.Raycaster();
+    const tmpRayOrigin = new THREE.Vector3();
+    const tmpRayDir = new THREE.Vector3();
+    const tmpLidarTargets: THREE.Object3D[] = [];
+    const tmpLidarHits: THREE.Intersection[] = [];
 
     const grfPositions = new Float32Array(4 * 2 * 3);
     const grfGeo = new THREE.BufferGeometry();
@@ -563,7 +665,7 @@ export default function ThreeViewer({
             },
             listenersCount: 1,
             loopsCount: 1,
-            meshCount: robotGroup.children.length,
+            meshCount: mainRig.robotGroup.children.length,
           };
         },
         finishEpisode: () => {
@@ -611,46 +713,69 @@ export default function ThreeViewer({
       const eng = engineRef.current;
       const { alpha } = eng.tick(dt);
       eng.sampleRenderState(alpha, renderState);
+      const activeProfile = eng.getRobotProfile();
 
-      // 1. Update Droid Root Transform (strictly on canonical terrain heightfield — ZERO floating!)
+      // Dynamic Multi-Robot Profile Switch (cleanly disposes prior WebGL subtree)
+      if (renderState.profileId && renderState.profileId !== activeProfileId) {
+        scene.remove(mainRig.robotGroup);
+        disposeObjectTree(mainRig.robotGroup);
+        scene.remove(ghostRig.robotGroup);
+        disposeObjectTree(ghostRig.robotGroup);
+
+        activeProfileId = renderState.profileId;
+        mainRig = buildRobotForProfile(activeProfile, false);
+        scene.add(mainRig.robotGroup);
+        ghostRig = buildRobotForProfile(activeProfile, true);
+        ghostRig.robotGroup.visible = false;
+        scene.add(ghostRig.robotGroup);
+      }
+
+      // 1. Update Droid Root Transform (height grounded smoothly to profile stance height)
       const sanitized = sanitizeViewerPosition(renderState.pos, DEFAULT_ARENA);
-      robotGroup.position.set(sanitized.pos[0], sanitized.pos[1], sanitized.pos[2]);
-      robotGroup.quaternion.set(renderState.quat[0], renderState.quat[1], renderState.quat[2], renderState.quat[3]);
+      const profileYAdjust = activeProfile.id === 'quadruped_scout' ? 0 : activeProfile.dimensions.standingHeightM - 0.385;
+      mainRig.robotGroup.position.set(sanitized.pos[0], sanitized.pos[1] + profileYAdjust, sanitized.pos[2]);
+      mainRig.robotGroup.quaternion.set(renderState.quat[0], renderState.quat[1], renderState.quat[2], renderState.quat[3]);
 
-      // 2. Update Articulated Joint Rotations + Torque-Driven Actuator LEDs
-      for (const name in renderState.joints) {
-        const g = jointGroups[name];
-        const angle = renderState.joints[name];
-        if (g) {
-          if (name.includes('hip')) g.rotation.x = -angle;
-          else if (name.includes('thigh')) g.rotation.z = angle;
-          else if (name.includes('calf')) g.rotation.z = angle;
+      // 2. Update Wheel Rotation (4WD) OR Articulated Joint Rotations (Quadruped) + Actuator LEDs
+      if (activeProfile.locomotionType === 'differential_4wd' && renderState.wheelAngles) {
+        for (let i = 0; i < mainRig.wheelMeshes.length && i < 4; i++) {
+          mainRig.wheelMeshes[i]!.rotation.z = -renderState.wheelAngles[i]!;
         }
-        const led = actuatorLeds[name];
-        if (led) {
-          const tq = renderState.jointTorques[name] ?? 0;
-          const intensity = Math.min(1.6, 0.25 + tq * 0.22);
-          (led.material as THREE.MeshStandardMaterial).emissiveIntensity = intensity;
+      } else {
+        for (const name in renderState.joints) {
+          const g = mainRig.jointGroups[name];
+          const angle = renderState.joints[name];
+          if (g) {
+            if (name.includes('hip')) g.rotation.x = -angle;
+            else if (name.includes('thigh')) g.rotation.z = angle;
+            else if (name.includes('calf')) g.rotation.z = angle;
+          }
+          const led = mainRig.actuatorLeds[name];
+          if (led) {
+            const tq = renderState.jointTorques[name] ?? 0;
+            const intensity = Math.min(1.6, 0.25 + tq * 0.22);
+            (led.material as THREE.MeshStandardMaterial).emissiveIntensity = intensity;
+          }
         }
       }
 
       // Secondary-motion antenna sway
-      if (antennaGroup) {
-        antennaGroup.rotation.z = renderState.antennaAngles[0] * 0.8;
-        antennaGroup.rotation.x = renderState.antennaAngles[1] * 0.8;
+      if (mainRig.antennaGroup) {
+        mainRig.antennaGroup.rotation.z = renderState.antennaAngles[0] * 0.8;
+        mainRig.antennaGroup.rotation.x = renderState.antennaAngles[1] * 0.8;
       }
 
       // Collider debug wireframe
-      colliderSphere.visible = showColliderRef.current;
+      mainRig.colliderSphere.visible = showColliderRef.current;
 
       // 3. Ghost Droid Overlay (from saved replay or comparison)
       const ghostPose = showGhostRef.current || eng.hasGhost() ? eng.getCurrentGhostPose() : null;
       if (ghostPose) {
-        ghostGroup.visible = true;
-        ghostGroup.position.set(ghostPose.pos[0], ghostPose.pos[1], ghostPose.pos[2]);
-        ghostGroup.quaternion.set(ghostPose.quat[0], ghostPose.quat[1], ghostPose.quat[2], ghostPose.quat[3]);
+        ghostRig.robotGroup.visible = true;
+        ghostRig.robotGroup.position.set(ghostPose.pos[0], ghostPose.pos[1] + profileYAdjust, ghostPose.pos[2]);
+        ghostRig.robotGroup.quaternion.set(ghostPose.quat[0], ghostPose.quat[1], ghostPose.quat[2], ghostPose.quat[3]);
         for (const name in renderState.joints) {
-          const gg = ghostJoints[name];
+          const gg = ghostRig.jointGroups[name];
           if (gg) {
             const ang = renderState.joints[name];
             if (name.includes('hip')) gg.rotation.x = -ang;
@@ -658,7 +783,7 @@ export default function ThreeViewer({
           }
         }
       } else {
-        ghostGroup.visible = false;
+        ghostRig.robotGroup.visible = false;
       }
 
       // 4. Subtle Contact Shadows under actual footfalls + Ballistic Dust Puffs
@@ -728,10 +853,16 @@ export default function ThreeViewer({
         trailLine.computeLineDistances();
       }
 
-      // 7. Rebuild Mission Beacons & Waypoints when changed
+      // 7. Rebuild Mission Beacons & Waypoints (Pointer Queue OR Nemotron/Benchmark Autonomous Plan)
       const activeMarkers = missionMarkersRef.current;
       const doneIds = completedIdsRef.current;
-      const wps = waypointsRef.current;
+      const pointerWps = waypointsRef.current;
+      const planWps = eng.getAutonomousPlanState().remainingWaypoints;
+      const wps =
+        pointerWps.length > 0
+          ? pointerWps
+          : planWps.map((p, i) => ({ id: p.id, x: p.x, z: p.z, label: `WP ${i + 1}`, reachable: true }));
+
       const markerSig = `${activeMarkers.map((m) => m.id).join(',')}|${doneIds.join(',')}|${wps.map((w) => `${w.x.toFixed(1)},${w.z.toFixed(1)}`).join(';')}|${colorblindRef.current}`;
       if (markerSig !== lastMarkerSig) {
         lastMarkerSig = markerSig;
@@ -756,31 +887,155 @@ export default function ThreeViewer({
       }
       markerGroup.visible = showOverlaysRef.current;
 
-      // 8. Sensor Overlays (LiDAR, GRF Arrows, Support Polygon, Planned Path — Phase W9.1)
+      // 8. Sensor Overlays (Configurable 36-72 Ray Three.js Raycaster LiDAR + Hit Cloud + GRF Arrows + Path)
       const sFlags = sensorsRef.current;
-      lidarLines.visible = sFlags.lidar && !isLow;
-      if (lidarLines.visible && now - lastLidarMs > 50) {
+      const perceptionStore = PerceptionStore.getInstance();
+      const lCfg = perceptionStore.getLidarConfig();
+      const pCfg = perceptionStore.getPipConfig();
+      const lidarActive = lCfg.enabled || sFlags.lidar;
+      lidarLines.visible = (sFlags.lidar || (lCfg.enabled && showOverlaysRef.current)) && !isLow;
+      lidarHitPoints.visible = lidarActive && showOverlaysRef.current;
+      lidarMat.opacity = sFlags.lidar ? 0.58 : 0.24;
+
+      if (lidarActive && now - lastLidarMs >= 55) {
         lastLidarMs = now;
-        const rays = eng.computeLidarScan(24, 14.0);
-        let idx = 0;
-        for (let i = 0; i < rays.length && idx + 1 < lidarMaxVerts; i++) {
-          const r = rays[i];
-          lidarPositions[idx * 3] = r.origin[0];
-          lidarPositions[idx * 3 + 1] = r.origin[1];
-          lidarPositions[idx * 3 + 2] = r.origin[2];
-          lidarPositions[(idx + 1) * 3] = r.hitPoint[0];
-          lidarPositions[(idx + 1) * 3 + 1] = r.hitPoint[1];
-          lidarPositions[(idx + 1) * 3 + 2] = r.hitPoint[2];
-          const cr = r.isObstacle ? 0.96 : 0.42;
-          const cg = r.isObstacle ? 0.35 : 0.72;
-          const cb = r.isObstacle ? 0.25 : 0.55;
-          lidarColors[idx * 3] = cr; lidarColors[idx * 3 + 1] = cg; lidarColors[idx * 3 + 2] = cb;
-          lidarColors[(idx + 1) * 3] = cr; lidarColors[(idx + 1) * 3 + 1] = cg; lidarColors[(idx + 1) * 3 + 2] = cb;
-          idx += 2;
+        const tStart = performance.now();
+        const rayCount = Math.min(lidarMaxRays, Math.max(12, lCfg.rayCount));
+        const maxRange = lCfg.maxRangeM;
+        const fovRad = (lCfg.fovDeg * Math.PI) / 180;
+        const mountOffset = activeProfile.sensorMounts.lidar.offsetLocal;
+
+        // World-space mount origin
+        tmpRayOrigin.set(mountOffset[0], mountOffset[1], mountOffset[2]).applyQuaternion(mainRig.robotGroup.quaternion).add(mainRig.robotGroup.position);
+
+        let vIdx = 0;
+        let pIdx = 0;
+        const rangesOut: number[] = [];
+        const anglesOut: number[] = [];
+        const obsOut: boolean[] = [];
+        let minObsDist = maxRange;
+        let minAnyDist = maxRange;
+
+        if (lCfg.useThreeRaycaster && terrainMeshRef.current && !isLow) {
+          tmpLidarTargets.length = 0;
+          tmpLidarTargets.push(terrainMeshRef.current);
+          const chunks = debrisMeshesRef.current;
+          for (let c = 0; c < chunks.length; c++) {
+            const dm = chunks[c]!;
+            if (!dm.boundingSphere || dm.boundingSphere.center.distanceTo(tmpRayOrigin) <= dm.boundingSphere.radius + maxRange + 1.5) {
+              tmpLidarTargets.push(dm);
+            }
+          }
+          lidarRaycaster.near = 0.28;
+          lidarRaycaster.far = maxRange;
+
+          for (let i = 0; i < rayCount; i++) {
+            const frac = rayCount > 1 ? i / (rayCount - 1) - 0.5 : 0;
+            const relAngle = frac * fovRad;
+            const worldAngle = renderState.yaw + relAngle;
+            tmpRayDir.set(Math.cos(worldAngle), -0.10, -Math.sin(worldAngle)).normalize();
+
+            lidarRaycaster.set(tmpRayOrigin, tmpRayDir);
+            tmpLidarHits.length = 0;
+            lidarRaycaster.intersectObjects(tmpLidarTargets, false, tmpLidarHits);
+
+            const hit = tmpLidarHits.length > 0 ? tmpLidarHits[0] : null;
+            const hitDist = hit ? hit.distance : maxRange;
+            const isObs = hit ? hit.object !== terrainMeshRef.current : false;
+
+            const hx = hit ? hit.point.x : tmpRayOrigin.x + tmpRayDir.x * maxRange;
+            const hy = hit ? hit.point.y : tmpRayOrigin.y + tmpRayDir.y * maxRange;
+            const hz = hit ? hit.point.z : tmpRayOrigin.z + tmpRayDir.z * maxRange;
+
+            rangesOut.push(Number(hitDist.toFixed(3)));
+            anglesOut.push(relAngle);
+            obsOut.push(isObs);
+            if (hitDist < minAnyDist) minAnyDist = hitDist;
+            if (isObs && hitDist < minObsDist) minObsDist = hitDist;
+
+            const cr = isObs ? 0.96 : 0.44;
+            const cg = isObs ? 0.35 : 0.78;
+            const cb = isObs ? 0.25 : 0.56;
+
+            if (vIdx + 1 < lidarMaxVerts) {
+              lidarPositions[vIdx * 3] = tmpRayOrigin.x;
+              lidarPositions[vIdx * 3 + 1] = tmpRayOrigin.y;
+              lidarPositions[vIdx * 3 + 2] = tmpRayOrigin.z;
+              lidarPositions[(vIdx + 1) * 3] = hx;
+              lidarPositions[(vIdx + 1) * 3 + 1] = hy;
+              lidarPositions[(vIdx + 1) * 3 + 2] = hz;
+              lidarColors[vIdx * 3] = cr; lidarColors[vIdx * 3 + 1] = cg; lidarColors[vIdx * 3 + 2] = cb;
+              lidarColors[(vIdx + 1) * 3] = cr; lidarColors[(vIdx + 1) * 3 + 1] = cg; lidarColors[(vIdx + 1) * 3 + 2] = cb;
+              vIdx += 2;
+            }
+            if (pIdx < lidarMaxRays && hit) {
+              lidarPtsPositions[pIdx * 3] = hx;
+              lidarPtsPositions[pIdx * 3 + 1] = hy + 0.03;
+              lidarPtsPositions[pIdx * 3 + 2] = hz;
+              lidarPtsColors[pIdx * 3] = cr;
+              lidarPtsColors[pIdx * 3 + 1] = cg;
+              lidarPtsColors[pIdx * 3 + 2] = cb;
+              pIdx++;
+            }
+          }
+        } else {
+          const rays = eng.computeLidarScan(rayCount, maxRange, fovRad);
+          for (let i = 0; i < rays.length; i++) {
+            const r = rays[i]!;
+            const frac = rayCount > 1 ? i / (rayCount - 1) - 0.5 : 0;
+            rangesOut.push(r.dist);
+            anglesOut.push(frac * fovRad);
+            obsOut.push(r.isObstacle);
+            if (r.dist < minAnyDist) minAnyDist = r.dist;
+            if (r.isObstacle && r.dist < minObsDist) minObsDist = r.dist;
+
+            const cr = r.isObstacle ? 0.96 : 0.44;
+            const cg = r.isObstacle ? 0.35 : 0.78;
+            const cb = r.isObstacle ? 0.25 : 0.56;
+            if (vIdx + 1 < lidarMaxVerts) {
+              lidarPositions[vIdx * 3] = r.origin[0];
+              lidarPositions[vIdx * 3 + 1] = r.origin[1];
+              lidarPositions[vIdx * 3 + 2] = r.origin[2];
+              lidarPositions[(vIdx + 1) * 3] = r.hitPoint[0];
+              lidarPositions[(vIdx + 1) * 3 + 1] = r.hitPoint[1];
+              lidarPositions[(vIdx + 1) * 3 + 2] = r.hitPoint[2];
+              lidarColors[vIdx * 3] = cr; lidarColors[vIdx * 3 + 1] = cg; lidarColors[vIdx * 3 + 2] = cb;
+              lidarColors[(vIdx + 1) * 3] = cr; lidarColors[(vIdx + 1) * 3 + 1] = cg; lidarColors[(vIdx + 1) * 3 + 2] = cb;
+              vIdx += 2;
+            }
+            if (pIdx < lidarMaxRays && r.hit) {
+              lidarPtsPositions[pIdx * 3] = r.hitPoint[0];
+              lidarPtsPositions[pIdx * 3 + 1] = r.hitPoint[1] + 0.03;
+              lidarPtsPositions[pIdx * 3 + 2] = r.hitPoint[2];
+              lidarPtsColors[pIdx * 3] = cr;
+              lidarPtsColors[pIdx * 3 + 1] = cg;
+              lidarPtsColors[pIdx * 3 + 2] = cb;
+              pIdx++;
+            }
+          }
         }
+
         lidarGeo.attributes.position.needsUpdate = true;
         lidarGeo.attributes.color.needsUpdate = true;
-        lidarGeo.setDrawRange(0, idx);
+        lidarGeo.setDrawRange(0, vIdx);
+        lidarPtsGeo.attributes.position.needsUpdate = true;
+        lidarPtsGeo.attributes.color.needsUpdate = true;
+        lidarPtsGeo.setDrawRange(0, pIdx);
+
+        perceptionStore.updateScan({
+          timestampMs: now,
+          rayCount: rangesOut.length,
+          fovDeg: lCfg.fovDeg,
+          maxRangeM: maxRange,
+          ranges: rangesOut,
+          anglesRad: anglesOut,
+          isObstacle: obsOut,
+          minObstacleDistM: Number(minObsDist.toFixed(2)),
+          minRangeDistM: Number(minAnyDist.toFixed(2)),
+          raycastTimeMs: Number((performance.now() - tStart).toFixed(2)),
+          pipFps: pCfg.targetFps,
+          depthMode: pCfg.depthMode,
+        });
       }
 
       grfLines.visible = sFlags.contacts;
@@ -958,27 +1213,75 @@ export default function ThreeViewer({
       renderer.setViewport(0, 0, curW, curH);
       renderer.render(scene, camera);
 
-      // 12. Optional Picture-in-Picture (PiP) Droid Head Camera (rendered ONLY when visible!)
-      if (pipEnabledRef.current && mode !== 'fpv') {
-        const pipW = Math.min(240, Math.round(curW * 0.22));
+      // 12. Offscreen WebGLRenderTarget Onboard Robot Camera (18 FPS throttled + Linear Depth Map toggle)
+      const activePipCfg = PerceptionStore.getInstance().getPipConfig();
+      const showPipNow = activePipCfg.enabled && mode !== 'fpv';
+      if (showPipNow) {
+        const pipIntervalMs = 1000 / Math.max(5, activePipCfg.targetFps);
+        const pipW = Math.min(256, Math.round(curW * 0.22));
         const pipH = Math.round(pipW * (9 / 16));
         const margin = 16;
         const px = curW - pipW - margin;
         const py = 86; // Above bottom scrubber
 
-        const fwdX = Math.cos(renderState.yaw);
-        const fwdZ = -Math.sin(renderState.yaw);
-        pipCamera.position.set(rx + fwdX * 0.34, ry + 0.19, rz + fwdZ * 0.34);
-        tmpFpvDir.set(rx + fwdX * 6.0, ry + 0.02, rz + fwdZ * 6.0);
-        pipCamera.lookAt(tmpFpvDir);
-        pipCamera.aspect = pipW / pipH;
-        pipCamera.updateProjectionMatrix();
+        if (now - lastPipRenderMs >= pipIntervalMs) {
+          lastPipRenderMs = now;
+          const camMount = activeProfile.sensorMounts.camera;
+          tmpCamTargetPos
+            .set(camMount.offsetLocal[0], camMount.offsetLocal[1], camMount.offsetLocal[2])
+            .applyQuaternion(mainRig.robotGroup.quaternion)
+            .add(mainRig.robotGroup.position);
+          tmpFpvDir
+            .set(camMount.lookAheadLocal[0], camMount.lookAheadLocal[1], camMount.lookAheadLocal[2])
+            .applyQuaternion(mainRig.robotGroup.quaternion)
+            .add(mainRig.robotGroup.position);
 
+          pipCamera.fov = camMount.fovDeg;
+          pipCamera.position.copy(tmpCamTargetPos);
+          pipCamera.lookAt(tmpFpvDir);
+          pipCamera.aspect = pipW / pipH;
+          pipCamera.updateProjectionMatrix();
+
+          const prevTarget = renderer.getRenderTarget();
+          const prevShadowAuto = renderer.shadowMap.autoUpdate;
+          const prevColliderVis = mainRig.colliderSphere.visible;
+          const prevLidarVis = lidarLines.visible;
+          const prevPtsVis = lidarHitPoints.visible;
+
+          mainRig.colliderSphere.visible = false;
+          if (activePipCfg.depthMode) {
+            starfield.visible = false;
+            lidarLines.visible = false;
+            lidarHitPoints.visible = false;
+            scene.overrideMaterial = pipDepthMat;
+          }
+          renderer.shadowMap.autoUpdate = false;
+          renderer.setRenderTarget(pipRenderTarget);
+          renderer.setScissorTest(false);
+          renderer.setViewport(0, 0, pipRenderTarget.width, pipRenderTarget.height);
+          renderer.clear();
+          renderer.render(scene, pipCamera);
+
+          scene.overrideMaterial = null;
+          starfield.visible = true;
+          mainRig.colliderSphere.visible = prevColliderVis;
+          lidarLines.visible = prevLidarVis;
+          lidarHitPoints.visible = prevPtsVis;
+          renderer.shadowMap.autoUpdate = prevShadowAuto;
+          renderer.setRenderTarget(prevTarget);
+        }
+
+        // Fast textured quad blit onto main viewport every frame
+        pipQuadMat.uniforms.uIsDepth.value = activePipCfg.depthMode ? 1.0 : 0.0;
+        const prevAutoClear = renderer.autoClear;
+        renderer.autoClear = false;
         renderer.setScissorTest(true);
         renderer.setScissor(px, py, pipW, pipH);
         renderer.setViewport(px, py, pipW, pipH);
-        renderer.render(scene, pipCamera);
+        renderer.clearDepth();
+        renderer.render(pipOrthoScene, pipOrthoCam);
         renderer.setScissorTest(false);
+        renderer.autoClear = prevAutoClear;
       }
 
       // 13. Throttled Radar & HUD Sync (10 Hz — zero per-frame React state churn!)
@@ -1022,10 +1325,16 @@ export default function ThreeViewer({
       onCanvasReadyRef.current?.(null);
       lunarDust.dispose();
       lidarGeo.dispose(); lidarMat.dispose();
+      lidarPtsGeo.dispose(); lidarPtsMat.dispose();
+      pipRenderTarget.dispose();
+      pipDepthMat.dispose();
+      pipQuadGeo.dispose(); pipQuadMat.dispose();
       grfGeo.dispose(); grfMat.dispose();
       polyGeo.dispose(); polyMat.dispose();
       pathGeo.dispose(); pathMat.dispose();
       trailGeo.dispose(); trailMat.dispose();
+      disposeObjectTree(mainRig.robotGroup);
+      disposeObjectTree(ghostRig.robotGroup);
 
       scene.traverse((obj) => {
         if ((obj as THREE.Mesh).isMesh) {
@@ -1089,7 +1398,17 @@ export default function ThreeViewer({
             robotPos={radarState.pos}
             robotYaw={radarState.yaw}
             trailPoints={radarState.trail}
-            waypoints={waypoints}
+            waypoints={
+              waypoints.length > 0
+                ? waypoints
+                : engine.getAutonomousPlanState().remainingWaypoints.map((w, idx) => ({
+                    id: w.id,
+                    x: w.x,
+                    z: w.z,
+                    label: `WP ${idx + 1}`,
+                    reachable: true,
+                  }))
+            }
             missionMarkers={missionMarkers}
             completedMarkerIds={completedMarkerIds}
             colorblindSafe={colorblindSafe}
@@ -1097,10 +1416,43 @@ export default function ThreeViewer({
         </div>
       )}
 
-      {/* Picture-in-Picture Droid Camera Frame Badge */}
-      {pipEnabled && cameraMode !== 'fpv' && (
-        <div className="pointer-events-none absolute bottom-[86px] right-4 z-20 px-2 py-0.5 rounded-t bg-charcoal-deep/85 border border-cream/25 font-mono text-[9px] text-sage font-bold">
-          DROID FPV CAM
+      {/* Offscreen PiP Onboard Robot Camera Overlay + RGB/Depth Shader Toggle */}
+      {cameraMode !== 'fpv' && (
+        <div className="pointer-events-auto absolute bottom-[86px] right-4 z-20 flex items-center space-x-1 px-2 py-0.5 rounded bg-charcoal-deep/90 border border-cream/25 font-mono text-[9px] shadow-lg">
+          {pipCfg.enabled ? (
+            <>
+              <span className="text-sage font-bold">ONBOARD CAM · {pipCfg.targetFps}Hz</span>
+              <button
+                type="button"
+                onClick={() => PerceptionStore.getInstance().setPipConfig({ depthMode: !pipCfg.depthMode })}
+                className={`px-1.5 py-0.5 rounded font-bold uppercase transition-colors ${
+                  pipCfg.depthMode
+                    ? 'bg-sky-400/25 text-sky-300 border border-sky-400/40'
+                    : 'bg-charcoal text-cream-dim hover:text-cream border border-cream/15'
+                }`}
+                title="Toggle RGB / Linear Metric Depth Map Shader"
+              >
+                {pipCfg.depthMode ? 'DEPTH' : 'RGB'}
+              </button>
+              <button
+                type="button"
+                onClick={() => PerceptionStore.getInstance().setPipConfig({ enabled: false })}
+                className="px-1 py-0.5 rounded bg-charcoal hover:bg-brick/30 text-cream-dim hover:text-cream border border-cream/15"
+                title="Hide PiP Feed"
+              >
+                HIDE
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => PerceptionStore.getInstance().setPipConfig({ enabled: true })}
+              className="text-cream-dim hover:text-sage font-bold uppercase"
+              title="Enable Offscreen WebGLRenderTarget PiP Camera"
+            >
+              + ONBOARD CAM
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1451,161 +1803,4 @@ function buildChunkedDebris(
     created.push(mesh);
   }
   return created;
-}
-
-/**
- * Upgraded 12-DOF Quadruped Model (R-09 fix):
- * - Chamfered multi-part torso chassis + sensor head visor (+X forward)
- * - Articulated shoulder brackets & servo housings visibly joining hips to torso
- * - Tapered thighs/calves + rubber foot pads + torque-driven actuator LEDs
- * - Secondary-motion damped telemetry antenna
- */
-function buildDetailedQuadruped(isGhost = false) {
-  const robotGroup = new THREE.Group();
-  const jointGroups: Record<string, THREE.Group> = {};
-  const actuatorLeds: Record<string, THREE.Mesh> = {};
-
-  const chassisMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.3, roughness: 0.5 })
-    : new THREE.MeshStandardMaterial({ color: 0x383836, roughness: 0.36, metalness: 0.58 });
-  const armorMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.25 })
-    : new THREE.MeshStandardMaterial({ color: 0x4b4c46, roughness: 0.42, metalness: 0.45 });
-  const boneMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.3 })
-    : new THREE.MeshStandardMaterial({ color: 0xe8e6e0, roughness: 0.38, metalness: 0.35 });
-  const jointMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.35 })
-    : new THREE.MeshStandardMaterial({ color: 0x6b705c, roughness: 0.28, metalness: 0.78 });
-  const padMat = isGhost
-    ? new THREE.MeshStandardMaterial({ color: 0xfdfbf7, transparent: true, opacity: 0.3 })
-    : new THREE.MeshStandardMaterial({ color: 0x1e1e1c, roughness: 0.9, metalness: 0.1 });
-
-  // Main chassis core
-  const torsoMesh = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.14, 0.24), chassisMat);
-  torsoMesh.castShadow = !isGhost;
-  torsoMesh.receiveShadow = !isGhost;
-  robotGroup.add(torsoMesh);
-
-  // Upper armor deck + cream spine stripe
-  const upperDeck = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.035, 0.20), armorMat);
-  upperDeck.position.y = 0.085;
-  upperDeck.castShadow = !isGhost;
-  robotGroup.add(upperDeck);
-
-  const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.50, 0.014, 0.055), new THREE.MeshBasicMaterial({ color: 0xfdfbf7 }));
-  stripe.position.y = 0.105;
-  robotGroup.add(stripe);
-
-  // Forward Sensor Head / Stereo Camera Visor (+X front)
-  const headPod = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.095, 0.16), armorMat);
-  headPod.position.set(0.31, 0.015, 0);
-  headPod.castShadow = !isGhost;
-  robotGroup.add(headPod);
-
-  if (!isGhost) {
-    const visorMat = new THREE.MeshStandardMaterial({
-      color: 0x8ea48c,
-      emissive: 0x6b705c,
-      emissiveIntensity: 0.9,
-      roughness: 0.15,
-    });
-    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.032, 0.11), visorMat);
-    visor.position.set(0.365, 0.02, 0);
-    robotGroup.add(visor);
-  }
-
-  // Secondary-motion damped telemetry antenna mast (rear top)
-  const antennaGroup = new THREE.Group();
-  antennaGroup.position.set(-0.22, 0.10, 0.05);
-  robotGroup.add(antennaGroup);
-  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.008, 0.22, 8), boneMat);
-  mast.position.y = 0.11;
-  antennaGroup.add(mast);
-  const tip = new THREE.Mesh(
-    new THREE.SphereGeometry(0.015, 10, 10),
-    new THREE.MeshBasicMaterial({ color: 0xf59e0b })
-  );
-  tip.position.y = 0.225;
-  antennaGroup.add(tip);
-
-  const colliderSphere = new THREE.Mesh(
-    new THREE.SphereGeometry(0.55, 16, 16),
-    new THREE.MeshBasicMaterial({ color: 0xb83b2f, wireframe: true, transparent: true, opacity: 0.3 })
-  );
-  colliderSphere.visible = false;
-  if (!isGhost) robotGroup.add(colliderSphere);
-
-  const legConfigs = [
-    { name: 'FL', x: 0.24, z: -0.15 },
-    { name: 'FR', x: 0.24, z: 0.15 },
-    { name: 'RL', x: -0.24, z: -0.15 },
-    { name: 'RR', x: -0.24, z: 0.15 },
-  ];
-  const thighLen = 0.22;
-  const calfLen = 0.22;
-
-  for (const cfg of legConfigs) {
-    // Structural hip mounting strut connecting torso to hip servo housing
-    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.06, Math.abs(cfg.z) * 0.9), armorMat);
-    strut.position.set(cfg.x, 0, cfg.z * 0.55);
-    robotGroup.add(strut);
-
-    const hipGroup = new THREE.Group();
-    hipGroup.position.set(cfg.x, 0, cfg.z);
-    robotGroup.add(hipGroup);
-    jointGroups[`${cfg.name}_hip_joint`] = hipGroup;
-
-    // Shoulder servo cylinder
-    const hipServo = new THREE.Mesh(new THREE.CylinderGeometry(0.044, 0.044, 0.075, 16), jointMat);
-    hipServo.rotateX(Math.PI / 2);
-    hipServo.castShadow = !isGhost;
-    hipGroup.add(hipServo);
-
-    const thighGroup = new THREE.Group();
-    hipGroup.add(thighGroup);
-    jointGroups[`${cfg.name}_thigh_joint`] = thighGroup;
-
-    // Torque-reactive actuator status LED ring on thigh servo
-    if (!isGhost) {
-      const ledMat = new THREE.MeshStandardMaterial({
-        color: 0x8ea48c,
-        emissive: 0x8ea48c,
-        emissiveIntensity: 0.4,
-      });
-      const led = new THREE.Mesh(new THREE.BoxGeometry(0.025, 0.012, 0.082), ledMat);
-      led.position.set(0, -0.02, 0);
-      thighGroup.add(led);
-      actuatorLeds[`${cfg.name}_thigh_joint`] = led;
-    }
-
-    // Tapered thigh armor limb
-    const thighMesh = new THREE.Mesh(new THREE.BoxGeometry(0.052, thighLen * 0.94, 0.044), boneMat);
-    thighMesh.position.y = -thighLen / 2;
-    thighMesh.castShadow = !isGhost;
-    thighGroup.add(thighMesh);
-
-    const calfGroup = new THREE.Group();
-    calfGroup.position.y = -thighLen;
-    thighGroup.add(calfGroup);
-    jointGroups[`${cfg.name}_calf_joint`] = calfGroup;
-
-    const kneeServo = new THREE.Mesh(new THREE.CylinderGeometry(0.034, 0.034, 0.056, 14), jointMat);
-    kneeServo.rotateX(Math.PI / 2);
-    calfGroup.add(kneeServo);
-
-    const calfMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.021, 0.016, calfLen * 0.95, 10), boneMat);
-    calfMesh.position.y = -calfLen / 2;
-    calfMesh.castShadow = !isGhost;
-    calfGroup.add(calfMesh);
-
-    // Rubberized hemispherical lunar foot pad (exact bottom contact at -calfLen)
-    const footPad = new THREE.Mesh(new THREE.SphereGeometry(0.032, 14, 14), padMat);
-    footPad.position.y = -calfLen + 0.024;
-    footPad.scale.set(1.1, 0.85, 1.1);
-    footPad.castShadow = !isGhost;
-    calfGroup.add(footPad);
-  }
-
-  return { robotGroup, jointGroups, colliderSphere, antennaGroup, actuatorLeds };
 }

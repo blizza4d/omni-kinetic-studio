@@ -169,9 +169,20 @@ export default function NemotronPlannerPanel({
                 </div>
 
                 {isExecuting ? (
-                  <span className="text-[9px] px-2 py-0.5 rounded bg-sage/30 text-sage border border-sage/50 font-bold uppercase animate-pulse">
-                    EXECUTING
-                  </span>
+                  <div className="flex items-center space-x-1.5">
+                    <span className="text-[9px] px-2 py-0.5 rounded bg-sage/30 text-sage border border-sage/50 font-bold uppercase animate-pulse">
+                      EXECUTING
+                    </span>
+                    {onClearPlan && (
+                      <button
+                        type="button"
+                        onClick={onClearPlan}
+                        className="py-0.5 px-2 rounded bg-brick/20 hover:bg-brick/35 text-brick border border-brick/40 font-bold text-[9px] uppercase"
+                      >
+                        Stop
+                      </button>
+                    )}
+                  </div>
                 ) : (
                   <button
                     onClick={handleExecute}

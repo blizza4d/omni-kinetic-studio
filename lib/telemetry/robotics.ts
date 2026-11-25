@@ -10,6 +10,7 @@
 
 import { TelemetryFrame } from '@/contracts';
 import { quaternionToEuler, Quaternion4 } from '@/lib/frames';
+import { DEFAULT_ROBOT_PROFILE, RobotProfile } from '@/lib/robotics/profiles';
 
 export interface ActuatorTelemetry {
   id: string;
@@ -62,6 +63,11 @@ export interface RoboticsTelemetryData {
     stepPeriodMs: number;
     gravityMps2: number;
     batteryPct: number;
+    maxTorqueNm: number;
+    tiltWarningDeg: number;
+    tiltCriticalDeg: number;
+    profileId: string;
+    profileName: string;
   };
 }
 
@@ -104,6 +110,11 @@ export const DEFAULT_ROBOTICS_TELEMETRY: RoboticsTelemetryData = {
     stepPeriodMs: 16.67,
     gravityMps2: 1.62,
     batteryPct: 100,
+    maxTorqueNm: DEFAULT_ROBOT_PROFILE.maxTorqueNm,
+    tiltWarningDeg: DEFAULT_ROBOT_PROFILE.safetyLimits.tiltWarningDeg,
+    tiltCriticalDeg: DEFAULT_ROBOT_PROFILE.safetyLimits.tiltCriticalDeg,
+    profileId: DEFAULT_ROBOT_PROFILE.id,
+    profileName: DEFAULT_ROBOT_PROFILE.name,
   },
 };
 
@@ -129,13 +140,25 @@ export function extractRoboticsTelemetry(
   frame: TelemetryFrame | null,
   eStopActive = false,
   controlLatencyMs = 2.1,
-  fps = 60
+  fps = 60,
+  profile: RobotProfile = DEFAULT_ROBOT_PROFILE,
+  gravityMps2 = 1.62
 ): RoboticsTelemetryData {
   if (!frame || !frame.bodies || frame.bodies.length === 0) {
     return {
       ...DEFAULT_ROBOTICS_TELEMETRY,
       safety: { ...DEFAULT_ROBOTICS_TELEMETRY.safety, eStopActive },
-      system: { ...DEFAULT_ROBOTICS_TELEMETRY.system, webglFps: fps, controlLatencyMs },
+      system: {
+        ...DEFAULT_ROBOTICS_TELEMETRY.system,
+        webglFps: fps,
+        controlLatencyMs,
+        gravityMps2,
+        maxTorqueNm: profile.maxTorqueNm,
+        tiltWarningDeg: profile.safetyLimits.tiltWarningDeg,
+        tiltCriticalDeg: profile.safetyLimits.tiltCriticalDeg,
+        profileId: profile.id,
+        profileName: profile.name,
+      },
     };
   }
 
@@ -149,7 +172,9 @@ export function extractRoboticsTelemetry(
   const rollDeg = Number((rollRad * toDeg).toFixed(2));
 
   const totalTiltDeg = Number(Math.hypot(pitchDeg, rollDeg).toFixed(2));
-  const tiltStatus = totalTiltDeg > 25 ? 'critical' : totalTiltDeg > 15 ? 'warning' : 'nominal';
+  const warnDeg = profile.safetyLimits.tiltWarningDeg;
+  const critDeg = profile.safetyLimits.tiltCriticalDeg;
+  const tiltStatus = totalTiltDeg > critDeg ? 'critical' : totalTiltDeg > warnDeg ? 'warning' : 'nominal';
 
   const vx = body.vel[0];
   const vy = body.vel[1];
@@ -157,10 +182,11 @@ export function extractRoboticsTelemetry(
   const speedMps = Number(Math.hypot(vx, vz).toFixed(3));
   const cmdSpeedMps = Number((frame.gait?.cmdSpeed ?? speedMps).toFixed(3));
 
-  // Process actuators
+  // Process actuators (clipped cleanly to profile motor limit)
   const actuators: ActuatorTelemetry[] = (frame.joints || []).map((j) => {
     const meta = JOINT_LIMBS[j.name] || { limb: 'FL', joint: 'hip' };
-    const torque = j.torque ?? Number((Math.sin(j.angle) * 18.5 + j.velocity * 3.2).toFixed(2));
+    const rawTorque = j.torque ?? Number((Math.sin(j.angle) * (profile.maxTorqueNm * 0.45) + j.velocity * 3.2).toFixed(2));
+    const torque = Number(Math.max(-profile.maxTorqueNm, Math.min(profile.maxTorqueNm, rawTorque)).toFixed(2));
     const power = Number(Math.abs(torque * j.velocity).toFixed(2));
     return {
       id: j.name,
@@ -176,9 +202,13 @@ export function extractRoboticsTelemetry(
   });
 
   const groundedFeetCount = (frame.feet || []).filter((f) => f.contact).length;
+  const nominalH = profile.dimensions.standingHeightM || 0.44;
   const stabilityMarginPct = Math.max(
     0,
-    Math.min(100, Math.round(((frame.bodyHeightAboveGround ?? 0.44) / 0.44) * 100 * (1 - Math.min(1, totalTiltDeg / 35))))
+    Math.min(
+      100,
+      Math.round(((frame.bodyHeightAboveGround ?? nominalH) / nominalH) * 100 * (1 - Math.min(1, totalTiltDeg / Math.max(25, critDeg + 10))))
+    )
   );
 
   return {
@@ -218,8 +248,13 @@ export function extractRoboticsTelemetry(
       controlLatencyMs: Number(controlLatencyMs.toFixed(1)),
       webglFps: Math.round(fps),
       stepPeriodMs: Number(((frame.dt ?? 0.0167) * 1000).toFixed(2)),
-      gravityMps2: 1.62,
+      gravityMps2: Number(gravityMps2.toFixed(2)),
       batteryPct: Math.round(Math.max(0, 100 - (frame.energy ?? 0) * 0.05)),
+      maxTorqueNm: profile.maxTorqueNm,
+      tiltWarningDeg: warnDeg,
+      tiltCriticalDeg: critDeg,
+      profileId: profile.id,
+      profileName: profile.name,
     },
   };
 }

@@ -50,6 +50,9 @@ import {
 import { ScenarioConfig, DEFAULT_SCENARIO_CONFIG } from '../scenario/sharing';
 import { slerpShortest } from '../anim/math/quaternion';
 import { globalEpisodeRecorder, DatasetControlSource } from '../dataset/episodeRecorder';
+import { DEFAULT_ROBOT_PROFILE, getRobotProfile, RobotProfile, RobotProfileId } from '../robotics/profiles';
+import { PerceptionStore } from '../perception/lidar';
+import { gaussian, mulberry32 } from './prng';
 
 export interface InterpolatedDroidRenderState {
   time: number;
@@ -62,6 +65,8 @@ export interface InterpolatedDroidRenderState {
   cmdSpeed: number;
   joints: Record<string, number>;
   jointTorques: Record<string, number>;
+  wheelAngles?: [number, number, number, number];
+  profileId?: RobotProfileId;
   feet: { id: string; pos: [number, number, number]; contact: boolean; slip: number }[];
   antennaAngles: [number, number];
   gaitState: string;
@@ -129,6 +134,30 @@ export class SimEngine {
   private lastCmdSpeed = 0;
   private readonly chartHistory: TelemetryChartSample[] = [];
   private readonly maxChartSamples = 600;
+
+  // Robot profile, Sim-to-Real Domain Physics & Hardware-in-the-Loop Digital Twin state
+  private robotProfile: RobotProfile = DEFAULT_ROBOT_PROFILE;
+  private wheelSpinAngles: [number, number, number, number] = [0, 0, 0, 0];
+  private domainSlipDamping = 0.25;
+  private domainMaxTorqueNm = DEFAULT_ROBOT_PROFILE.maxTorqueNm;
+  private domainImuNoiseSigma = 0;
+  private readonly noiseRng = mulberry32(99173);
+  private domainLatencyMs = 0;
+  private readonly cmdDelayBuffer: { vx: number; vy: number; yawRate: number }[] = [];
+  private digitalTwinEnabled = false;
+  // Autonomous Nemotron / Benchmark Waypoint Plan
+  private autonomousWaypoints: { id: string; x: number; z: number; targetSpeed: number; tolerance: number }[] = [];
+  private autonomousWpIndex = 0;
+  private autonomousPlanCompleted = false;
+
+  // Digital Twin / Domain state
+  private digitalTwinPose: {
+    pos: [number, number, number];
+    quat: [number, number, number, number];
+    vel: [number, number, number];
+    yaw: number;
+    updatedMs: number;
+  } | null = null;
 
   // Prev & Curr pose buffers for render-time alpha interpolation (zero allocations)
   private prevPos: [number, number, number] = [0, STANDING_HEIGHT, 0];
@@ -260,6 +289,147 @@ export class SimEngine {
 
   public setGravity(gravityMps2: number): void {
     this.scenario.gravity = gravityMps2;
+  }
+
+  public getRobotProfile(): RobotProfile {
+    return this.robotProfile;
+  }
+
+  public setRobotProfile(profileId: RobotProfileId): RobotProfile {
+    const profile = getRobotProfile(profileId);
+    this.robotProfile = profile;
+    this.shaper.params.maxForward = profile.maxLinearVelMps;
+    this.shaper.params.maxBackward = profile.maxBackwardVelMps;
+    this.shaper.params.maxLateral = profile.maxLateralVelMps;
+    this.shaper.params.maxYawRate = profile.maxAngularVelRadS;
+    this.shaper.params.maxSafeTiltRad = (profile.safetyLimits.tiltCriticalDeg * Math.PI) / 180;
+    this.domainMaxTorqueNm = profile.maxTorqueNm;
+    PerceptionStore.getInstance().setLidarConfig({
+      rayCount: profile.sensorMounts.lidar.defaultRays,
+      fovDeg: profile.sensorMounts.lidar.defaultFovDeg,
+      maxRangeM: profile.sensorMounts.lidar.defaultRangeM,
+    });
+    return profile;
+  }
+
+  public applyDomainPhysics(cfg: {
+    gravityMps2?: number;
+    frictionCoeff?: number;
+    slipDamping?: number;
+    maxTorqueNm?: number;
+    imuNoiseSigma?: number;
+    controlLatencyMs?: number;
+  }): void {
+    if (cfg.gravityMps2 !== undefined) {
+      this.scenario.gravity = cfg.gravityMps2;
+    }
+    if (cfg.frictionCoeff !== undefined) {
+      this.shaper.params.frictionMu = Math.max(0.1, Math.min(2.0, cfg.frictionCoeff));
+    }
+    if (cfg.slipDamping !== undefined) {
+      this.domainSlipDamping = Math.max(0, Math.min(1.0, cfg.slipDamping));
+    }
+    if (cfg.maxTorqueNm !== undefined) {
+      this.domainMaxTorqueNm = Math.max(5, Math.min(120, cfg.maxTorqueNm));
+    }
+    if (cfg.imuNoiseSigma !== undefined) {
+      this.domainImuNoiseSigma = Math.max(0, Math.min(0.5, cfg.imuNoiseSigma));
+    }
+    if (cfg.controlLatencyMs !== undefined) {
+      this.domainLatencyMs = Math.max(0, Math.min(350, cfg.controlLatencyMs));
+      if (this.domainLatencyMs === 0) {
+        this.cmdDelayBuffer.length = 0;
+      }
+    }
+  }
+
+  public getDomainPhysics() {
+    return {
+      gravityMps2: this.scenario.gravity,
+      frictionCoeff: this.shaper.params.frictionMu,
+      slipDamping: this.domainSlipDamping,
+      maxTorqueNm: this.domainMaxTorqueNm,
+      imuNoiseSigma: this.domainImuNoiseSigma,
+      controlLatencyMs: this.domainLatencyMs,
+    };
+  }
+
+  public setDigitalTwinEnabled(enabled: boolean): void {
+    this.digitalTwinEnabled = enabled;
+    if (!enabled) {
+      this.digitalTwinPose = null;
+    }
+  }
+
+  public isDigitalTwinEnabled(): boolean {
+    return this.digitalTwinEnabled;
+  }
+
+  public applyDigitalTwinTelemetry(data: {
+    x: number;
+    y?: number;
+    z: number;
+    yaw?: number;
+    quat?: [number, number, number, number];
+    vx?: number;
+    vy?: number;
+    vz?: number;
+  }): void {
+    if (!this.digitalTwinEnabled) return;
+    const samplerY = this.terrain.heightAt(data.x, data.z);
+    const bodyY = data.y !== undefined ? data.y : samplerY + this.robotProfile.dimensions.standingHeightM;
+    const yaw = data.yaw ?? 0;
+    const q: [number, number, number, number] = data.quat ?? [
+      0,
+      Math.sin(yaw * 0.5),
+      0,
+      Math.cos(yaw * 0.5),
+    ];
+    this.digitalTwinPose = {
+      pos: [data.x, bodyY, data.z],
+      quat: q,
+      vel: [data.vx ?? 0, data.vy ?? 0, data.vz ?? 0],
+      yaw,
+      updatedMs: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+    };
+  }
+
+  public getLastShapedCommand(): LocomotionCommand {
+    return { ...this._shapedCmd };
+  }
+
+  public getDistanceMeters(): number {
+    return this.distanceMeters;
+  }
+
+  public setAutonomousPlan(
+    waypoints: { id: string; x: number; z: number; targetSpeed?: number; tolerance?: number }[]
+  ): void {
+    this.autonomousWaypoints = waypoints.map((w) => ({
+      id: w.id,
+      x: w.x,
+      z: w.z,
+      targetSpeed: w.targetSpeed ?? 1.05,
+      tolerance: w.tolerance ?? 0.55,
+    }));
+    this.autonomousWpIndex = 0;
+    this.autonomousPlanCompleted = false;
+  }
+
+  public clearAutonomousPlan(): void {
+    this.autonomousWaypoints = [];
+    this.autonomousWpIndex = 0;
+    this.autonomousPlanCompleted = false;
+  }
+
+  public getAutonomousPlanState() {
+    return {
+      totalWaypoints: this.autonomousWaypoints.length,
+      currentIndex: this.autonomousWpIndex,
+      completed: this.autonomousPlanCompleted,
+      active: this.autonomousWaypoints.length > 0 && !this.autonomousPlanCompleted,
+      remainingWaypoints: this.autonomousWaypoints.slice(this.autonomousWpIndex),
+    };
   }
 
   public getDebris(): readonly DebrisInstance[] {
@@ -401,6 +571,10 @@ export class SimEngine {
     this.distanceMeters = 0;
     this.lastCollisionStep = -120;
     this.chartHistory.length = 0;
+    this.cmdDelayBuffer.length = 0;
+    this.wheelSpinAngles = [0, 0, 0, 0];
+    this.autonomousWpIndex = 0;
+    this.autonomousPlanCompleted = false;
 
     const sx = this.scenario.startPos[0];
     const sz = this.scenario.startPos[1];
@@ -578,23 +752,65 @@ export class SimEngine {
     const rHeading = snap.heading;
     const nowSec = stepIndex * dt;
 
-    // 2. Compute autonomous Policy v1 command (pure pursuit to active mission marker or default goal)
-    const nextMarker = this.missionRuntime.getNextMarker(rx, rz);
-    const goalX = nextMarker ? nextMarker.x : 14.0;
-    const goalZ = nextMarker ? nextMarker.z : -10.0;
+    // 2. Compute autonomous Policy v1 command (autonomous plan waypoints OR mission marker / default goal)
+    let nextMarker = null as ReturnType<MissionRuntime['getNextMarker']>;
+    if (this.autonomousWaypoints.length > 0) {
+      if (this.autonomousPlanCompleted || this.autonomousWpIndex >= this.autonomousWaypoints.length) {
+        this._policyCmd.vx = 0;
+        this._policyCmd.vy = 0;
+        this._policyCmd.yawRate = 0;
+        this._policyCmd.bodyHeight = 0.5;
+        this._policyCmd.gait = 'auto';
+        this._policyCmd.hop = false;
+        this._policyCmd.hopCharge = 0;
+        this._policyCmd.stop = false;
+      } else {
+        const wp = this.autonomousWaypoints[this.autonomousWpIndex]!;
+        const distWp = Math.hypot(wp.x - rx, wp.z - rz);
+        if (distWp <= wp.tolerance) {
+          this.autonomousWpIndex++;
+          if (this.autonomousWpIndex >= this.autonomousWaypoints.length) {
+            this.autonomousPlanCompleted = true;
+          }
+        }
+        if (this.autonomousPlanCompleted) {
+          this._policyCmd.vx = 0;
+          this._policyCmd.vy = 0;
+          this._policyCmd.yawRate = 0;
+        } else {
+          const targetWp = this.autonomousWaypoints[this.autonomousWpIndex]!;
+          purePursuit(rx, rz, rHeading, targetWp.x, targetWp.z, targetWp.targetSpeed, 1.35, targetWp.tolerance, this._pursuitOut);
+          const avoidYaw = computeObstacleAvoidanceYaw(rx, rz, rHeading, this.hazardObstacles, 2.0);
+          this._policyCmd.vx = this._pursuitOut.reached ? 0 : this._pursuitOut.vx;
+          this._policyCmd.vy = 0;
+          this._policyCmd.yawRate = this._pursuitOut.reached
+            ? 0
+            : Math.max(-2.0, Math.min(2.0, this._pursuitOut.yawRate + avoidYaw));
+        }
+        this._policyCmd.bodyHeight = 0.5;
+        this._policyCmd.gait = 'auto';
+        this._policyCmd.hop = false;
+        this._policyCmd.hopCharge = 0.55;
+        this._policyCmd.stop = false;
+      }
+    } else {
+      nextMarker = this.missionRuntime.getNextMarker(rx, rz);
+      const goalX = nextMarker ? nextMarker.x : 14.0;
+      const goalZ = nextMarker ? nextMarker.z : -10.0;
 
-    purePursuit(rx, rz, rHeading, goalX, goalZ, 1.05, 1.3, 0.7, this._pursuitOut);
-    const avoidYaw = computeObstacleAvoidanceYaw(rx, rz, rHeading, this.hazardObstacles, 2.0);
-    this._policyCmd.vx = this._pursuitOut.reached ? 0 : this._pursuitOut.vx;
-    this._policyCmd.vy = 0;
-    this._policyCmd.yawRate = this._pursuitOut.reached
-      ? 0
-      : Math.max(-2.0, Math.min(2.0, this._pursuitOut.yawRate + avoidYaw));
-    this._policyCmd.bodyHeight = 0.5;
-    this._policyCmd.gait = 'auto';
-    this._policyCmd.hop = Boolean(nextMarker?.requireHop && this._pursuitOut.distToTarget < 2.3 && !snap.hopActive);
-    this._policyCmd.hopCharge = 0.55;
-    this._policyCmd.stop = false;
+      purePursuit(rx, rz, rHeading, goalX, goalZ, 1.05, 1.3, 0.7, this._pursuitOut);
+      const avoidYaw = computeObstacleAvoidanceYaw(rx, rz, rHeading, this.hazardObstacles, 2.0);
+      this._policyCmd.vx = this._pursuitOut.reached ? 0 : this._pursuitOut.vx;
+      this._policyCmd.vy = 0;
+      this._policyCmd.yawRate = this._pursuitOut.reached
+        ? 0
+        : Math.max(-2.0, Math.min(2.0, this._pursuitOut.yawRate + avoidYaw));
+      this._policyCmd.bodyHeight = 0.5;
+      this._policyCmd.gait = 'auto';
+      this._policyCmd.hop = Boolean(nextMarker?.requireHop && this._pursuitOut.distToTarget < 2.3 && !snap.hopActive);
+      this._policyCmd.hopCharge = 0.55;
+      this._policyCmd.stop = false;
+    }
 
     // 3. Poll all manual input sources
     const polled = this.inputs.poll(rx, rz, rHeading, this.hazardObstacles, dt, this._manualCmd);
@@ -652,18 +868,39 @@ export class SimEngine {
       ? arbitrated.cmd
       : this.shaper.shape(arbitrated.cmd, this._safetyCtx, dt, this._shapedCmd);
 
-    this.lastCmdSpeed = Math.hypot(shaped.vx, shaped.vy);
+    // Non-holonomic 4WD differential constraint + optional domain transport delay
+    let execVx = shaped.vx;
+    let execVy = this.robotProfile.locomotionType === 'differential_4wd' ? 0 : shaped.vy;
+    let execYawRate = shaped.yawRate;
+    const execHop = this.robotProfile.locomotionType === 'differential_4wd' ? false : shaped.hop;
+
+    if (this.domainLatencyMs > 0 && !shaped.stop && !this.replayCursor) {
+      const delaySteps = Math.max(1, Math.round(this.domainLatencyMs / (dt * 1000)));
+      this.cmdDelayBuffer.push({ vx: execVx, vy: execVy, yawRate: execYawRate });
+      if (this.cmdDelayBuffer.length > delaySteps) {
+        const delayed = this.cmdDelayBuffer.shift()!;
+        execVx = delayed.vx;
+        execVy = delayed.vy;
+        execYawRate = delayed.yawRate;
+      } else {
+        execVx = 0;
+        execVy = 0;
+        execYawRate = 0;
+      }
+    }
+
+    this.lastCmdSpeed = Math.hypot(execVx, execVy);
 
     // 7. Step GaitController on canonical TerrainService
     const sampler = (x: number, z: number) => this.terrain.heightAt(x, z);
     const kin = this.gait.step(
       {
-        vx: shaped.vx,
-        vy: shaped.vy,
-        yawRate: shaped.yawRate,
+        vx: execVx,
+        vy: execVy,
+        yawRate: execYawRate,
         bodyHeight: shaped.bodyHeight,
         gait: shaped.gait,
-        hop: shaped.hop,
+        hop: execHop,
         hopCharge: shaped.hopCharge,
         stop: shaped.stop,
         mode: arbitrated.source === 'policy' ? 'policy' : 'teleop',
@@ -673,6 +910,18 @@ export class SimEngine {
       dt
     );
     this.latestKinematic = kin;
+
+    // Differential 4WD wheel rotation integration
+    if (this.robotProfile.locomotionType === 'differential_4wd') {
+      const wr = Math.max(0.05, this.robotProfile.wheelRadiusM);
+      const halfTrack = this.robotProfile.trackWidthM * 0.5;
+      const vLeft = shaped.stop ? 0 : kin.bodyLinearVel[0] * Math.cos(rHeading) - kin.bodyLinearVel[2] * Math.sin(rHeading) - execYawRate * halfTrack;
+      const vRight = shaped.stop ? 0 : kin.bodyLinearVel[0] * Math.cos(rHeading) - kin.bodyLinearVel[2] * Math.sin(rHeading) + execYawRate * halfTrack;
+      this.wheelSpinAngles[0] += (vLeft / wr) * dt;
+      this.wheelSpinAngles[1] += (vRight / wr) * dt;
+      this.wheelSpinAngles[2] += (vLeft / wr) * dt;
+      this.wheelSpinAngles[3] += (vRight / wr) * dt;
+    }
 
     // Measure input-to-motion latency when manual velocity begins changing
     if (
@@ -692,26 +941,38 @@ export class SimEngine {
       this.inputs.triggerHaptics(Math.min(0.8, (kin.landingImpactSpeed ?? 0.5) * 0.4), 0.3, 110);
     }
 
-    // 8. Update curr interpolation buffers
-    this.currPos[0] = kin.bodyPos[0];
-    this.currPos[1] = kin.bodyPos[1];
-    this.currPos[2] = kin.bodyPos[2];
-    this.currQuat[0] = kin.bodyQuat[0];
-    this.currQuat[1] = kin.bodyQuat[1];
-    this.currQuat[2] = kin.bodyQuat[2];
-    this.currQuat[3] = kin.bodyQuat[3];
+    // 8. Update curr interpolation buffers (Digital Twin inbound pose takes precedence when live)
+    if (this.digitalTwinEnabled && this.digitalTwinPose) {
+      this.currPos[0] = this.digitalTwinPose.pos[0];
+      this.currPos[1] = this.digitalTwinPose.pos[1];
+      this.currPos[2] = this.digitalTwinPose.pos[2];
+      this.currQuat[0] = this.digitalTwinPose.quat[0];
+      this.currQuat[1] = this.digitalTwinPose.quat[1];
+      this.currQuat[2] = this.digitalTwinPose.quat[2];
+      this.currQuat[3] = this.digitalTwinPose.quat[3];
+    } else {
+      this.currPos[0] = kin.bodyPos[0];
+      this.currPos[1] = kin.bodyPos[1];
+      this.currPos[2] = kin.bodyPos[2];
+      this.currQuat[0] = kin.bodyQuat[0];
+      this.currQuat[1] = kin.bodyQuat[1];
+      this.currQuat[2] = kin.bodyQuat[2];
+      this.currQuat[3] = kin.bodyQuat[3];
+    }
     for (let i = 0; i < kin.joints.length; i++) {
       const j = kin.joints[i];
       this.currJoints[j.name] = j.angle;
-      this.currTorques[j.name] = j.torque ?? 0;
+      const rawT = j.torque ?? 0;
+      this.currTorques[j.name] = Math.max(-this.domainMaxTorqueNm, Math.min(this.domainMaxTorqueNm, rawT));
     }
 
     // 9. Collision detection against hazard boulders & custom obstacles
+    const collisionBodyRadius = this.robotProfile.id === 'quadruped_scout' ? 0.32 : this.robotProfile.dimensions.widthM * 0.68;
     let collided = false;
     for (let i = 0; i < this.hazardObstacles.length; i++) {
       const obs = this.hazardObstacles[i];
-      const d = Math.hypot(kin.bodyPos[0] - obs.x, kin.bodyPos[2] - obs.z);
-      if (d < obs.radius + 0.32 && !kin.hopActive) {
+      const d = Math.hypot(this.currPos[0] - obs.x, this.currPos[2] - obs.z);
+      if (d < obs.radius + collisionBodyRadius && !kin.hopActive) {
         if (stepIndex - this.lastCollisionStep > 45) {
           collided = true;
           this.lastCollisionStep = stepIndex;
@@ -794,6 +1055,13 @@ export class SimEngine {
 
     // 12. Optional TelemetryFrame callback (keeps TelemetryStore & Analytics Tabs live)
     if (this.onFrameCallback && stepIndex % 2 === 0) {
+      const nX = this.domainImuNoiseSigma > 0 ? gaussian(this.noiseRng, 0, this.domainImuNoiseSigma) : 0;
+      const nZ = this.domainImuNoiseSigma > 0 ? gaussian(this.noiseRng, 0, this.domainImuNoiseSigma) : 0;
+      const activeVel: [number, number, number] =
+        this.digitalTwinEnabled && this.digitalTwinPose
+          ? [this.digitalTwinPose.vel[0], this.digitalTwinPose.vel[1], this.digitalTwinPose.vel[2]]
+          : [kin.bodyLinearVel[0] + nX, kin.bodyLinearVel[1], kin.bodyLinearVel[2] + nZ];
+
       const frame: TelemetryFrame = {
         schemaVersion: '4.0',
         seq: stepIndex,
@@ -804,18 +1072,23 @@ export class SimEngine {
         bodies: [
           {
             id: 'torso',
-            pos: [kin.bodyPos[0], kin.bodyPos[1], kin.bodyPos[2]],
-            quat: [kin.bodyQuat[0], kin.bodyQuat[1], kin.bodyQuat[2], kin.bodyQuat[3]],
-            vel: [kin.bodyLinearVel[0], kin.bodyLinearVel[1], kin.bodyLinearVel[2]],
+            pos: [this.currPos[0], this.currPos[1], this.currPos[2]],
+            quat: [this.currQuat[0], this.currQuat[1], this.currQuat[2], this.currQuat[3]],
+            vel: activeVel,
           },
         ],
-        joints: kin.joints.map((j) => ({ name: j.name, angle: j.angle, velocity: j.velocity })),
+        joints: kin.joints.map((j) => ({
+          name: j.name,
+          angle: j.angle,
+          velocity: j.velocity,
+          torque: this.currTorques[j.name] ?? j.torque,
+        })),
         feet: kin.feet.map((f) => ({
           id: f.id,
           pos: [f.worldPos[0], f.worldPos[1], f.worldPos[2]],
-          contact: f.contact,
+          contact: this.robotProfile.locomotionType === 'differential_4wd' ? true : f.contact,
         })),
-        bodyHeightAboveGround: Number((kin.bodyPos[1] - sampler(kin.bodyPos[0], kin.bodyPos[2])).toFixed(3)),
+        bodyHeightAboveGround: Number((this.currPos[1] - sampler(this.currPos[0], this.currPos[2])).toFixed(3)),
         slopeUnderBody: Number(tiltDeg.toFixed(2)),
         gait: {
           phase: Number(this.gait.getSnapshot().phase.masterPhase.toFixed(3)),
@@ -834,7 +1107,7 @@ export class SimEngine {
           goal_bonus: nextMarker ? Number(Math.max(0, (20 - this._pursuitOut.distToTarget) * 0.05).toFixed(3)) : 0,
         },
         collisions: collided
-          ? [{ a: 'chassis', b: 'boulder', point: [kin.bodyPos[0], kin.bodyPos[1] - 0.2, kin.bodyPos[2]], impulse: 3.0 }]
+          ? [{ a: 'chassis', b: 'boulder', point: [this.currPos[0], this.currPos[1] - 0.2, this.currPos[2]], impulse: 3.0 }]
           : [],
         goalDistance: Number((this._pursuitOut.distToTarget ?? 0).toFixed(2)),
         energy: Number(this.energyJoules.toFixed(2)),
@@ -854,10 +1127,16 @@ export class SimEngine {
             ? 'gesture'
             : currentSource === 'keyboard'
             ? 'keyboard'
-            : currentSource === 'pointer'
+            : currentSource === 'pointer' || this.autonomousWaypoints.length > 0
             ? 'nemotron'
             : 'manual';
-        globalEpisodeRecorder.recordStep(frame, shaped, datasetSource, collided);
+        const perception = PerceptionStore.getInstance();
+        const pCfg = perception.getLidarConfig();
+        let ranges = perception.getLatestLidarRanges();
+        if (!ranges || ranges.length !== pCfg.rayCount) {
+          ranges = this.computeLidarScan(pCfg.rayCount, pCfg.maxRangeM, (pCfg.fovDeg * Math.PI) / 180).map((h) => h.dist);
+        }
+        globalEpisodeRecorder.recordStep(frame, shaped, datasetSource, collided, ranges);
       }
     }
 
@@ -931,6 +1210,16 @@ export class SimEngine {
       }
     }
 
+    out.profileId = this.robotProfile.id;
+    if (!out.wheelAngles) {
+      out.wheelAngles = [this.wheelSpinAngles[0], this.wheelSpinAngles[1], this.wheelSpinAngles[2], this.wheelSpinAngles[3]];
+    } else {
+      out.wheelAngles[0] = this.wheelSpinAngles[0];
+      out.wheelAngles[1] = this.wheelSpinAngles[1];
+      out.wheelAngles[2] = this.wheelSpinAngles[2];
+      out.wheelAngles[3] = this.wheelSpinAngles[3];
+    }
+
     const bCheck = evaluateBoundary(out.pos[0], out.pos[1], out.pos[2], DEFAULT_ARENA);
     out.distanceToEdge = bCheck.distanceToEdge;
     out.boundaryState = bCheck.state;
@@ -938,15 +1227,16 @@ export class SimEngine {
   }
 
   /**
-   * Computes a fan of LiDAR rays against the canonical TerrainService and hazard boulders (Phase W9.1).
+   * Computes a fan of LiDAR rays against the canonical TerrainService and hazard boulders (Phase W9.1 + Phase 2).
    */
-  public computeLidarScan(rayCount = 24, maxRange = 14.0): LidarRayHit[] {
+  public computeLidarScan(rayCount = 24, maxRange = 14.0, fovRad = Math.PI * 0.85): LidarRayHit[] {
     const snap = this.gait.getSnapshot();
+    const mountY = this.robotProfile.sensorMounts.lidar.offsetLocal[1];
     const ox = this.currPos[0];
-    const oy = this.currPos[1] + 0.14; // Sensor head mount
+    const oy = this.currPos[1] + mountY; // Sensor head mount
     const oz = this.currPos[2];
-    const heading = snap.heading;
-    const fov = Math.PI * 0.85;
+    const heading = this.digitalTwinEnabled && this.digitalTwinPose ? this.digitalTwinPose.yaw : snap.heading;
+    const fov = fovRad;
     const hits: LidarRayHit[] = [];
 
     for (let i = 0; i < rayCount; i++) {
