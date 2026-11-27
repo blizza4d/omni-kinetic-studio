@@ -28,6 +28,7 @@ interface DatasetRecorderPanelProps {
   terrainSeed?: number;
   isCollapsed?: boolean;
   onToggleCollapse?: () => void;
+  onReplayEpisode?: (episode: RecordedDemonstrationEpisode) => void;
   className?: string;
 }
 
@@ -37,12 +38,14 @@ export default function DatasetRecorderPanel({
   terrainSeed = 42,
   isCollapsed = false,
   onToggleCollapse,
+  onReplayEpisode,
   className = '',
 }: DatasetRecorderPanelProps) {
   const [isRecording, setIsRecording] = useState(false);
+  const [pendingSuccessTag, setPendingSuccessTag] = useState(true);
   const [frameCount, setFrameCount] = useState(0);
   const [elapsedSec, setElapsedSec] = useState(0);
-  const [episodes, setEpisodes] = useState<RecordedDemonstrationEpisode[]>([]);
+  const [episodes, setEpisodes] = useState<RecordedDemonstrationEpisode[]>(() => [...globalEpisodeRecorder.getEpisodes()]);
   const [selectedSource, setSelectedSource] = useState<DatasetControlSource>(currentSource);
 
   // Sync selected source when current source changes
@@ -72,8 +75,13 @@ export default function DatasetRecorderPanel({
   };
 
   const handleStopAndSave = (success: boolean) => {
-    const ep = globalEpisodeRecorder.stopAndSave(success);
+    globalEpisodeRecorder.stopAndSave(success);
     setIsRecording(false);
+    setEpisodes([...globalEpisodeRecorder.getEpisodes()]);
+  };
+
+  const handleToggleEpisodeTag = (episodeId: string) => {
+    globalEpisodeRecorder.toggleEpisodeSuccess(episodeId);
     setEpisodes([...globalEpisodeRecorder.getEpisodes()]);
   };
 
@@ -180,28 +188,36 @@ export default function DatasetRecorderPanel({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-3 gap-2">
+                <div className="flex items-center justify-between">
                   <button
-                    onClick={() => handleStopAndSave(true)}
-                    className="py-1.5 px-2 rounded bg-sage/20 hover:bg-sage/30 text-sage border border-sage/40 font-bold text-[10px] uppercase flex items-center justify-center space-x-1 transition-colors"
+                    type="button"
+                    onClick={() => setPendingSuccessTag((prev) => !prev)}
+                    className={`px-2 py-1 rounded text-[10px] font-bold uppercase border transition-colors ${
+                      pendingSuccessTag
+                        ? 'bg-sage/20 text-sage border-sage/40'
+                        : 'bg-brick/20 text-brick border-brick/40'
+                    }`}
                   >
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    <span>Save Success</span>
+                    Tag: {pendingSuccessTag ? 'Success' : 'Fail'}
                   </button>
-                  <button
-                    onClick={() => handleStopAndSave(false)}
-                    className="py-1.5 px-2 rounded bg-amber-400/20 hover:bg-amber-400/30 text-amber-300 border border-amber-400/40 font-bold text-[10px] uppercase flex items-center justify-center space-x-1 transition-colors"
-                  >
-                    <Square className="w-3.5 h-3.5" />
-                    <span>Save Fail</span>
-                  </button>
-                  <button
-                    onClick={handleDiscard}
-                    className="py-1.5 px-2 rounded bg-brick/20 hover:bg-brick/30 text-brick border border-brick/40 font-bold text-[10px] uppercase flex items-center justify-center space-x-1 transition-colors"
-                  >
-                    <XCircle className="w-3.5 h-3.5" />
-                    <span>Discard</span>
-                  </button>
+                  <div className="flex items-center space-x-1.5">
+                    <button
+                      type="button"
+                      onClick={() => handleStopAndSave(pendingSuccessTag)}
+                      className="py-1 px-2.5 rounded bg-cream/15 hover:bg-cream/25 text-cream border border-cream/30 font-bold text-[10px] uppercase flex items-center space-x-1 transition-colors"
+                    >
+                      <Square className="w-3 h-3" />
+                      <span>Stop</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDiscard}
+                      className="py-1 px-2 rounded bg-brick/20 hover:bg-brick/30 text-brick border border-brick/40 font-bold text-[10px] uppercase flex items-center space-x-1 transition-colors"
+                    >
+                      <XCircle className="w-3 h-3" />
+                      <span>Discard</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (
@@ -291,13 +307,18 @@ export default function DatasetRecorderPanel({
                         <span className="font-bold text-cream text-[10px]">
                           EP #{idx + 1}
                         </span>
-                        <span
-                          className={`text-[8px] px-1 rounded uppercase font-bold ${
-                            ep.meta.success ? 'bg-sage/20 text-sage' : 'bg-brick/20 text-brick'
+                        <button
+                          type="button"
+                          onClick={() => handleToggleEpisodeTag(ep.meta.id)}
+                          title="Toggle Tag: Success / Fail"
+                          className={`text-[8px] px-1 rounded uppercase font-bold border transition-colors ${
+                            ep.meta.success
+                              ? 'bg-sage/20 text-sage border-sage/40 hover:bg-sage/30'
+                              : 'bg-brick/20 text-brick border-brick/40 hover:bg-brick/30'
                           }`}
                         >
                           {ep.meta.success ? 'Success' : 'Fail'}
-                        </span>
+                        </button>
                         <span className="text-[8px] text-cream-dim uppercase">
                           {ep.meta.controlSource}
                         </span>
@@ -308,7 +329,18 @@ export default function DatasetRecorderPanel({
                     </div>
 
                     <div className="flex items-center space-x-1">
+                      {onReplayEpisode && (
+                        <button
+                          type="button"
+                          onClick={() => onReplayEpisode(ep)}
+                          className="p-1 rounded hover:bg-sage/20 text-sage hover:text-cream"
+                          title="Replay this recorded demonstration in SimEngine"
+                        >
+                          <Play className="w-3 h-3" />
+                        </button>
+                      )}
                       <button
+                        type="button"
                         onClick={() => handleExportJsonl(ep.meta.id)}
                         className="p-1 rounded hover:bg-cream/10 text-cream-dim hover:text-cream"
                         title="Export this episode as LeRobot JSONL"
@@ -316,6 +348,7 @@ export default function DatasetRecorderPanel({
                         <FileCode className="w-3 h-3 text-sage" />
                       </button>
                       <button
+                        type="button"
                         onClick={() => handleExportCsv(ep.meta.id)}
                         className="p-1 rounded hover:bg-cream/10 text-cream-dim hover:text-cream"
                         title="Export this episode as CSV"

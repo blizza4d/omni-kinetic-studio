@@ -52,6 +52,8 @@ import { slerpShortest } from '../anim/math/quaternion';
 import { globalEpisodeRecorder, DatasetControlSource } from '../dataset/episodeRecorder';
 import { DEFAULT_ROBOT_PROFILE, getRobotProfile, RobotProfile, RobotProfileId } from '../robotics/profiles';
 import { PerceptionStore } from '../perception/lidar';
+import { TransientRoboticsStore } from '../telemetry/transientStore';
+import { quaternionToEuler, Quaternion4 } from '../frames';
 import { gaussian, mulberry32 } from './prng';
 
 export interface InterpolatedDroidRenderState {
@@ -147,8 +149,11 @@ export class SimEngine {
   private digitalTwinEnabled = false;
   // Autonomous Nemotron / Benchmark Waypoint Plan
   private autonomousWaypoints: { id: string; x: number; z: number; targetSpeed: number; tolerance: number }[] = [];
+  private autonomousConstraints: { maxSpeed?: number; maxTiltDeg?: number } | null = null;
   private autonomousWpIndex = 0;
   private autonomousPlanCompleted = false;
+  private prevYawRad = 0;
+  private readonly _angVelOut: [number, number, number] = [0, 0, 0];
 
   // Digital Twin / Domain state
   private digitalTwinPose: {
@@ -403,7 +408,8 @@ export class SimEngine {
   }
 
   public setAutonomousPlan(
-    waypoints: { id: string; x: number; z: number; targetSpeed?: number; tolerance?: number }[]
+    waypoints: { id: string; x: number; z: number; targetSpeed?: number; tolerance?: number }[],
+    constraints?: { maxSpeed?: number; maxTiltDeg?: number }
   ): void {
     this.autonomousWaypoints = waypoints.map((w) => ({
       id: w.id,
@@ -412,12 +418,14 @@ export class SimEngine {
       targetSpeed: w.targetSpeed ?? 1.05,
       tolerance: w.tolerance ?? 0.55,
     }));
+    this.autonomousConstraints = constraints ?? null;
     this.autonomousWpIndex = 0;
     this.autonomousPlanCompleted = false;
   }
 
   public clearAutonomousPlan(): void {
     this.autonomousWaypoints = [];
+    this.autonomousConstraints = null;
     this.autonomousWpIndex = 0;
     this.autonomousPlanCompleted = false;
   }
@@ -779,9 +787,14 @@ export class SimEngine {
           this._policyCmd.yawRate = 0;
         } else {
           const targetWp = this.autonomousWaypoints[this.autonomousWpIndex]!;
-          purePursuit(rx, rz, rHeading, targetWp.x, targetWp.z, targetWp.targetSpeed, 1.35, targetWp.tolerance, this._pursuitOut);
+          const maxSpd = this.autonomousConstraints?.maxSpeed ?? targetWp.targetSpeed;
+          const effSpeed = Math.min(targetWp.targetSpeed, maxSpd);
+          purePursuit(rx, rz, rHeading, targetWp.x, targetWp.z, effSpeed, 1.35, targetWp.tolerance, this._pursuitOut);
           const avoidYaw = computeObstacleAvoidanceYaw(rx, rz, rHeading, this.hazardObstacles, 2.0);
-          this._policyCmd.vx = this._pursuitOut.reached ? 0 : this._pursuitOut.vx;
+          const slopeNowDeg = this.terrain.slopeDegAt(rx, rz);
+          const maxPlanTilt = this.autonomousConstraints?.maxTiltDeg ?? 30;
+          const tiltScale = slopeNowDeg > maxPlanTilt ? 0.35 : 1.0;
+          this._policyCmd.vx = this._pursuitOut.reached ? 0 : this._pursuitOut.vx * tiltScale;
           this._policyCmd.vy = 0;
           this._policyCmd.yawRate = this._pursuitOut.reached
             ? 0
@@ -868,9 +881,22 @@ export class SimEngine {
       ? arbitrated.cmd
       : this.shaper.shape(arbitrated.cmd, this._safetyCtx, dt, this._shapedCmd);
 
-    // Non-holonomic 4WD differential constraint + optional domain transport delay
-    let execVx = shaped.vx;
-    let execVy = this.robotProfile.locomotionType === 'differential_4wd' ? 0 : shaped.vy;
+    // Non-holonomic 4WD differential constraint + slope traction + optional domain transport delay
+    const curSlopeDeg = this.terrain.slopeDegAt(rx, rz);
+    const slopeTractionFactor = Math.max(
+      0.35,
+      Math.min(1.0, (this.shaper.params.frictionMu / 0.8) * Math.cos((curSlopeDeg * Math.PI) / 180))
+    );
+    const applySlopeTraction =
+      curSlopeDeg > 18 || this.shaper.params.frictionMu < 0.78 || this.robotProfile.id !== 'quadruped_scout';
+
+    let execVx = applySlopeTraction ? shaped.vx * slopeTractionFactor : shaped.vx;
+    let execVy =
+      this.robotProfile.locomotionType === 'differential_4wd'
+        ? 0
+        : applySlopeTraction
+        ? shaped.vy * slopeTractionFactor
+        : shaped.vy;
     let execYawRate = shaped.yawRate;
     const execHop = this.robotProfile.locomotionType === 'differential_4wd' ? false : shaped.hop;
 
@@ -965,6 +991,55 @@ export class SimEngine {
       const rawT = j.torque ?? 0;
       this.currTorques[j.name] = Math.max(-this.domainMaxTorqueNm, Math.min(this.domainMaxTorqueNm, rawT));
     }
+
+    // Ground-contact suspension clamping (prevents terrain penetration on steep crater rims)
+    const groundYUnderBody = sampler(this.currPos[0], this.currPos[2]);
+    const minSuspensionY = groundYUnderBody + Math.min(0.14, this.robotProfile.dimensions.clearanceM * 0.65);
+    let suspensionClamped = false;
+    if (this.currPos[1] < minSuspensionY) {
+      this.currPos[1] = minSuspensionY;
+      suspensionClamped = true;
+    }
+
+    // Write high-frequency 60 Hz state to non-reactive transient store (zero React re-renders)
+    let slipSum = 0;
+    let contactCount = 0;
+    for (let i = 0; i < kin.feet.length; i++) {
+      slipSum += kin.feet[i]!.slipDistance;
+      if (kin.feet[i]!.contact || this.robotProfile.locomotionType === 'differential_4wd') {
+        contactCount++;
+      }
+    }
+    const avgWheelSlip = kin.feet.length > 0 ? slipSum / kin.feet.length : 0;
+    const qTuple: Quaternion4 = [this.currQuat[0], this.currQuat[1], this.currQuat[2], this.currQuat[3]];
+    const [eYawRad, ePitchRad, eRollRad] = quaternionToEuler(qTuple);
+    const toDeg = 180 / Math.PI;
+    let dYaw = eYawRad - this.prevYawRad;
+    if (dYaw > Math.PI) dYaw -= Math.PI * 2;
+    if (dYaw < -Math.PI) dYaw += Math.PI * 2;
+    this.prevYawRad = eYawRad;
+    this._angVelOut[0] = Number((eRollRad * 2.0 * toDeg).toFixed(2));
+    this._angVelOut[1] = Number((ePitchRad * 2.0 * toDeg).toFixed(2));
+    this._angVelOut[2] = Number(((dYaw / Math.max(1e-4, dt)) * toDeg).toFixed(2));
+
+    TransientRoboticsStore.getInstance().writePhysicsFrame({
+      timestampMs: Math.round(nowSec * 1000),
+      step: stepIndex,
+      pos: this.currPos,
+      quat: this.currQuat,
+      vel: kin.bodyLinearVel,
+      angVelDegS: this._angVelOut,
+      pitchDeg: Number((ePitchRad * toDeg).toFixed(2)),
+      rollDeg: Number((eRollRad * toDeg).toFixed(2)),
+      yawDeg: Number((eYawRad * toDeg).toFixed(2)),
+      wheelSlip: Number(avgWheelSlip.toFixed(4)),
+      slopeDeg: Number(curSlopeDeg.toFixed(2)),
+      slopeTractionFactor: Number(slopeTractionFactor.toFixed(3)),
+      groundContactCount: contactCount,
+      suspensionClamped,
+      gravityMps2: this.scenario.gravity,
+      eStopActive: this.arbiter.snapshot().emergencyStop,
+    });
 
     // 9. Collision detection against hazard boulders & custom obstacles
     const collisionBodyRadius = this.robotProfile.id === 'quadruped_scout' ? 0.32 : this.robotProfile.dimensions.widthM * 0.68;
@@ -1120,7 +1195,7 @@ export class SimEngine {
       };
       this.onFrameCallback(frame);
 
-      if (globalEpisodeRecorder.getIsRecording()) {
+      if (globalEpisodeRecorder.getIsRecording() && frame.seq % 2 === 0) {
         const currentSource = this.arbiter.getActiveSource();
         const datasetSource: DatasetControlSource =
           currentSource === 'cv'

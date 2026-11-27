@@ -12,7 +12,7 @@ import { LunarDustSystem } from '@/lib/droid/fx/DustPuffs';
 import { FramePacer } from '@/lib/sim/framePacer';
 import { FollowCameraRig } from '@/lib/camera/follow_camera';
 import { minJerk } from '@/lib/anim/math/minJerk';
-import { SimEngine, InterpolatedDroidRenderState } from '@/lib/sim/SimEngine';
+import { SimEngine, InterpolatedDroidRenderState, ScriptedCommandStep } from '@/lib/sim/SimEngine';
 import { CameraMode, RadarSize } from '@/lib/storage/settings';
 import { SensorOverlayFlags } from '@/components/control/ControlHUD';
 import { EditorToolMode } from '@/components/missions/MissionPanels';
@@ -62,7 +62,7 @@ interface ThreeViewerProps {
   onPointerDriveUpdate?: (active: boolean, x: number, z: number) => void;
   onCanvasReady?: (canvas: HTMLCanvasElement | null) => void;
   onUiSync?: () => void;
-  onCollisionDetected?: (collision: any) => void;
+  onCollisionDetected?: (collision: { a: string; b: string; point: [number, number, number]; impulse: number }) => void;
   onFpsUpdate?: (fps: number, frameTimeMs: number) => void;
   onBoundaryWarning?: (state: 'soft' | 'hard' | 'out', distToEdge: number) => void;
   onEpisodeReset?: (reason: string) => void;
@@ -273,7 +273,9 @@ export default function ThreeViewer({
     pipCamera.up.set(0, 1, 0);
 
     const isLow = qualityTier === 'low' || qualityTier === 'potato';
+    const isBalanced = qualityTier === 'medium';
     const shadowsEnabled = !isLow;
+    const maxDpr = isLow ? 1 : isBalanced ? 1.5 : 2;
 
     const renderer = new THREE.WebGLRenderer({
       antialias: !isLow,
@@ -281,7 +283,7 @@ export default function ThreeViewer({
       preserveDrawingBuffer: true, // Required for crisp 2x screenshot capture
     });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, isLow ? 1 : 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxDpr));
     renderer.shadowMap.enabled = shadowsEnabled;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -306,8 +308,9 @@ export default function ThreeViewer({
 
     const dirLight = new THREE.DirectionalLight(0xfdfbf7, 2.3);
     dirLight.castShadow = shadowsEnabled;
-    dirLight.shadow.mapSize.width = qualityTier === 'ultra' ? 2048 : 1024;
-    dirLight.shadow.mapSize.height = qualityTier === 'ultra' ? 2048 : 1024;
+    const shadowRes = qualityTier === 'ultra' ? 2048 : isBalanced ? 1024 : 1024;
+    dirLight.shadow.mapSize.width = shadowRes;
+    dirLight.shadow.mapSize.height = shadowRes;
     dirLight.shadow.camera.near = 0.5;
     dirLight.shadow.camera.far = 50;
     dirLight.shadow.camera.left = -12;
@@ -500,8 +503,11 @@ export default function ThreeViewer({
 
     // Pre-warm shaders
     try {
-      if ((renderer as any).compileAsync) {
-        (renderer as any).compileAsync(scene, camera).catch(() => {});
+      const asyncRenderer = renderer as THREE.WebGLRenderer & {
+        compileAsync?: (s: THREE.Scene, c: THREE.Camera) => Promise<unknown>;
+      };
+      if (asyncRenderer.compileAsync) {
+        asyncRenderer.compileAsync(scene, camera).catch(() => {});
       } else {
         renderer.compile(scene, camera);
       }
@@ -630,12 +636,12 @@ export default function ThreeViewer({
 
     // Debug accessor for Playwright & automated trace verification (Phase E0.3)
     if (typeof window !== 'undefined') {
-      (window as any).__omniDebug = {
+      (window as unknown as { __omniDebug?: Record<string, unknown> }).__omniDebug = {
         getEngine: () => engineRef.current,
         getClock: () => engineRef.current.getClockSnapshot(),
         getState: () => ({ ...renderState }),
         getLatencyMs: () => engineRef.current.getLastInputLatencyMs(),
-        runScript: (steps: any[]) => engineRef.current.runScript(steps),
+        runScript: (steps: ScriptedCommandStep[]) => engineRef.current.runScript(steps),
         setCameraMode: (m: CameraMode) => {
           cameraModeRef.current = m;
         },
@@ -1713,8 +1719,11 @@ function buildTerrainBeacon(
       ctx.strokeStyle = `#${colorHex.toString(16).padStart(6, '0')}`;
       ctx.lineWidth = 3;
       ctx.beginPath();
-      if ((ctx as any).roundRect) {
-        (ctx as any).roundRect(4, 4, 248, 56, 10);
+      const roundCtx = ctx as CanvasRenderingContext2D & {
+        roundRect?: (x: number, y: number, w: number, h: number, radii?: number) => void;
+      };
+      if (roundCtx.roundRect) {
+        roundCtx.roundRect(4, 4, 248, 56, 10);
       } else {
         ctx.rect(4, 4, 248, 56);
       }

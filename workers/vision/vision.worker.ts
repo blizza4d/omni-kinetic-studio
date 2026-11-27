@@ -1,9 +1,13 @@
-import { FilesetResolver, HandLandmarker, FaceLandmarker } from '@mediapipe/tasks-vision';
+import { FilesetResolver, HandLandmarker, FaceLandmarker, NormalizedLandmark } from '@mediapipe/tasks-vision';
 
 let handLandmarker: HandLandmarker | null = null;
 let faceLandmarker: FaceLandmarker | null = null;
 let lastTimestamp = -1;
 let activeDelegate: 'GPU' | 'CPU' | 'SYNTHETIC_OFFLINE' = 'GPU';
+
+function formatErr(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 async function initLandmarkers() {
   try {
@@ -62,8 +66,8 @@ async function initLandmarkers() {
     }
 
     self.postMessage({ type: 'READY', delegate: activeDelegate });
-  } catch (err: any) {
-    console.warn('[VisionWorker] Remote model assets unavailable. Offline synthetic tracker active:', err);
+  } catch (err: unknown) {
+    console.warn('[VisionWorker] Remote model assets unavailable. Offline synthetic tracker active:', formatErr(err));
     activeDelegate = 'SYNTHETIC_OFFLINE';
     self.postMessage({ type: 'READY', delegate: 'SYNTHETIC_OFFLINE' });
   }
@@ -105,14 +109,20 @@ self.onmessage = async (event: MessageEvent) => {
   lastTimestamp = validTimestamp;
 
   try {
-    let handsLandmarks: any[] = [];
-    let faceLandmarks: any[] = [];
+    let handsLandmarks: NormalizedLandmark[][] = [];
+    let faceLandmarks: NormalizedLandmark[][] = [];
+    let handConfidence = 0;
 
     if (activeDelegate === 'SYNTHETIC_OFFLINE' || !handLandmarker) {
-      handsLandmarks = [generateSyntheticHandLandmarks(validTimestamp / 1000)];
+      handsLandmarks = [generateSyntheticHandLandmarks(validTimestamp / 1000) as NormalizedLandmark[]];
+      handConfidence = 0.95;
     } else {
       const handsResult = handLandmarker.detectForVideo(frame, validTimestamp);
       handsLandmarks = handsResult ? handsResult.landmarks : [];
+      if (handsLandmarks.length > 0) {
+        const firstScore = handsResult.handednesses?.[0]?.[0]?.score;
+        handConfidence = typeof firstScore === 'number' ? Number(firstScore.toFixed(3)) : 0.92;
+      }
 
       if (faceLandmarker && Math.floor(validTimestamp) % 2 === 0) {
         const faceResult = faceLandmarker.detectForVideo(frame, validTimestamp);
@@ -129,12 +139,13 @@ self.onmessage = async (event: MessageEvent) => {
         handednesses: [],
         faces: faceLandmarks,
       },
+      confidence: handConfidence,
       latencyMs: Number(latencyMs.toFixed(1)),
       delegate: activeDelegate,
       timestamp: validTimestamp,
     });
-  } catch (err: any) {
-    self.postMessage({ type: 'FRAME_ERROR', error: err.message });
+  } catch (err: unknown) {
+    self.postMessage({ type: 'FRAME_ERROR', error: formatErr(err) });
   } finally {
     // Crucial: Always close ImageBitmap to prevent memory leaks in the worker thread
     if (frame && typeof frame.close === 'function') {

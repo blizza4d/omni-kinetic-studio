@@ -21,23 +21,37 @@ export interface BuiltRobotRig {
   actuatorLeds: Record<string, THREE.Mesh>;
 }
 
+function disposeMaterialItem(m: THREE.Material): void {
+  const matWithMap = m as THREE.Material & { map?: THREE.Texture | null };
+  if (matWithMap.map && typeof matWithMap.map.dispose === 'function') {
+    matWithMap.map.dispose();
+  }
+  if (typeof m.dispose === 'function') {
+    m.dispose();
+  }
+}
+
 /**
  * Recursively disposes geometries, materials, and textures on a detached Three.js subtree.
  */
 export function disposeObjectTree(root: THREE.Object3D | null | undefined): void {
   if (!root) return;
   root.traverse((obj) => {
-    const anyObj = obj as any;
-    if (anyObj.geometry && typeof anyObj.geometry.dispose === 'function') {
-      anyObj.geometry.dispose();
+    const renderObj = obj as THREE.Object3D & {
+      geometry?: THREE.BufferGeometry;
+      material?: THREE.Material | THREE.Material[];
+    };
+    if (renderObj.geometry && typeof renderObj.geometry.dispose === 'function') {
+      renderObj.geometry.dispose();
     }
-    const mat = anyObj.material;
+    const mat = renderObj.material;
     if (mat) {
-      const mats = Array.isArray(mat) ? mat : [mat];
-      for (const m of mats) {
-        if (!m) continue;
-        if (m.map && typeof m.map.dispose === 'function') m.map.dispose();
-        if (typeof m.dispose === 'function') m.dispose();
+      if (Array.isArray(mat)) {
+        for (const m of mat) {
+          if (m) disposeMaterialItem(m);
+        }
+      } else {
+        disposeMaterialItem(mat);
       }
     }
   });

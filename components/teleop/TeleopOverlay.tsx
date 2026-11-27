@@ -17,23 +17,48 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { Vector3OneEuroFilter, OneEuroFilter } from '@/lib/filters/one_euro';
+import { GestureTeleopStabilizer, DEFAULT_GESTURE_FILTER_CONFIG } from '@/lib/filters/gestureController';
+import { TransientRoboticsStore } from '@/lib/telemetry/transientStore';
 import { solveLegIK, computePinchDistance, computeWristRoll, computeFacePose } from '@/lib/ik/fabrik';
-import { TeleopCommand } from '@/contracts';
+import { DemonstrationStep, TeleopCommand, TelemetryFrame } from '@/contracts';
 import { DAggerRecorder } from './Recorder';
+
+interface LandmarkPoint {
+  x: number;
+  y: number;
+  z?: number;
+}
+
+interface VisionResultsMessage {
+  type: 'RESULTS';
+  landmarks: {
+    hands?: LandmarkPoint[][];
+    faces?: LandmarkPoint[][];
+  };
+  confidence?: number;
+  latencyMs: number;
+  delegate?: 'GPU' | 'CPU' | 'SYNTHETIC_OFFLINE';
+  timestamp?: number;
+}
+
+type VisionWorkerMessage =
+  | { type: 'READY'; delegate?: 'GPU' | 'CPU' | 'SYNTHETIC_OFFLINE' }
+  | VisionResultsMessage
+  | { type: 'FRAME_ERROR'; error: string };
 
 interface TeleopOverlayProps {
   isOpen: boolean;
   onClose: () => void;
   onTeleopCommand?: (cmd: TeleopCommand) => void;
-  onCommand?: (cmd: any) => void;
-  onOpenDatasetPanel?: (episodes: any[]) => void;
-  onSaveEpisode?: (ep: any) => void;
+  onCommand?: (cmd: TeleopCommand) => void;
+  onOpenDatasetPanel?: (episodes: DemonstrationStep[][]) => void;
+  onSaveEpisode?: (ep: DemonstrationStep[]) => void;
   currentRobotState?: {
     pos: [number, number, number];
     quat: [number, number, number, number];
     joints: Record<string, number>;
   };
-  currentFrame?: any;
+  currentFrame?: TelemetryFrame | null;
 }
 
 export default function TeleopOverlay({
@@ -47,7 +72,7 @@ export default function TeleopOverlay({
   currentFrame,
 }: TeleopOverlayProps) {
   const dispatchCommand = useCallback(
-    (cmd: any) => {
+    (cmd: TeleopCommand) => {
       (onTeleopCommand || onCommand || (() => {}))(cmd);
     },
     [onTeleopCommand, onCommand]
@@ -58,7 +83,7 @@ export default function TeleopOverlay({
       return {
         pos: currentFrame.bodies[0].pos as [number, number, number],
         quat: currentFrame.bodies[0].quat as [number, number, number, number],
-        joints: (currentFrame.joints || []).reduce((acc: Record<string, number>, j: any) => {
+        joints: (currentFrame.joints || []).reduce<Record<string, number>>((acc, j) => {
           acc[j.name] = j.angle;
           return acc;
         }, {}),
@@ -85,6 +110,14 @@ export default function TeleopOverlay({
   const [recordedSteps, setRecordedSteps] = useState(0);
   const [recordedEpisodes, setRecordedEpisodes] = useState(0);
   const [activeLimb, setActiveLimb] = useState<'FL' | 'FR' | 'RL' | 'RR'>('FL');
+  const [emaAlpha, setEmaAlpha] = useState<number>(DEFAULT_GESTURE_FILTER_CONFIG.emaAlpha);
+  const [deadzone, setDeadzone] = useState<number>(DEFAULT_GESTURE_FILTER_CONFIG.deadzone);
+  const [failsafeActive, setFailsafeActive] = useState(false);
+  const [signalLostMs, setSignalLostMs] = useState(0);
+  const [stabilizedCmd, setStabilizedCmd] = useState<{ vx: number; yawRate: number }>({ vx: 0, yawRate: 0 });
+  const [targetInferFps, setTargetInferFps] = useState<number>(() =>
+    TransientRoboticsStore.getInstance().getState().mediapipeTargetFps
+  );
 
   // Virtual keyboard tip position
   const keyboardTipRef = useRef<[number, number, number]>([0.0, 0.0, -0.25]);
@@ -93,9 +126,22 @@ export default function TeleopOverlay({
   const recorderRef = useRef(new DAggerRecorder());
   const filterRef = useRef(new Vector3OneEuroFilter(1.2, 0.015));
   const pinchFilterRef = useRef(new OneEuroFilter(1.0, 0.01));
+  const stabilizerRef = useRef(new GestureTeleopStabilizer());
   const calibrationOriginRef = useRef<[number, number, number] | null>(null);
   const animationFrameId = useRef<number | null>(null);
-  const handleVisionResultsRef = useRef<(data: any) => void>(() => {});
+  const lastInferenceSentMsRef = useRef<number>(0);
+  const handleVisionResultsRef = useRef<(data: VisionResultsMessage) => void>(() => {});
+
+  useEffect(() => {
+    stabilizerRef.current.updateConfig({ emaAlpha, deadzone });
+  }, [emaAlpha, deadzone]);
+
+  useEffect(() => {
+    const store = TransientRoboticsStore.getInstance();
+    return store.subscribeThrottled((s) => {
+      setTargetInferFps(s.mediapipeTargetFps);
+    }, 10);
+  }, []);
 
   // Load saved calibration origin from localStorage if present
   useEffect(() => {
@@ -117,7 +163,7 @@ export default function TeleopOverlay({
         type: 'module',
       });
 
-      worker.onmessage = (event: MessageEvent) => {
+      worker.onmessage = (event: MessageEvent<VisionWorkerMessage>) => {
         const data = event.data;
         if (data.type === 'READY') {
           setDelegate(data.delegate || 'GPU');
@@ -253,6 +299,9 @@ export default function TeleopOverlay({
           limb: activeLimb,
           activeLimb,
           jointTargets,
+          vx: Number((keyboardTipRef.current[0] * 4.0).toFixed(3)),
+          yawRate: Number((keyboardTipRef.current[1] * 4.0).toFixed(3)),
+          failsafeActive: false,
           confidence: 1.0,
           stiffness: keyboardStiffnessRef.current,
           source: 'keyboard_fallback',
@@ -288,13 +337,24 @@ export default function TeleopOverlay({
         return;
       }
 
-      if (videoRef.current.readyState >= 2 && !videoRef.current.paused) {
+      const now = performance.now();
+      const fpsCap = TransientRoboticsStore.getInstance().getState().mediapipeTargetFps;
+      const minIntervalMs = 1000 / Math.max(5, fpsCap);
+
+      if (
+        videoRef.current.readyState >= 2 &&
+        !videoRef.current.paused &&
+        now - lastInferenceSentMsRef.current >= minIntervalMs
+      ) {
+        lastInferenceSentMsRef.current = now;
         isProcessing = true;
         createImageBitmap(videoRef.current)
           .then((bitmap) => {
             if (workerRef.current) {
-              const now = performance.now();
-              workerRef.current.postMessage({ frame: bitmap, timestamp: now }, [bitmap]);
+              const sendNow = performance.now();
+              workerRef.current.postMessage({ frame: bitmap, timestamp: sendNow }, [bitmap]);
+            } else {
+              bitmap.close();
             }
           })
           .catch(() => {})
@@ -317,11 +377,11 @@ export default function TeleopOverlay({
 
   // Process Vision Results from Worker
   const handleVisionResults = useCallback(
-    (data: any) => {
+    (data: VisionResultsMessage) => {
       if (isKeyboardMode) return;
 
       const now = performance.now();
-      const { landmarks, latencyMs: workerLatency } = data;
+      const { landmarks, latencyMs: workerLatency, confidence: workerConfidence } = data;
       setLatencyMs(workerLatency);
 
       // Rolling p50/p95 latency calculation
@@ -343,74 +403,112 @@ export default function TeleopOverlay({
       let jointTargets: Record<string, number> = {};
       let cameraPose = { yaw: 0, pitch: 0 };
       let stiffness = 0.8;
-      let confidence = 0.95;
+      const handsList = landmarks?.hands ?? [];
+      const handPresent = handsList.length > 0;
+      const confidence = handPresent
+        ? typeof workerConfidence === 'number'
+          ? workerConfidence
+          : 0.92
+        : 0;
+      let rawThrottle = 0;
+      let rawSteering = 0;
 
       // 1. Process Hand Landmarks
-      if (landmarks.hands && landmarks.hands.length > 0) {
-        const hand = landmarks.hands[0];
+      if (handPresent) {
+        const hand = handsList[0]!;
         const thumbTip = hand[4];
         const indexTip = hand[8];
 
-        // Draw Skeleton on Preview Canvas
-        if (ctx && canvas) {
-          ctx.strokeStyle = '#6B705C';
-          ctx.lineWidth = 2;
-          ctx.fillStyle = '#FDFBF7';
+        if (indexTip && thumbTip) {
+          // Draw Skeleton on Preview Canvas
+          if (ctx && canvas) {
+            ctx.strokeStyle = '#6B705C';
+            ctx.lineWidth = 2;
+            ctx.fillStyle = '#FDFBF7';
 
-          for (const pt of hand) {
-            const px = (1 - pt.x) * canvas.width;
-            const py = pt.y * canvas.height;
+            for (const pt of hand) {
+              const px = (1 - pt.x) * canvas.width;
+              const py = pt.y * canvas.height;
+              ctx.beginPath();
+              ctx.arc(px, py, 3, 0, 2 * Math.PI);
+              ctx.fill();
+            }
+
+            // Highlight fingertip
+            const ix = (1 - indexTip.x) * canvas.width;
+            const iy = indexTip.y * canvas.height;
+            ctx.fillStyle = '#B83B2F';
             ctx.beginPath();
-            ctx.arc(px, py, 3, 0, 2 * Math.PI);
+            ctx.arc(ix, iy, 6, 0, 2 * Math.PI);
             ctx.fill();
           }
 
-          // Highlight fingertip
-          const ix = (1 - indexTip.x) * canvas.width;
-          const iy = indexTip.y * canvas.height;
-          ctx.fillStyle = '#B83B2F';
-          ctx.beginPath();
-          ctx.arc(ix, iy, 6, 0, 2 * Math.PI);
-          ctx.fill();
+          // Target coordinates with origin calibration offset
+          const rawTarget: [number, number, number] = [
+            (indexTip.x - 0.5) * 0.4,
+            (0.5 - indexTip.y) * 0.4,
+            (indexTip.z ?? 0) * 0.4 - 0.25,
+          ];
+
+          if (isCalibrating) {
+            calibrationOriginRef.current = rawTarget;
+          }
+
+          const origin = calibrationOriginRef.current ?? [0, 0, -0.25];
+          // Map hand up/down displacement -> linear throttle, left/right displacement -> yaw steering
+          rawThrottle = Math.max(-1, Math.min(1, (rawTarget[1] - origin[1]) / 0.14));
+          rawSteering = Math.max(-1, Math.min(1, (origin[0] - rawTarget[0]) / 0.14));
+
+          // Apply One Euro Filter to target coordinates
+          const smoothed = filterRef.current.filter(rawTarget, now / 1000);
+
+          // Solve IK for the active leg
+          const legIK = solveLegIK([smoothed[0], smoothed[1], smoothed[2]]);
+
+          // Pinch for stiffness
+          const rawPinch = computePinchDistance(
+            { x: thumbTip.x, y: thumbTip.y, z: thumbTip.z ?? 0 },
+            { x: indexTip.x, y: indexTip.y, z: indexTip.z ?? 0 }
+          );
+          stiffness = pinchFilterRef.current.filter(rawPinch, now / 1000);
+
+          jointTargets = {
+            [`${activeLimb}_hip_joint`]: legIK.hip,
+            [`${activeLimb}_thigh_joint`]: legIK.thigh,
+            [`${activeLimb}_calf_joint`]: legIK.calf,
+          };
         }
-
-        // Target coordinates with origin calibration offset
-        const rawTarget: [number, number, number] = [
-          (indexTip.x - 0.5) * 0.4,
-          (0.5 - indexTip.y) * 0.4,
-          (indexTip.z ?? 0) * 0.4 - 0.25,
-        ];
-
-        if (isCalibrating) {
-          calibrationOriginRef.current = rawTarget;
-        }
-
-        // Apply One Euro Filter to target coordinates
-        const smoothed = filterRef.current.filter(rawTarget, now / 1000);
-
-        // Solve IK for the active leg
-        const legIK = solveLegIK([smoothed[0], smoothed[1], smoothed[2]]);
-
-        // Pinch for stiffness
-        const rawPinch = computePinchDistance(thumbTip, indexTip);
-        stiffness = pinchFilterRef.current.filter(rawPinch, now / 1000);
-
-        jointTargets = {
-          [`${activeLimb}_hip_joint`]: legIK.hip,
-          [`${activeLimb}_thigh_joint`]: legIK.thigh,
-          [`${activeLimb}_calf_joint`]: legIK.calf,
-        };
       }
 
+      // Stabilize rover velocity with EMA + deadzone + >300ms signal-loss failsafe
+      const stabilized = stabilizerRef.current.step({
+        rawThrottle,
+        rawSteering,
+        handPresent,
+        confidence,
+        nowMs: now,
+      });
+      setFailsafeActive(stabilized.failsafeActive);
+      setSignalLostMs(stabilized.signalLostMs);
+      setStabilizedCmd({
+        vx: Number(stabilized.vx.toFixed(2)),
+        yawRate: Number(stabilized.yawRate.toFixed(2)),
+      });
+
       // 2. Process Face Landmarks for Camera Orbit
-      if (landmarks.faces && landmarks.faces.length > 0) {
-        const face = landmarks.faces[0];
+      const facesList = landmarks?.faces ?? [];
+      if (facesList.length > 0) {
+        const face = facesList[0]!;
         const noseTip = face[1];
         const leftCheek = face[234];
         const rightCheek = face[454];
 
         if (noseTip && leftCheek && rightCheek) {
-          cameraPose = computeFacePose(noseTip, leftCheek, rightCheek);
+          cameraPose = computeFacePose(
+            { x: noseTip.x, y: noseTip.y, z: noseTip.z ?? 0 },
+            { x: leftCheek.x, y: leftCheek.y, z: leftCheek.z ?? 0 },
+            { x: rightCheek.x, y: rightCheek.y, z: rightCheek.z ?? 0 }
+          );
         }
       }
 
@@ -420,6 +518,14 @@ export default function TeleopOverlay({
         limb: activeLimb,
         activeLimb,
         jointTargets,
+        vx: Number(stabilized.vx.toFixed(3)),
+        yawRate: Number(stabilized.yawRate.toFixed(3)),
+        targetPosition: [
+          Number((stabilized.vx / 4.0).toFixed(4)),
+          0,
+          Number((-stabilized.yawRate / 3.5).toFixed(4)),
+        ],
+        failsafeActive: stabilized.failsafeActive,
         cameraPose,
         confidence,
         stiffness,
@@ -502,9 +608,19 @@ export default function TeleopOverlay({
           <div className="flex items-center space-x-1.5 bg-charcoal px-2.5 py-1 rounded border border-cream/10">
             <span className="text-cream-dim">Engine:</span>
             <span className="text-cream font-semibold">
-              {isKeyboardMode ? 'Keyboard Fallback' : delegate}
+              {isKeyboardMode ? 'Keyboard Fallback' : `${delegate} (${targetInferFps} FPS)`}
             </span>
           </div>
+
+          {!isKeyboardMode && failsafeActive && (
+            <div
+              className="flex items-center space-x-1 bg-brick/25 px-2.5 py-1 rounded border border-brick/50 text-brick font-bold"
+              title="Signal-loss failsafe (>300ms): ramping rover velocity to 0"
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+              <span>FAILSAFE ({Math.round(signalLostMs)}ms)</span>
+            </div>
+          )}
 
           {/* Mode Switcher */}
           <button
@@ -622,6 +738,51 @@ export default function TeleopOverlay({
                 )}
               </>
             )}
+          </div>
+        )}
+
+        {/* Stabilizer Controls (EMA Smoothing, Deadzone, Signal-Loss Status) */}
+        {!isKeyboardMode && (
+          <div className="p-2.5 rounded-lg bg-charcoal-deep/80 border border-cream/10 font-mono text-[10px] space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-cream font-bold uppercase flex items-center space-x-1">
+                <Sliders className="w-3 h-3 text-sage" />
+                <span>Gesture Stabilizer</span>
+              </span>
+              <span className="text-cream-dim tabular-nums">
+                vx {stabilizedCmd.vx.toFixed(2)} m/s · ω {stabilizedCmd.yawRate.toFixed(2)} rad/s
+              </span>
+            </div>
+            <div className="space-y-1">
+              <div className="flex justify-between text-cream-dim">
+                <span>EMA Alpha</span>
+                <span className="text-cream tabular-nums">{emaAlpha.toFixed(2)}</span>
+              </div>
+              <input
+                type="range"
+                min={0.05}
+                max={0.95}
+                step={0.05}
+                value={emaAlpha}
+                onChange={(e) => setEmaAlpha(parseFloat(e.target.value))}
+                className="w-full accent-[#6B705C]"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="flex justify-between text-cream-dim">
+                <span>Deadzone</span>
+                <span className="text-cream tabular-nums">{deadzone.toFixed(2)}</span>
+              </div>
+              <input
+                type="range"
+                min={0.0}
+                max={0.35}
+                step={0.02}
+                value={deadzone}
+                onChange={(e) => setDeadzone(parseFloat(e.target.value))}
+                className="w-full accent-[#6B705C]"
+              />
+            </div>
           </div>
         )}
 

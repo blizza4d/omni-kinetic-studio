@@ -148,6 +148,10 @@ export const TeleopCommandSchema = z.object({
   confidence: z.number().min(0).max(1),
   stiffness: z.number().min(0).max(1),
   source: z.enum(['camera_mediapipe', 'keyboard_fallback', 'replay_landmark']).default('camera_mediapipe'),
+  targetPosition: z.tuple([z.number(), z.number(), z.number()]).optional(),
+  vx: z.number().optional(),
+  yawRate: z.number().optional(),
+  failsafeActive: z.boolean().optional(),
 }).transform((data) => ({
   ...data,
   activeLimb: data.activeLimb ?? data.limb,

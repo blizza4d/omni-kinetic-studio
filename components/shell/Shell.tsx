@@ -71,7 +71,12 @@ import {
   ArchitectOutput,
   JobStatus,
   RunSummary,
+  CompiledSpec,
+  SpecCompileReport,
+  DemonstrationStep,
 } from '@/contracts';
+import { TransientRoboticsStore } from '@/lib/telemetry/transientStore';
+import { RecordedDemonstrationEpisode } from '@/lib/dataset/episodeRecorder';
 import { generateDeterministicEnvironmentSpec } from '@/lib/nebius/prompts';
 import { TelemetryStore } from '@/lib/telemetry/store';
 import { PerfProbe } from '@/lib/perf/probe';
@@ -252,13 +257,20 @@ export default function Shell() {
   const [stages, setStages] = useState<Record<string, StageState>>(INITIAL_STAGES);
   const [activeStageKey, setActiveStageKey] = useState<string | null>(null);
   const [architectOutput, setArchitectOutput] = useState<
-    (ArchitectOutput & { critique?: any; safetyChecks?: any[]; compileReport?: any; compiledSpec?: any; sandboxResult?: any }) | null
+    (ArchitectOutput & {
+      spec: EnvironmentSpec;
+      critique?: Record<string, unknown>;
+      safetyChecks?: Array<Record<string, unknown>>;
+      compileReport?: SpecCompileReport;
+      compiledSpec?: CompiledSpec;
+      sandboxResult?: Record<string, unknown>;
+    }) | null
   >(null);
   const [isStreamingArchitect, setIsStreamingArchitect] = useState(false);
   const [iteration, setIteration] = useState(1);
   const [isDatasetPanelOpen, setIsDatasetPanelOpen] = useState(false);
   const [isDeltaComparisonOpen, setIsDeltaComparisonOpen] = useState(false);
-  const [collectedEpisodes, setCollectedEpisodes] = useState<any[]>([]);
+  const [collectedEpisodes, setCollectedEpisodes] = useState<DemonstrationStep[][]>([]);
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [runSummary, setRunSummary] = useState<RunSummary | null>(null);
   const [showRunSummary, setShowRunSummary] = useState(false);
@@ -510,6 +522,9 @@ export default function Shell() {
           const tiers: QualityTier[] = ['low', 'medium', 'high', 'ultra'];
           const next = tiers[(tiers.indexOf(prev) + 1) % tiers.length];
           PerfProbe.getInstance().setTier(next);
+          TransientRoboticsStore.getInstance().setPerformanceTier(
+            next === 'high' || next === 'ultra' ? 'high' : next === 'medium' ? 'balanced' : 'low'
+          );
           showToast(`Quality tier: ${next.toUpperCase()}`, 'info');
           return next;
         });
@@ -800,8 +815,9 @@ export default function Shell() {
           } catch {}
         }
       }
-    } catch (err: any) {
-      addLog(`Architect stream error: ${err.message}`, 'error');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog(`Architect stream error: ${msg}`, 'error');
     } finally {
       setIsStreamingArchitect(false);
     }
@@ -835,15 +851,61 @@ export default function Shell() {
     setActivePlan(plan);
     const waypoints = plan.waypoints.map((w) => ({
       id: `wp_${w.id}`,
-      x: w.position[0],
-      z: w.position[2],
+      x: typeof w.x === 'number' ? w.x : w.position[0],
+      z: typeof w.z === 'number' ? w.z : w.position[2],
       targetSpeed: w.target_speed,
       tolerance: w.arrival_tolerance,
     }));
     engine.inputs.clearWaypoints();
-    engine.setAutonomousPlan(waypoints);
+    engine.setAutonomousPlan(waypoints, {
+      maxSpeed: plan.safety_constraints.max_speed ?? plan.safety_constraints.max_linear_vel,
+      maxTiltDeg: plan.safety_constraints.max_tilt_deg ?? plan.safety_constraints.max_pitch_deg,
+    });
     engine.arbiter.releaseToPolicy();
     showToast(`Executing Nemotron Plan: ${plan.task_name} (${waypoints.length} waypoints)`, 'info');
+    handleUiSync();
+  }, [engine, showToast, handleUiSync]);
+
+  const handleReplayEpisode = useCallback((ep: RecordedDemonstrationEpisode) => {
+    if (!ep.frames || ep.frames.length === 0) {
+      showToast('Recorded episode contains no trajectory frames.', 'warn');
+      return;
+    }
+    const waypoints: Array<{ id: string; x: number; z: number; targetSpeed?: number; tolerance?: number }> = [];
+    let lastX = ep.frames[0]!.observation.pose[0];
+    let lastZ = ep.frames[0]!.observation.pose[2];
+    for (let i = 0; i < ep.frames.length; i++) {
+      const f = ep.frames[i]!;
+      const [fx, , fz] = f.observation.pose;
+      const dist = Math.hypot(fx - lastX, fz - lastZ);
+      if (i === ep.frames.length - 1 || dist >= 0.45) {
+        const speed = Math.max(0.35, Math.min(1.5, Math.abs(f.action.throttle ?? f.action.linear_vel_cmd[0]) || 0.75));
+        waypoints.push({
+          id: `replay_wp_${i}`,
+          x: fx,
+          z: fz,
+          targetSpeed: speed,
+          tolerance: 0.4,
+        });
+        lastX = fx;
+        lastZ = fz;
+      }
+    }
+    if (waypoints.length === 0) {
+      const f0 = ep.frames[0]!;
+      waypoints.push({
+        id: 'replay_wp_0',
+        x: f0.observation.pose[0],
+        z: f0.observation.pose[2],
+        targetSpeed: 0.6,
+        tolerance: 0.4,
+      });
+    }
+    engine.resetEpisode(true);
+    engine.inputs.clearWaypoints();
+    engine.setAutonomousPlan(waypoints);
+    engine.arbiter.releaseToPolicy();
+    showToast(`Replaying ${ep.meta.name} (${waypoints.length} waypoints)`, 'info');
     handleUiSync();
   }, [engine, showToast, handleUiSync]);
 
@@ -991,7 +1053,7 @@ export default function Shell() {
                   : 'text-cream-dim hover:text-cream'
               }`}
             >
-              Manual (T)
+              Manual <span className="hidden lg:inline">(WASD)</span>
             </button>
             <button
               type="button"
@@ -1007,7 +1069,7 @@ export default function Shell() {
                   : 'text-cream-dim hover:text-cream'
               }`}
             >
-              Gesture
+              Gesture <span className="hidden xl:inline">(MediaPipe)</span>
             </button>
             <button
               type="button"
@@ -1022,7 +1084,7 @@ export default function Shell() {
                   : 'text-cream-dim hover:text-cream'
               }`}
             >
-              Autonomous
+              Autonomous <span className="hidden xl:inline">(Nemotron)</span>
             </button>
           </div>
 
@@ -1157,13 +1219,16 @@ export default function Shell() {
                 onClick={() => {
                   setQualityTier(t);
                   PerfProbe.getInstance().setTier(t);
-                  showToast(`Tier: ${t.toUpperCase()}`, 'info');
+                  TransientRoboticsStore.getInstance().setPerformanceTier(
+                    t === 'high' ? 'high' : t === 'medium' ? 'balanced' : 'low'
+                  );
+                  showToast(`Tier: ${t === 'medium' ? 'BALANCED' : t.toUpperCase()}`, 'info');
                 }}
                 className={`px-1.5 py-0.5 rounded font-bold uppercase transition-colors ${
                   qualityTier === t ? 'bg-sage text-charcoal-deep' : 'text-cream-dim hover:text-cream'
                 }`}
               >
-                {t === 'medium' ? 'BAL' : t.toUpperCase()}
+                {t === 'medium' ? 'BALANCED' : t.toUpperCase()}
               </button>
             ))}
           </div>
@@ -1678,6 +1743,7 @@ export default function Shell() {
                 }
                 gravityMps2={scenario.gravity}
                 terrainSeed={scenario.seed}
+                onReplayEpisode={handleReplayEpisode}
                 className="flex-1"
               />
             )}
@@ -1900,10 +1966,12 @@ export default function Shell() {
             setIsTeleopOpen(false);
           }}
           onCommand={(cmd: TeleopCommand) => {
-            const target = (cmd as any)?.targetPosition as [number, number, number] | undefined;
-            if (target) {
-              const vx = Math.max(-0.8, Math.min(1.6, target[0] * 4.0));
-              const yawRate = Math.max(-1.8, Math.min(1.8, -target[2] * 3.5));
+            if (typeof cmd.vx === 'number' && typeof cmd.yawRate === 'number') {
+              const active = !cmd.failsafeActive || Math.abs(cmd.vx) > 0.005 || Math.abs(cmd.yawRate) > 0.005;
+              engine.inputs.setCVTeleopCommand(active, cmd.vx, cmd.yawRate);
+            } else if (cmd.targetPosition) {
+              const vx = Math.max(-0.8, Math.min(1.6, cmd.targetPosition[0] * 4.0));
+              const yawRate = Math.max(-1.8, Math.min(1.8, -cmd.targetPosition[2] * 3.5));
               engine.inputs.setCVTeleopCommand(true, vx, yawRate);
             }
           }}

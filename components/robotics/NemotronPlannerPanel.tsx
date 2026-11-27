@@ -165,7 +165,7 @@ export default function NemotronPlannerPanel({
                   <div className="font-bold text-cream text-[11px] uppercase tracking-wider">
                     {plan.task_name}
                   </div>
-                  <div className="text-[10px] text-cream-dim">{plan.summary}</div>
+                  <div className="text-[10px] text-cream-dim">{plan.mission_summary || plan.summary}</div>
                 </div>
 
                 {isExecuting ? (
@@ -231,19 +231,25 @@ export default function NemotronPlannerPanel({
                 <div className="text-[9px] font-bold text-cream-dim uppercase">Safety Constraints</div>
                 <div className="grid grid-cols-2 gap-2 text-[9px]">
                   <div className="flex justify-between text-cream-dim">
-                    <span>Max Pitch / Roll:</span>
+                    <span>Max Speed:</span>
+                    <span className="text-cream font-bold tabular-nums">
+                      {(plan.safety_constraints.max_speed ?? plan.safety_constraints.max_linear_vel).toFixed(2)} m/s
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-cream-dim">
+                    <span>Max Tilt:</span>
+                    <span className="text-cream font-bold tabular-nums">
+                      {plan.safety_constraints.max_tilt_deg ?? plan.safety_constraints.max_pitch_deg}°
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-cream-dim">
+                    <span>Pitch / Roll Cap:</span>
                     <span className="text-cream font-bold tabular-nums">
                       {plan.safety_constraints.max_pitch_deg}° / {plan.safety_constraints.max_roll_deg}°
                     </span>
                   </div>
                   <div className="flex justify-between text-cream-dim">
-                    <span>Max Velocity:</span>
-                    <span className="text-cream font-bold tabular-nums">
-                      {plan.safety_constraints.max_linear_vel.toFixed(2)} m/s
-                    </span>
-                  </div>
-                  <div className="flex justify-between text-cream-dim">
-                    <span>Min Obstacle Clearance:</span>
+                    <span>Min Clearance:</span>
                     <span className="text-cream font-bold tabular-nums">
                       {plan.safety_constraints.min_obstacle_clearance.toFixed(2)} m
                     </span>

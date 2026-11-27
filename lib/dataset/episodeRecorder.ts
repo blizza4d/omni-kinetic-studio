@@ -16,10 +16,16 @@ export type DatasetControlSource = 'keyboard' | 'gesture' | 'nemotron' | 'gamepa
 
 export interface LeRobotObservation {
   pose: [number, number, number]; // [x, y, z] in meters
+  position: [number, number, number]; // [x, y, z] in meters
   orientation_euler_deg: [number, number, number]; // [roll, pitch, yaw] in degrees
+  orientation: [number, number, number, number]; // [qx, qy, qz, qw]
   orientation_quat: [number, number, number, number]; // [qx, qy, qz, qw]
+  linear_vel: [number, number, number]; // [vx, vy, vz] in m/s
   linear_velocity: [number, number, number]; // [vx, vy, vz] in m/s
+  angular_vel: [number, number, number]; // [wx, wy, wz] in deg/s
   angular_velocity: [number, number, number]; // [wx, wy, wz] in deg/s
+  pitch: number; // pitch angle in deg
+  roll: number; // roll angle in deg
   joint_positions: number[]; // 12 angles in radians
   joint_velocities: number[]; // 12 velocities in rad/s
   joint_torques: number[]; // 12 torques in N*m
@@ -30,6 +36,8 @@ export interface LeRobotObservation {
 }
 
 export interface LeRobotAction {
+  throttle: number; // m/s linear command vx
+  steering: number; // rad/s yaw rate command
   linear_vel_cmd: [number, number]; // [vx, vy]
   angular_vel_cmd: number; // yaw_rate
   gait_mode?: string;
@@ -134,24 +142,33 @@ export class EpisodeDemonstrationRecorder {
         : PerceptionStore.getInstance().getLatestLidarRanges();
     const capturedRanges = rawRanges.map((r) => Number(r.toFixed(3)));
 
+    const pos: [number, number, number] = body ? [body.pos[0], body.pos[1], body.pos[2]] : [0, 0.44, 0];
+    const rollDeg = Number((rollRad * toDeg).toFixed(2));
+    const pitchDeg = Number((pitchRad * toDeg).toFixed(2));
+    const yawDeg = Number((yawRad * toDeg).toFixed(2));
+    const linVel: [number, number, number] = body ? [body.vel[0], body.vel[1], body.vel[2]] : [0, 0, 0];
+    const angVel: [number, number, number] = [
+      Number((rollRad * 2.0 * toDeg).toFixed(2)),
+      Number((pitchRad * 2.0 * toDeg).toFixed(2)),
+      Number((yawRad * 2.0 * toDeg).toFixed(2)),
+    ];
+
     const demoFrame: RoboticsDemonstrationFrame = {
       step: this.frames.length,
       timestamp_ms: Math.round(performance.now() - this.startPerfMs),
       control_source: controlSource,
       observation: {
-        pose: body ? [body.pos[0], body.pos[1], body.pos[2]] : [0, 0.44, 0],
-        orientation_euler_deg: [
-          Number((rollRad * toDeg).toFixed(2)),
-          Number((pitchRad * toDeg).toFixed(2)),
-          Number((yawRad * toDeg).toFixed(2)),
-        ],
+        pose: pos,
+        position: pos,
+        orientation_euler_deg: [rollDeg, pitchDeg, yawDeg],
+        orientation: quat,
         orientation_quat: quat,
-        linear_velocity: body ? [body.vel[0], body.vel[1], body.vel[2]] : [0, 0, 0],
-        angular_velocity: [
-          Number((rollRad * 2.0 * toDeg).toFixed(2)),
-          Number((pitchRad * 2.0 * toDeg).toFixed(2)),
-          Number((yawRad * 2.0 * toDeg).toFixed(2)),
-        ],
+        linear_vel: linVel,
+        linear_velocity: linVel,
+        angular_vel: angVel,
+        angular_velocity: angVel,
+        pitch: pitchDeg,
+        roll: rollDeg,
         joint_positions: jointPositions,
         joint_velocities: jointVelocities,
         joint_torques: jointTorques,
@@ -161,14 +178,12 @@ export class EpisodeDemonstrationRecorder {
           body ? Number(((body.vel[1] - this.gravityMps2) * 1.0).toFixed(3)) : -this.gravityMps2,
           body ? Number((body.vel[2] * 2.5).toFixed(3)) : 0,
         ],
-        imu_gyro: [
-          Number((rollRad * toDeg).toFixed(2)),
-          Number((pitchRad * toDeg).toFixed(2)),
-          Number((yawRad * toDeg).toFixed(2)),
-        ],
+        imu_gyro: [rollDeg, pitchDeg, yawDeg],
         lidar_ranges: capturedRanges,
       },
       action: {
+        throttle: Number(cmd.vx.toFixed(3)),
+        steering: Number(cmd.yawRate.toFixed(3)),
         linear_vel_cmd: [Number(cmd.vx.toFixed(3)), Number(cmd.vy.toFixed(3))],
         angular_vel_cmd: Number(cmd.yawRate.toFixed(3)),
         gait_mode: cmd.gait || 'auto',
@@ -215,6 +230,13 @@ export class EpisodeDemonstrationRecorder {
     this.frames = [];
   }
 
+  public toggleEpisodeSuccess(episodeId: string): boolean {
+    const ep = this.completedEpisodes.find((e) => e.meta.id === episodeId);
+    if (!ep) return false;
+    ep.meta.success = !ep.meta.success;
+    return ep.meta.success;
+  }
+
   public getEpisodes(): RecordedDemonstrationEpisode[] {
     return this.completedEpisodes;
   }
@@ -238,8 +260,16 @@ export class EpisodeDemonstrationRecorder {
           episode_index: ep.meta.id,
           frame_index: f.step,
           timestamp: f.timestamp_ms / 1000,
+          timestamp_ms: f.timestamp_ms,
           control_source: f.control_source,
+          success: ep.meta.success,
           observation: {
+            position: f.observation.position,
+            orientation: f.observation.orientation,
+            linear_vel: f.observation.linear_vel,
+            angular_vel: f.observation.angular_vel,
+            pitch: f.observation.pitch,
+            roll: f.observation.roll,
             'observation.state.pose': f.observation.pose,
             'observation.state.euler_deg': f.observation.orientation_euler_deg,
             'observation.state.quat': f.observation.orientation_quat,
@@ -254,7 +284,13 @@ export class EpisodeDemonstrationRecorder {
             'observation.lidar_ranges': f.observation.lidar_ranges,
             lidar_ranges: f.observation.lidar_ranges,
           },
-          action: [
+          action: {
+            throttle: f.action.throttle,
+            steering: f.action.steering,
+            linear_vel_cmd: f.action.linear_vel_cmd,
+            angular_vel_cmd: f.action.angular_vel_cmd,
+          },
+          action_vector: [
             f.action.linear_vel_cmd[0],
             f.action.linear_vel_cmd[1],
             f.action.angular_vel_cmd,

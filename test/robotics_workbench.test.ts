@@ -11,7 +11,9 @@ import {
   getRobotProfile,
 } from '../lib/robotics/profiles';
 import { ShortcutRegistry } from '../lib/control/shortcuts';
-import { SimEngine } from '../lib/sim/SimEngine';
+import { SimEngine, InterpolatedDroidRenderState } from '../lib/sim/SimEngine';
+import { TransientRoboticsStore } from '../lib/telemetry/transientStore';
+import { GestureTeleopStabilizer } from '../lib/filters/gestureController';
 import {
   buildRosTwistPayload,
   parseInboundHardwareMessage,
@@ -114,7 +116,17 @@ test('Demonstration Recorder: records time-synced steps and exports valid LeRobo
   assert.ok(jsonl.includes('"observation.lidar_ranges":[4.25,5.1,14]'));
   const parsedFirstLine = JSON.parse(jsonl.split('\n')[0]!);
   assert.equal(parsedFirstLine.frame_index, 0);
+  assert.equal(parsedFirstLine.timestamp_ms >= 0, true);
+  assert.deepEqual(parsedFirstLine.observation.position, [0.1, 0.44, 0]);
+  assert.deepEqual(parsedFirstLine.observation.orientation, [0, 0, 0, 1]);
+  assert.deepEqual(parsedFirstLine.observation.linear_vel, [0.3, 0, 0]);
+  assert.equal(typeof parsedFirstLine.observation.pitch, 'number');
+  assert.equal(typeof parsedFirstLine.observation.roll, 'number');
+  assert.equal(parsedFirstLine.action.throttle, 0.3);
+  assert.equal(parsedFirstLine.action.steering, 0);
   assert.deepEqual(parsedFirstLine.observation.lidar_ranges, [4.25, 5.1, 14]);
+  assert.equal(recorder.toggleEpisodeSuccess(epId), false);
+  assert.equal(recorder.toggleEpisodeSuccess(epId), true);
 
   // Test CSV serialization
   const csv = recorder.exportRoboticsCsv(epId);
@@ -128,7 +140,12 @@ test('Nemotron Task Planner: generates structured plan conforming to robotics sc
   const plan = generateDeterministicPlan('Survey western boulder cluster safely', [0, 0.44, 0]);
 
   assert.ok(plan.task_name.includes('Western Boulder Cluster'));
+  assert.ok(plan.mission_summary.length > 10);
   assert.ok(plan.waypoints.length >= 3);
+  assert.equal(typeof plan.waypoints[0]!.x, 'number');
+  assert.equal(typeof plan.waypoints[0]!.z, 'number');
+  assert.ok(plan.safety_constraints.max_speed > 0);
+  assert.ok(plan.safety_constraints.max_tilt_deg > 0);
   assert.ok(plan.safety_constraints.max_pitch_deg > 0);
   assert.ok(plan.safety_constraints.min_obstacle_clearance >= 0.5);
   assert.ok(plan.reasoning.length > 10);
@@ -153,7 +170,7 @@ test('Multi-Robot Profiles & Configurable LiDAR: switches Lunar Rover 4WD & cast
   for (let i = 0; i < 15; i++) {
     engine.executeFixedStep(i, 1 / 60);
   }
-  const renderOut: any = {
+  const renderOut: InterpolatedDroidRenderState = {
     time: 0,
     step: 0,
     pos: [0, 0, 0],
@@ -260,4 +277,90 @@ test('Sim-to-Real Benchmark Suite: executes 3 randomized trials and generates Sc
   const decoded = JSON.parse(json);
   assert.equal(decoded.scenarioId, 'obstacle_slalom');
   assert.equal(decoded.trials.length, 3);
+});
+
+test('TransientRoboticsStore: tracks >30deg tilt safety warning & performance tier MediaPipe FPS', () => {
+  const store = TransientRoboticsStore.getInstance();
+  store.setPerformanceTier('balanced');
+  assert.equal(store.getState().mediapipeTargetFps, 18);
+  store.setPerformanceTier('low');
+  assert.equal(store.getState().mediapipeTargetFps, 10);
+  store.setPerformanceTier('high');
+  assert.equal(store.getState().mediapipeTargetFps, 30);
+
+  store.writePhysicsFrame({
+    timestampMs: 100,
+    step: 6,
+    pos: [1.0, 0.4, 2.0],
+    quat: [0, 0, 0, 1],
+    vel: [0.5, 0, 0],
+    angVelDegS: [0, 0, 0],
+    pitchDeg: 33.5,
+    rollDeg: 4.0,
+    yawDeg: 0,
+    wheelSlip: 0.12,
+    slopeDeg: 22.0,
+    slopeTractionFactor: 0.78,
+    groundContactCount: 4,
+    suspensionClamped: true,
+    gravityMps2: 1.62,
+    eStopActive: false,
+  });
+  const snap = store.getState();
+  assert.equal(snap.tiltWarning, true);
+  assert.equal(snap.suspensionClamped, true);
+  assert.equal(snap.slopeTractionFactor, 0.78);
+});
+
+test('GestureTeleopStabilizer: applies EMA smoothing, deadzone suppression, and >300ms failsafe ramp-to-zero', () => {
+  const stabilizer = new GestureTeleopStabilizer({
+    emaAlpha: 0.3,
+    deadzone: 0.1,
+    minConfidence: 0.6,
+    failsafeTimeoutMs: 300,
+  });
+
+  // Inside deadzone -> suppressed to exact 0
+  const dzOut = stabilizer.step({
+    rawThrottle: 0.05,
+    rawSteering: -0.08,
+    handPresent: true,
+    confidence: 0.95,
+    nowMs: 100,
+  });
+  assert.equal(dzOut.vx, 0);
+  assert.equal(dzOut.yawRate, 0);
+  assert.equal(dzOut.failsafeActive, false);
+
+  // Strong command -> EMA smooths smoothly toward target
+  const out1 = stabilizer.step({
+    rawThrottle: 1.0,
+    rawSteering: 0.5,
+    handPresent: true,
+    confidence: 0.95,
+    nowMs: 133,
+  });
+  assert.ok(out1.vx > 0 && out1.vx < 1.5);
+  assert.equal(out1.signalValid, true);
+
+  // Signal loss > 300ms -> activates failsafe and ramps velocity toward zero
+  const outFailsafe1 = stabilizer.step({
+    rawThrottle: 1.0,
+    rawSteering: 0.5,
+    handPresent: false,
+    confidence: 0.0,
+    nowMs: 500,
+  });
+  assert.equal(outFailsafe1.failsafeActive, true);
+  assert.ok(outFailsafe1.vx < out1.vx);
+
+  const outFailsafeLater = stabilizer.step({
+    rawThrottle: 0,
+    rawSteering: 0,
+    handPresent: false,
+    confidence: 0.0,
+    nowMs: 900,
+  });
+  assert.equal(outFailsafeLater.failsafeActive, true);
+  assert.ok(outFailsafeLater.vx < 0.05);
 });

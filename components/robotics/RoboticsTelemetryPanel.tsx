@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ShieldAlert,
   Activity,
@@ -25,6 +25,10 @@ import {
   RobotProfile,
   RobotProfileId,
 } from '@/lib/robotics/profiles';
+import {
+  TransientRoboticsStore,
+  TransientRoverState,
+} from '@/lib/telemetry/transientStore';
 import LidarMiniRadar from './LidarMiniRadar';
 
 interface RoboticsTelemetryPanelProps {
@@ -57,39 +61,26 @@ export default function RoboticsTelemetryPanel({
   className = '',
 }: RoboticsTelemetryPanelProps) {
   const [data, setData] = useState<RoboticsTelemetryData>(DEFAULT_ROBOTICS_TELEMETRY);
-  const rafId = useRef<number | null>(null);
-  const lastUpdateRef = useRef<number>(0);
+  const [transient, setTransient] = useState<TransientRoverState>(() =>
+    TransientRoboticsStore.getInstance().getSnapshotCopy()
+  );
 
-  // Poll TelemetryStore at ~20 Hz (50ms) to eliminate React overhead while keeping visual streaming fluid
+  // Subscribe to TransientRoboticsStore at ~18 Hz (zero 60 FPS React tree churn)
   useEffect(() => {
-    let mounted = true;
-
-    const poll = (now: number) => {
-      if (!mounted) return;
-      if (now - lastUpdateRef.current >= 50) {
-        lastUpdateRef.current = now;
-        const latestFrame = telemetryStore.getLatestFrame();
-        const telemetry = extractRoboticsTelemetry(
-          latestFrame,
-          eStopActive,
-          controlLatencyMs,
-          webglFps,
-          robotProfile,
-          gravityMps2
-        );
-        setData(telemetry);
-      }
-      rafId.current = requestAnimationFrame(poll);
-    };
-
-    rafId.current = requestAnimationFrame(poll);
-
-    return () => {
-      mounted = false;
-      if (rafId.current !== null) {
-        cancelAnimationFrame(rafId.current);
-      }
-    };
+    const store = TransientRoboticsStore.getInstance();
+    return store.subscribeThrottled((snap) => {
+      setTransient(snap);
+      const latestFrame = telemetryStore.getLatestFrame();
+      const telemetry = extractRoboticsTelemetry(
+        latestFrame,
+        eStopActive,
+        controlLatencyMs,
+        webglFps,
+        robotProfile,
+        gravityMps2
+      );
+      setData(telemetry);
+    }, 18);
   }, [telemetryStore, eStopActive, controlLatencyMs, webglFps, robotProfile, gravityMps2]);
 
   const { pose, velocity, actuators, safety, system } = data;
@@ -127,6 +118,17 @@ export default function RoboticsTelemetryPanel({
           )}
         </div>
       </div>
+
+      {/* > 30° Critical Tilt Safety Warning Banner */}
+      {transient.tiltWarning && (
+        <div className="px-3.5 py-2 bg-brick/25 border-b border-brick/50 flex items-center justify-between text-[10px] text-brick font-bold animate-pulse">
+          <span className="flex items-center space-x-1.5">
+            <AlertTriangle className="w-3.5 h-3.5" />
+            <span>TILT SAFETY WARNING (&gt; 30°): {safety.tiltDeg.toFixed(1)}°</span>
+          </span>
+          <span className="uppercase text-[9px]">Traction Clamped</span>
+        </div>
+      )}
 
       {/* Prominent E-STOP Control Header */}
       <div className="p-3 bg-[#2A2A2A]/80 border-b border-cream/10">
@@ -418,6 +420,27 @@ export default function RoboticsTelemetryPanel({
                 <div className="text-[9px] text-cream-dim uppercase">Collisions</div>
                 <div className={`text-sm font-bold tabular-nums ${safety.collision ? 'text-brick' : 'text-cream'}`}>
                   {safety.collisionCount}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+              <div className="p-2 rounded bg-charcoal-deep/60 border border-cream/5">
+                <div className="text-[9px] text-cream-dim uppercase">Wheel Slip</div>
+                <div className="text-xs font-bold text-cream tabular-nums">
+                  {(transient.wheelSlip * 1000).toFixed(1)} <span className="text-[9px] font-normal text-cream-dim">mm</span>
+                </div>
+              </div>
+              <div className="p-2 rounded bg-charcoal-deep/60 border border-cream/5">
+                <div className="text-[9px] text-cream-dim uppercase">Slope / Trac</div>
+                <div className="text-xs font-bold text-cream tabular-nums">
+                  {transient.slopeDeg.toFixed(1)}° · {Math.round(transient.slopeTractionFactor * 100)}%
+                </div>
+              </div>
+              <div className="p-2 rounded bg-charcoal-deep/60 border border-cream/5">
+                <div className="text-[9px] text-cream-dim uppercase">Suspension</div>
+                <div className={`text-xs font-bold uppercase ${transient.suspensionClamped ? 'text-amber-300' : 'text-sage'}`}>
+                  {transient.suspensionClamped ? 'Clamped' : 'Nominal'}
                 </div>
               </div>
             </div>
