@@ -66,12 +66,15 @@ interface ThreeViewerProps {
   onFpsUpdate?: (fps: number, frameTimeMs: number) => void;
   onBoundaryWarning?: (state: 'soft' | 'hard' | 'out', distToEdge: number) => void;
   onEpisodeReset?: (reason: string) => void;
+  onToggleSensor?: (key: keyof SensorOverlayFlags) => void;
+  onTogglePip?: () => void;
   isNewAnimation?: boolean;
   adaptiveQuality?: boolean;
 }
 
 const DEFAULT_SENSORS: SensorOverlayFlags = {
   lidar: false,
+  velocity: false,
   contacts: false,
   stability: false,
   path: false,
@@ -111,6 +114,8 @@ export default function ThreeViewer({
   onCanvasReady,
   onUiSync,
   onBoundaryWarning,
+  onToggleSensor,
+  onTogglePip,
 }: ThreeViewerProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [contextLost, setContextLost] = useState(false);
@@ -493,6 +498,19 @@ export default function ThreeViewer({
     pathGeo.setAttribute('position', new THREE.BufferAttribute(pathPositions, 3));
     const pathMat = new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.7 });
     const pathLine = new THREE.Line(pathGeo, pathMat);
+    pathLine.visible = false;
+    pathLine.frustumCulled = false;
+    scene.add(pathLine);
+
+    // Preallocated 3D Velocity Vector Arrow (shaft + 2 arrowhead barbs = 6 verts, zero per-frame allocations)
+    const velPositions = new Float32Array(6 * 3);
+    const velGeo = new THREE.BufferGeometry();
+    velGeo.setAttribute('position', new THREE.BufferAttribute(velPositions, 3));
+    const velMat = new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.92 });
+    const velLines = new THREE.LineSegments(velGeo, velMat);
+    velLines.visible = false;
+    velLines.frustumCulled = false;
+    scene.add(velLines);
     pathLine.visible = false;
     pathLine.frustumCulled = false;
     scene.add(pathLine);
@@ -899,9 +917,9 @@ export default function ThreeViewer({
       const lCfg = perceptionStore.getLidarConfig();
       const pCfg = perceptionStore.getPipConfig();
       const lidarActive = lCfg.enabled || sFlags.lidar;
-      lidarLines.visible = (sFlags.lidar || (lCfg.enabled && showOverlaysRef.current)) && !isLow;
-      lidarHitPoints.visible = lidarActive && showOverlaysRef.current;
-      lidarMat.opacity = sFlags.lidar ? 0.58 : 0.24;
+      lidarLines.visible = sFlags.lidar && showOverlaysRef.current && !isLow;
+      lidarHitPoints.visible = sFlags.lidar && showOverlaysRef.current;
+      lidarMat.opacity = sFlags.lidar ? 0.65 : 0.25;
 
       if (lidarActive && now - lastLidarMs >= 55) {
         lastLidarMs = now;
@@ -1098,6 +1116,47 @@ export default function ThreeViewer({
         }
         pathGeo.attributes.position.needsUpdate = true;
         pathGeo.setDrawRange(0, pCount);
+      }
+
+      velLines.visible = sFlags.velocity && showOverlaysRef.current;
+      if (velLines.visible) {
+        const vx = renderState.vel[0];
+        const vy = renderState.vel[1];
+        const vz = renderState.vel[2];
+        const hSpeed = Math.hypot(vx, vz);
+        const ox = sanitized.pos[0];
+        const oy = sanitized.pos[1] + 0.34;
+        const oz = sanitized.pos[2];
+        if (hSpeed > 0.02 || Math.abs(vy) > 0.02) {
+          const scale = 1.45;
+          const tx = ox + vx * scale;
+          const ty = oy + vy * scale;
+          const tz = oz + vz * scale;
+          const lenXZ = Math.max(1e-4, hSpeed);
+          const dirX = vx / lenXZ;
+          const dirZ = vz / lenXZ;
+          const perpX = -dirZ;
+          const perpZ = dirX;
+          const headLen = Math.min(0.32, Math.max(0.12, hSpeed * 0.25));
+
+          // Shaft
+          velPositions[0] = ox; velPositions[1] = oy; velPositions[2] = oz;
+          velPositions[3] = tx; velPositions[4] = ty; velPositions[5] = tz;
+          // Left barb
+          velPositions[6] = tx; velPositions[7] = ty; velPositions[8] = tz;
+          velPositions[9] = tx - dirX * headLen + perpX * headLen * 0.55;
+          velPositions[10] = ty;
+          velPositions[11] = tz - dirZ * headLen + perpZ * headLen * 0.55;
+          // Right barb
+          velPositions[12] = tx; velPositions[13] = ty; velPositions[14] = tz;
+          velPositions[15] = tx - dirX * headLen - perpX * headLen * 0.55;
+          velPositions[16] = ty;
+          velPositions[17] = tz - dirZ * headLen - perpZ * headLen * 0.55;
+          velGeo.attributes.position.needsUpdate = true;
+          velGeo.setDrawRange(0, 6);
+        } else {
+          velGeo.setDrawRange(0, 0);
+        }
       }
 
       // 9. Camera Rig (Follow, Orbit, Top-Down, FPV, Free-Fly + 0.35s Min-Jerk Blend + Landing Shake)
@@ -1338,6 +1397,7 @@ export default function ThreeViewer({
       grfGeo.dispose(); grfMat.dispose();
       polyGeo.dispose(); polyMat.dispose();
       pathGeo.dispose(); pathMat.dispose();
+      velGeo.dispose(); velMat.dispose();
       trailGeo.dispose(); trailMat.dispose();
       disposeObjectTree(mainRig.robotGroup);
       disposeObjectTree(ghostRig.robotGroup);
@@ -1381,14 +1441,71 @@ export default function ThreeViewer({
         </div>
       )}
 
-      {/* Top-Left Gravity Telemetry Chip */}
-      <div className="absolute top-3 left-3 z-20 flex items-center space-x-2 pointer-events-none">
+      {/* Top-Left Gravity Telemetry Chip + Viewport Overlays Toolbar */}
+      <div className="absolute top-3 left-3 z-20 flex flex-col items-start space-y-1.5 pointer-events-none">
         <div className="analog-glass px-2.5 py-1 text-[11px] font-mono text-cream flex items-center space-x-1.5 shadow-lg">
           <span className="w-2 h-2 rounded-full bg-sage animate-pulse" />
           <span className="text-cream-dim">GRAVITY:</span>
           <span className="font-bold text-cream tabular-nums">
             {formatGravityDisplay([0, -engine.getScenario().gravity, 0])}
           </span>
+        </div>
+
+        <div
+          className="pointer-events-auto flex items-center flex-wrap gap-1 px-1.5 py-1 rounded-lg bg-charcoal-deep/85 border border-cream/15 font-mono text-[9px] shadow-lg"
+          data-testid="viewport-overlays-toolbar"
+        >
+          <span className="text-cream-dim uppercase px-1 font-bold">Overlays:</span>
+          <button
+            type="button"
+            onClick={() => onToggleSensor?.('lidar')}
+            className={`px-1.5 py-0.5 rounded uppercase font-bold border transition-colors ${
+              sensors.lidar
+                ? 'bg-sage text-charcoal-deep border-sage'
+                : 'bg-charcoal text-cream-dim hover:text-cream border-cream/10'
+            }`}
+          >
+            LiDAR Rays
+          </button>
+          <button
+            type="button"
+            onClick={() => onToggleSensor?.('velocity')}
+            className={`px-1.5 py-0.5 rounded uppercase font-bold border transition-colors ${
+              sensors.velocity
+                ? 'bg-sky-400/25 text-sky-300 border-sky-400/50'
+                : 'bg-charcoal text-cream-dim hover:text-cream border-cream/10'
+            }`}
+          >
+            Velocity Vector
+          </button>
+          <button
+            type="button"
+            onClick={() => onToggleSensor?.('path')}
+            className={`px-1.5 py-0.5 rounded uppercase font-bold border transition-colors ${
+              sensors.path
+                ? 'bg-amber-400/25 text-amber-300 border-amber-400/50'
+                : 'bg-charcoal text-cream-dim hover:text-cream border-cream/10'
+            }`}
+          >
+            Planned Path
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (onTogglePip) {
+                onTogglePip();
+              } else {
+                PerceptionStore.getInstance().setPipConfig({ enabled: !pipCfg.enabled });
+              }
+            }}
+            className={`px-1.5 py-0.5 rounded uppercase font-bold border transition-colors ${
+              pipCfg.enabled
+                ? 'bg-sage/25 text-sage border-sage/50'
+                : 'bg-charcoal text-cream-dim hover:text-cream border-cream/10'
+            }`}
+          >
+            Onboard Cam
+          </button>
         </div>
       </div>
 

@@ -10,27 +10,35 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import { SimEngine } from '@/lib/sim/SimEngine';
-import {
-  sampleDomain,
-  DEFAULT_RANDOMIZATION_CONFIG,
-} from '@/lib/sim2real/toolkit';
+import { mulberry32 } from '@/lib/sim/prng';
 
 export interface PhysicsDomainState {
   gravityMps2: number;
   frictionCoeff: number;
+  frictionMultiplier?: number;
   slipDamping: number;
   maxTorqueNm: number;
+  torqueScale?: number;
+  imuNoiseEnabled?: boolean;
   imuNoiseSigma: number;
   controlLatencyMs: number;
+  seed?: number;
 }
+
+export const NOMINAL_FRICTION = 0.85;
+export const NOMINAL_TORQUE_NM = 35.0;
 
 export const DEFAULT_PHYSICS_DOMAIN: PhysicsDomainState = {
   gravityMps2: 1.62,
-  frictionCoeff: 0.85,
+  frictionCoeff: NOMINAL_FRICTION,
+  frictionMultiplier: 1.0,
   slipDamping: 0.25,
-  maxTorqueNm: 35.0,
-  imuNoiseSigma: 0.02,
+  maxTorqueNm: NOMINAL_TORQUE_NM,
+  torqueScale: 1.0,
+  imuNoiseEnabled: false,
+  imuNoiseSigma: 0.0,
   controlLatencyMs: 0.0,
+  seed: 42,
 };
 
 interface PhysicsDomainPanelProps {
@@ -51,13 +59,22 @@ export default function PhysicsDomainPanel({
   const [domain, setDomain] = useState<PhysicsDomainState>(DEFAULT_PHYSICS_DOMAIN);
 
   const applyChange = (updated: Partial<PhysicsDomainState>) => {
-    const next = { ...domain, ...updated };
+    const next: PhysicsDomainState = { ...domain, ...updated };
+    const effImuSigma = next.imuNoiseEnabled === false ? 0 : next.imuNoiseSigma;
     setDomain(next);
     if (engine) {
-      engine.applyDomainPhysics(next);
+      engine.applyDomainPhysics({
+        gravityMps2: next.gravityMps2,
+        frictionCoeff: next.frictionCoeff,
+        slipDamping: next.slipDamping,
+        maxTorqueNm: next.maxTorqueNm,
+        imuNoiseSigma: effImuSigma,
+        controlLatencyMs: next.controlLatencyMs,
+        seed: next.seed,
+      });
     }
     if (onDomainChange) {
-      onDomainChange(next);
+      onDomainChange({ ...next, imuNoiseSigma: effImuSigma });
     }
   };
 
@@ -65,19 +82,32 @@ export default function PhysicsDomainPanel({
     applyChange({ gravityMps2: val });
   };
 
-  const handleRandomizeDomain = () => {
-    const sampled = sampleDomain(DEFAULT_RANDOMIZATION_CONFIG, domain.gravityMps2, Math.random);
+  const handleRandomizeSeed = () => {
+    const nextSeed = ((domain.seed ?? 42) * 1664525 + 1013904223) >>> 0 || 1337;
+    const rng = mulberry32(nextSeed);
+    const fricMult = Number((0.4 + rng() * 1.05).toFixed(2));
+    const torqueScale = Number((0.55 + rng() * 0.65).toFixed(2));
+    const imuSigma = Number((0.015 + rng() * 0.095).toFixed(3));
+    const latencyMs = Math.round((rng() * 160) / 5) * 5;
     applyChange({
-      frictionCoeff: sampled.friction,
-      imuNoiseSigma: sampled.rangeNoiseStd,
-      controlLatencyMs: sampled.motorLatencySteps * 16.67,
-      maxTorqueNm: Number((35 * sampled.motorStrength).toFixed(1)),
+      seed: nextSeed,
+      frictionMultiplier: fricMult,
+      frictionCoeff: Number((NOMINAL_FRICTION * fricMult).toFixed(2)),
+      torqueScale,
+      maxTorqueNm: Number((NOMINAL_TORQUE_NM * torqueScale).toFixed(1)),
+      imuNoiseEnabled: true,
+      imuNoiseSigma: imuSigma,
+      controlLatencyMs: latencyMs,
     });
   };
 
   const handleReset = () => {
     applyChange(DEFAULT_PHYSICS_DOMAIN);
   };
+
+  const frictionMult = domain.frictionMultiplier ?? Number((domain.frictionCoeff / NOMINAL_FRICTION).toFixed(2));
+  const torqueScale = domain.torqueScale ?? Number((domain.maxTorqueNm / NOMINAL_TORQUE_NM).toFixed(2));
+  const imuEnabled = domain.imuNoiseEnabled ?? domain.imuNoiseSigma > 0;
 
   return (
     <div
@@ -94,13 +124,15 @@ export default function PhysicsDomainPanel({
         </div>
 
         <div className="flex items-center space-x-2">
+          <span className="text-[9px] text-cream-dim tabular-nums">Seed #{domain.seed ?? 42}</span>
           <button
-            onClick={handleRandomizeDomain}
+            type="button"
+            onClick={handleRandomizeSeed}
             className="px-2 py-0.5 rounded bg-sage/20 hover:bg-sage/30 text-sage border border-sage/40 text-[9px] uppercase font-bold flex items-center space-x-1 transition-colors"
-            title="Randomize physics domain using Wilson 95% CI distributions"
+            title="Apply reproducible domain randomization seed & log to exported episodes"
           >
             <Sparkles className="w-3 h-3" />
-            <span>Randomize</span>
+            <span>Randomize Seed</span>
           </button>
           <button
             onClick={handleReset}
@@ -181,43 +213,59 @@ export default function PhysicsDomainPanel({
             <div className="space-y-2.5">
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[10px]">
-                  <span className="text-cream-dim">Friction Coefficient (μ):</span>
-                  <span className="text-cream font-bold tabular-nums">{domain.frictionCoeff.toFixed(2)}</span>
+                  <span className="text-cream-dim">Ground Friction Multiplier:</span>
+                  <span className="text-cream font-bold tabular-nums">
+                    {frictionMult.toFixed(2)}x (μ={domain.frictionCoeff.toFixed(2)})
+                  </span>
                 </div>
                 <input
                   type="range"
-                  min="0.1"
+                  min="0.3"
                   max="1.5"
                   step="0.05"
-                  value={domain.frictionCoeff}
-                  onChange={(e) => applyChange({ frictionCoeff: parseFloat(e.target.value) })}
+                  value={frictionMult}
+                  onChange={(e) => {
+                    const m = parseFloat(e.target.value);
+                    applyChange({
+                      frictionMultiplier: m,
+                      frictionCoeff: Number((NOMINAL_FRICTION * m).toFixed(2)),
+                    });
+                  }}
                   className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer"
                 />
                 <div className="flex justify-between text-[9px] text-cream-dim">
-                  <span>0.10 (Ice)</span>
-                  <span>0.55 (Regolith)</span>
-                  <span>1.50 (High Traction)</span>
+                  <span>0.3x (Ice)</span>
+                  <span>1.0x (Nominal)</span>
+                  <span>1.5x (High Grip)</span>
                 </div>
               </div>
 
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[10px]">
-                  <span className="text-cream-dim">Joint Max Torque Limit:</span>
-                  <span className="text-cream font-bold tabular-nums">{domain.maxTorqueNm.toFixed(0)} N·m</span>
+                  <span className="text-cream-dim">Max Torque Scale:</span>
+                  <span className="text-cream font-bold tabular-nums">
+                    {torqueScale.toFixed(2)}x ({domain.maxTorqueNm.toFixed(1)} N·m)
+                  </span>
                 </div>
                 <input
                   type="range"
-                  min="10"
-                  max="60"
-                  step="1"
-                  value={domain.maxTorqueNm}
-                  onChange={(e) => applyChange({ maxTorqueNm: parseFloat(e.target.value) })}
+                  min="0.5"
+                  max="1.2"
+                  step="0.05"
+                  value={torqueScale}
+                  onChange={(e) => {
+                    const s = parseFloat(e.target.value);
+                    applyChange({
+                      torqueScale: s,
+                      maxTorqueNm: Number((NOMINAL_TORQUE_NM * s).toFixed(1)),
+                    });
+                  }}
                   className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer"
                 />
                 <div className="flex justify-between text-[9px] text-cream-dim">
-                  <span>10 N·m (Compliant)</span>
-                  <span>35 N·m (Nominal)</span>
-                  <span>60 N·m (Rigid)</span>
+                  <span>0.5x (Derated)</span>
+                  <span>1.0x (35 N·m)</span>
+                  <span>1.2x (Boost)</span>
                 </div>
               </div>
             </div>
@@ -225,49 +273,68 @@ export default function PhysicsDomainPanel({
 
           {/* Sensor Noise & Comms Latency */}
           <div className="space-y-2">
-            <div className="text-[10px] font-bold uppercase text-cream-dim tracking-wider border-b border-cream/5 pb-1">
-              Sensors & Transport Latency
+            <div className="flex items-center justify-between text-[10px] font-bold uppercase text-cream-dim tracking-wider border-b border-cream/5 pb-1">
+              <span>Sensor & Control Faults</span>
+              <button
+                type="button"
+                onClick={() =>
+                  applyChange({
+                    imuNoiseEnabled: !imuEnabled,
+                    imuNoiseSigma: !imuEnabled && domain.imuNoiseSigma === 0 ? 0.04 : domain.imuNoiseSigma,
+                  })
+                }
+                className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase border transition-colors ${
+                  imuEnabled
+                    ? 'bg-amber-400/20 text-amber-300 border-amber-400/40'
+                    : 'bg-charcoal text-cream-dim border-cream/10'
+                }`}
+              >
+                IMU Noise: {imuEnabled ? 'ON' : 'OFF'}
+              </button>
             </div>
 
             <div className="space-y-2.5">
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[10px]">
-                  <span className="text-cream-dim">IMU Gaussian Noise (σ):</span>
-                  <span className="text-cream font-bold tabular-nums">±{domain.imuNoiseSigma.toFixed(3)} m/s²</span>
+                  <span className="text-cream-dim">IMU / Pose Gaussian Noise (σ):</span>
+                  <span className="text-cream font-bold tabular-nums">
+                    ±{(imuEnabled ? domain.imuNoiseSigma : 0).toFixed(3)} m/s²
+                  </span>
                 </div>
                 <input
                   type="range"
                   min="0.0"
                   max="0.15"
                   step="0.005"
+                  disabled={!imuEnabled}
                   value={domain.imuNoiseSigma}
-                  onChange={(e) => applyChange({ imuNoiseSigma: parseFloat(e.target.value) })}
-                  className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer"
+                  onChange={(e) => applyChange({ imuNoiseSigma: parseFloat(e.target.value), imuNoiseEnabled: true })}
+                  className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer disabled:opacity-40"
                 />
                 <div className="flex justify-between text-[9px] text-cream-dim">
-                  <span>Zero Noise (Perfect)</span>
-                  <span>0.15 m/s² (Noisy MEMS)</span>
+                  <span>0.000 (Clean)</span>
+                  <span>0.150 m/s² (Degraded MEMS)</span>
                 </div>
               </div>
 
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[10px]">
-                  <span className="text-cream-dim">Control Transport Latency:</span>
+                  <span className="text-cream-dim">Control Latency Buffer:</span>
                   <span className="text-cream font-bold tabular-nums">{domain.controlLatencyMs.toFixed(0)} ms</span>
                 </div>
                 <input
                   type="range"
                   min="0"
-                  max="250"
+                  max="200"
                   step="5"
-                  value={domain.controlLatencyMs}
+                  value={Math.min(200, domain.controlLatencyMs)}
                   onChange={(e) => applyChange({ controlLatencyMs: parseFloat(e.target.value) })}
                   className="w-full accent-sage h-1 bg-charcoal rounded cursor-pointer"
                 />
                 <div className="flex justify-between text-[9px] text-cream-dim">
-                  <span>0 ms (Real-time Bus)</span>
-                  <span>120 ms (5G Network)</span>
-                  <span>250 ms (Deep Space)</span>
+                  <span>0 ms (Real-time)</span>
+                  <span>100 ms (WAN)</span>
+                  <span>200 ms (Lag Spike)</span>
                 </div>
               </div>
             </div>

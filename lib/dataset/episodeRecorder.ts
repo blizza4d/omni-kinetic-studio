@@ -11,8 +11,9 @@
 import { TelemetryFrame } from '@/contracts';
 import { quaternionToEuler, Quaternion4 } from '@/lib/frames';
 import { PerceptionStore } from '@/lib/perception/lidar';
+import { TransientRoboticsStore } from '@/lib/telemetry/transientStore';
 
-export type DatasetControlSource = 'keyboard' | 'gesture' | 'nemotron' | 'gamepad' | 'manual';
+export type DatasetControlSource = 'keyboard' | 'gesture' | 'nemotron' | 'gamepad' | 'manual' | 'bc_policy';
 
 export interface LeRobotObservation {
   pose: [number, number, number]; // [x, y, z] in meters
@@ -49,8 +50,19 @@ export interface RoboticsDemonstrationFrame {
   control_source: DatasetControlSource;
   observation: LeRobotObservation;
   action: LeRobotAction;
+  wheelSlip?: number;
+  tiltWarning?: boolean;
   reward?: number;
   terminal?: boolean;
+}
+
+export interface DomainRandomizationMeta {
+  seed?: number;
+  gravityMps2: number;
+  frictionCoeff: number;
+  maxTorqueNm: number;
+  imuNoiseSigma: number;
+  controlLatencyMs: number;
 }
 
 export interface DemonstrationEpisodeMeta {
@@ -64,6 +76,7 @@ export interface DemonstrationEpisodeMeta {
   gravityMps2: number;
   terrainSeed: number;
   success: boolean;
+  domainMeta?: DomainRandomizationMeta;
   notes?: string;
 }
 
@@ -81,20 +94,27 @@ export class EpisodeDemonstrationRecorder {
   private startPerfMs = 0;
   private gravityMps2 = 1.62;
   private terrainSeed = 42;
+  private episodeCounter = 0;
+  private customEpisodeName = '';
+  private currentDomainMeta: DomainRandomizationMeta | undefined = undefined;
 
   public startRecording(
     source: DatasetControlSource = 'keyboard',
     gravityMps2 = 1.62,
     terrainSeed = 42,
-    customName?: string
+    customName?: string,
+    domainMeta?: DomainRandomizationMeta
   ): string {
     this.isRecording = true;
     this.currentSource = source;
     this.gravityMps2 = gravityMps2;
     this.terrainSeed = terrainSeed;
+    this.customEpisodeName = customName || '';
+    this.currentDomainMeta = domainMeta ? { ...domainMeta } : undefined;
     this.frames = [];
     this.startPerfMs = performance.now();
-    this.currentEpisodeId = `demo_ep_${Date.now()}`;
+    this.episodeCounter += 1;
+    this.currentEpisodeId = `demo_ep_${Date.now()}_${this.episodeCounter}`;
     return this.currentEpisodeId;
   }
 
@@ -153,6 +173,13 @@ export class EpisodeDemonstrationRecorder {
       Number((yawRad * 2.0 * toDeg).toFixed(2)),
     ];
 
+    const transient = TransientRoboticsStore.getInstance().getState();
+    const tiltTriggered =
+      Math.abs(pitchDeg) > 30 ||
+      Math.abs(rollDeg) > 30 ||
+      Math.hypot(pitchDeg, rollDeg) > 30 ||
+      transient.tiltWarning;
+
     const demoFrame: RoboticsDemonstrationFrame = {
       step: this.frames.length,
       timestamp_ms: Math.round(performance.now() - this.startPerfMs),
@@ -188,6 +215,8 @@ export class EpisodeDemonstrationRecorder {
         angular_vel_cmd: Number(cmd.yawRate.toFixed(3)),
         gait_mode: cmd.gait || 'auto',
       },
+      wheelSlip: Number(transient.wheelSlip.toFixed(4)),
+      tiltWarning: tiltTriggered,
       reward: Number(((body?.vel[0] ?? 0) * 0.1).toFixed(3)),
       terminal: isTerminal,
     };
@@ -206,7 +235,7 @@ export class EpisodeDemonstrationRecorder {
     const episode: RecordedDemonstrationEpisode = {
       meta: {
         id: this.currentEpisodeId,
-        name: `Episode ${this.completedEpisodes.length + 1} (${this.currentSource})`,
+        name: this.customEpisodeName || `Episode ${this.completedEpisodes.length + 1} (${this.currentSource})`,
         recordedAt: new Date().toISOString(),
         durationSec,
         frameCount,
@@ -215,6 +244,7 @@ export class EpisodeDemonstrationRecorder {
         gravityMps2: this.gravityMps2,
         terrainSeed: this.terrainSeed,
         success,
+        domainMeta: this.currentDomainMeta,
         notes,
       },
       frames: [...this.frames],
@@ -237,8 +267,45 @@ export class EpisodeDemonstrationRecorder {
     return ep.meta.success;
   }
 
+  public deleteEpisode(episodeId: string): boolean {
+    const idx = this.completedEpisodes.findIndex((e) => e.meta.id === episodeId);
+    if (idx < 0) return false;
+    this.completedEpisodes.splice(idx, 1);
+    return true;
+  }
+
+  public trimEpisode(
+    episodeId: string,
+    startIndex: number,
+    endIndex: number
+  ): RecordedDemonstrationEpisode | null {
+    const ep = this.completedEpisodes.find((e) => e.meta.id === episodeId);
+    if (!ep || ep.frames.length === 0) return null;
+
+    const clampedStart = Math.max(0, Math.min(ep.frames.length - 1, Math.floor(startIndex)));
+    const clampedEnd = Math.max(clampedStart, Math.min(ep.frames.length - 1, Math.floor(endIndex)));
+    const sliced = ep.frames.slice(clampedStart, clampedEnd + 1);
+    const t0 = sliced[0]?.timestamp_ms ?? 0;
+
+    ep.frames = sliced.map((f, idx) => ({
+      ...f,
+      step: idx,
+      timestamp_ms: Math.max(0, f.timestamp_ms - t0),
+    }));
+    ep.meta.frameCount = ep.frames.length;
+    const lastMs = ep.frames[ep.frames.length - 1]?.timestamp_ms ?? 0;
+    const durationSec = Math.max(0.01, Number((lastMs / 1000).toFixed(2)));
+    ep.meta.durationSec = durationSec;
+    ep.meta.effectiveHz = Number((ep.frames.length / durationSec).toFixed(1));
+    return ep;
+  }
+
   public getEpisodes(): RecordedDemonstrationEpisode[] {
     return this.completedEpisodes;
+  }
+
+  public getSuccessEpisodes(): RecordedDemonstrationEpisode[] {
+    return this.completedEpisodes.filter((e) => e.meta.success);
   }
 
   public clearEpisodes(): void {
@@ -248,10 +315,11 @@ export class EpisodeDemonstrationRecorder {
   /**
    * Serializes episodes into LeRobot / RLDS format JSONL string
    */
-  public exportLeRobotJsonl(episodeId?: string): string {
-    const targets = episodeId
+  public exportLeRobotJsonl(episodeId?: string, successOnly = false): string {
+    const baseTargets = episodeId
       ? this.completedEpisodes.filter((e) => e.meta.id === episodeId)
       : this.completedEpisodes;
+    const targets = successOnly ? baseTargets.filter((e) => e.meta.success) : baseTargets;
 
     const lines: string[] = [];
     for (const ep of targets) {
@@ -263,6 +331,8 @@ export class EpisodeDemonstrationRecorder {
           timestamp_ms: f.timestamp_ms,
           control_source: f.control_source,
           success: ep.meta.success,
+          tilt_warning: Boolean(f.tiltWarning),
+          wheel_slip: f.wheelSlip ?? 0,
           observation: {
             position: f.observation.position,
             orientation: f.observation.orientation,
@@ -301,6 +371,7 @@ export class EpisodeDemonstrationRecorder {
           meta: {
             gravity_mps2: ep.meta.gravityMps2,
             terrain_seed: ep.meta.terrainSeed,
+            domain_meta: ep.meta.domainMeta ?? null,
           },
         };
         lines.push(JSON.stringify(item));
@@ -312,10 +383,11 @@ export class EpisodeDemonstrationRecorder {
   /**
    * Serializes episodes into CSV format string
    */
-  public exportRoboticsCsv(episodeId?: string): string {
-    const targets = episodeId
+  public exportRoboticsCsv(episodeId?: string, successOnly = false): string {
+    const baseTargets = episodeId
       ? this.completedEpisodes.filter((e) => e.meta.id === episodeId)
       : this.completedEpisodes;
+    const targets = successOnly ? baseTargets.filter((e) => e.meta.success) : baseTargets;
 
     const headers = [
       'episode_id',

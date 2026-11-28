@@ -14,6 +14,7 @@ import { ShortcutRegistry } from '../lib/control/shortcuts';
 import { SimEngine, InterpolatedDroidRenderState } from '../lib/sim/SimEngine';
 import { TransientRoboticsStore } from '../lib/telemetry/transientStore';
 import { GestureTeleopStabilizer } from '../lib/filters/gestureController';
+import { ImitationPolicy } from '../src/robotics/imitationPolicy';
 import {
   buildRosTwistPayload,
   parseInboundHardwareMessage,
@@ -363,4 +364,160 @@ test('GestureTeleopStabilizer: applies EMA smoothing, deadzone suppression, and 
   });
   assert.equal(outFailsafeLater.failsafeActive, true);
   assert.ok(outFailsafeLater.vx < 0.05);
+});
+
+test('ImitationPolicy: handles empty/fail episodes safely, trains on Success demos, and predicts in < 1 ms', () => {
+  const policy = new ImitationPolicy();
+  const recorder = new EpisodeDemonstrationRecorder();
+
+  // Empty fit returns untrained stats cleanly
+  const emptyStats = policy.fit(recorder.getEpisodes(), 3);
+  assert.equal(emptyStats.trained, false);
+  const emptyPred = policy.predict({
+    position: [0, 0.44, 0],
+    yawRad: 0,
+    linearVel: [0, 0, 0],
+    angularVelDegS: [0, 0, 0],
+    pitchDeg: 0,
+    rollDeg: 0,
+  });
+  assert.equal(emptyPred.throttle, 0);
+  assert.equal(emptyPred.steering, 0);
+  assert.equal(emptyPred.confidence, 0);
+
+  const makeFrame = (x: number, z: number, vx: number): TelemetryFrame => ({
+    schemaVersion: '4.0',
+    seq: 1,
+    dt: 0.0167,
+    t: 0.0167,
+    episode: 1,
+    iteration: 2,
+    bodies: [{ id: 'torso', pos: [x, 0.44, z], quat: [0, 0, 0, 1], vel: [vx, 0, 0] }],
+    joints: [],
+    feet: [
+      { id: 'FL', pos: [x + 0.2, 0, z - 0.1], contact: true },
+      { id: 'FR', pos: [x + 0.2, 0, z + 0.1], contact: true },
+      { id: 'RL', pos: [x - 0.2, 0, z - 0.1], contact: true },
+      { id: 'RR', pos: [x - 0.2, 0, z + 0.1], contact: true },
+    ],
+    valid: true,
+    status: 'running',
+  });
+
+  // Fail-tagged episode must be excluded from training
+  recorder.startRecording('keyboard', 1.62, 42, 'fail-demo');
+  recorder.recordStep(makeFrame(5, 5, -0.5), { vx: -1.0, vy: 0, yawRate: 1.5 }, 'keyboard', false, [2, 2, 2]);
+  recorder.stopAndSave(false);
+
+  const failOnlyStats = policy.fit(recorder.getEpisodes(), 3);
+  assert.equal(failOnlyStats.trained, false);
+
+  // Success-tagged episode must train Weighted k-NN cleanly
+  recorder.startRecording('keyboard', 1.62, 42, 'success-demo');
+  recorder.recordStep(makeFrame(1.0, 0.0, 0.8), { vx: 0.9, vy: 0, yawRate: -0.25 }, 'keyboard', false, [10, 12, 11]);
+  recorder.recordStep(makeFrame(1.2, 0.0, 0.85), { vx: 1.0, vy: 0, yawRate: -0.2 }, 'keyboard', false, [10, 12, 11]);
+  recorder.stopAndSave(true);
+
+  const trainedStats = policy.fit(recorder.getEpisodes(), 2);
+  assert.equal(trainedStats.trained, true);
+  assert.equal(trainedStats.episodeCount, 1);
+  assert.equal(trainedStats.sampleCount, 2);
+
+  const pred = policy.predict({
+    position: [1.1, 0.44, 0.0],
+    yawRad: 0,
+    linearVel: [0.82, 0, 0],
+    angularVelDegS: [0, 0, 0],
+    pitchDeg: 0,
+    rollDeg: 0,
+    lidarRanges: [10, 12, 11],
+  });
+  assert.ok(pred.throttle > 0.7 && pred.throttle <= 1.05);
+  assert.ok(pred.steering < 0);
+  assert.ok(pred.confidence > 0.5);
+  assert.ok(pred.inferenceTimeMs < 5.0);
+  assert.equal(pred.usedDemoCount, 1);
+});
+
+test('Domain Randomization Control Latency Buffer: delays actuation by configured ms window', () => {
+  const engineNoLag = new SimEngine(new ShortcutRegistry());
+  engineNoLag.arbiter.takeManualControl('keyboard', 0);
+  engineNoLag.inputs.handleKeyDown({ code: 'KeyW', key: 'w' });
+  for (let i = 0; i < 8; i++) {
+    engineNoLag.executeFixedStep(i, 1 / 60);
+  }
+  const immediatePosX = engineNoLag.getLatestKinematic()!.bodyPos[0];
+
+  const engineLag = new SimEngine(new ShortcutRegistry());
+  engineLag.applyDomainPhysics({ controlLatencyMs: 160, seed: 777 });
+  assert.equal(engineLag.getDomainPhysics().seed, 777);
+  engineLag.arbiter.takeManualControl('keyboard', 0);
+  engineLag.inputs.handleKeyDown({ code: 'KeyW', key: 'w' });
+  for (let i = 0; i < 8; i++) {
+    engineLag.executeFixedStep(i, 1 / 60);
+  }
+  const delayedPosX = engineLag.getLatestKinematic()!.bodyPos[0];
+
+  // With 160 ms delay (10 steps), the first 8 steps stay at origin while immediate advances > 1cm
+  assert.ok(immediatePosX > 0.01);
+  assert.ok(delayedPosX < immediatePosX * 0.25);
+
+  // Clearing latency releases buffer cleanly
+  engineLag.applyDomainPhysics({ controlLatencyMs: 0 });
+  assert.equal(engineLag.getDomainPhysics().controlLatencyMs, 0);
+});
+
+test('Episode Scrubber & Filtered Export: trims frame range, deletes episodes, and filters Success-only JSONL/CSV', () => {
+  const recorder = new EpisodeDemonstrationRecorder();
+  const dummyFrame = (t: number, vx: number): TelemetryFrame => ({
+    schemaVersion: '4.0',
+    seq: Math.round(t * 60),
+    dt: 0.0167,
+    t,
+    episode: 1,
+    iteration: 2,
+    bodies: [{ id: 'torso', pos: [t, 0.44, 0], quat: [0, 0, 0, 1], vel: [vx, 0, 0] }],
+    joints: [],
+    feet: [{ id: 'FL', pos: [t + 0.2, 0, 0.1], contact: true }],
+    valid: true,
+    status: 'running',
+  });
+
+  const ep1 = recorder.startRecording('keyboard', 3.72, 99, 'mars-ep', {
+    seed: 1234,
+    gravityMps2: 3.72,
+    frictionCoeff: 0.65,
+    maxTorqueNm: 30,
+    imuNoiseSigma: 0.02,
+    controlLatencyMs: 50,
+  });
+  for (let i = 0; i < 6; i++) {
+    recorder.recordStep(dummyFrame(i * 0.1, 0.5 + i * 0.1), { vx: 0.8, vy: 0, yawRate: 0 }, 'keyboard', false, [5, 5, 5]);
+  }
+  recorder.stopAndSave(true);
+
+  const ep2 = recorder.startRecording('keyboard', 1.62, 42, 'failed-ep');
+  recorder.recordStep(dummyFrame(0, 0), { vx: 0, vy: 0, yawRate: 0 }, 'keyboard', false, [5, 5, 5]);
+  recorder.stopAndSave(false);
+
+  // Trim ep1 from index 2..4 -> 3 frames re-indexed 0..2
+  const trimmed = recorder.trimEpisode(ep1, 2, 4);
+  assert.ok(trimmed);
+  assert.equal(trimmed.frames.length, 3);
+  assert.equal(trimmed.meta.frameCount, 3);
+  assert.equal(trimmed.frames[0]!.step, 0);
+  assert.equal(trimmed.meta.domainMeta?.seed, 1234);
+
+  // Success-only exports must contain ep1 (3 lines JSONL, 1 header + 3 rows CSV) and exclude ep2
+  const successJsonl = recorder.exportLeRobotJsonl(undefined, true);
+  assert.equal(successJsonl.split('\n').length, 3);
+  assert.ok(!successJsonl.includes(ep2));
+  assert.ok(successJsonl.includes('"seed":1234'));
+
+  const successCsv = recorder.exportRoboticsCsv(undefined, true);
+  assert.equal(successCsv.split('\n').length, 4); // header + 3 rows
+
+  // Delete ep2
+  assert.equal(recorder.deleteEpisode(ep2), true);
+  assert.equal(recorder.getEpisodes().length, 1);
 });

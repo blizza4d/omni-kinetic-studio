@@ -8,7 +8,19 @@
  *   slope traction, suspension clamping, >30 deg tilt safety flag, and tier FPS
  */
 
+import { PerceptionStore } from '@/lib/perception/lidar';
+
 export type WorkbenchPerformanceTier = 'high' | 'balanced' | 'low';
+
+export interface BcPolicyTelemetry {
+  active: boolean;
+  trained: boolean;
+  confidence: number;
+  nearestDist: number;
+  inferenceTimeMs: number;
+  demoCount: number;
+  sampleCount: number;
+}
 
 export interface TransientRoverState {
   timestampMs: number;
@@ -30,15 +42,49 @@ export interface TransientRoverState {
   eStopActive: boolean;
   performanceTier: WorkbenchPerformanceTier;
   mediapipeTargetFps: number;
+  pipTargetFps: number;
+  bcPolicy: BcPolicyTelemetry;
 }
 
 export const PERFORMANCE_TIER_CONFIG: Record<
   WorkbenchPerformanceTier,
-  { qualityTier: 'high' | 'medium' | 'low'; maxPixelRatio: number; shadows: boolean; mediapipeFps: number; label: string }
+  {
+    qualityTier: 'high' | 'medium' | 'low';
+    maxPixelRatio: number;
+    shadows: boolean;
+    mediapipeFps: number;
+    pipFps: number;
+    pipDefaultEnabled: boolean;
+    label: string;
+  }
 > = {
-  high: { qualityTier: 'high', maxPixelRatio: 2, shadows: true, mediapipeFps: 30, label: 'High' },
-  balanced: { qualityTier: 'medium', maxPixelRatio: 1.5, shadows: true, mediapipeFps: 18, label: 'Balanced' },
-  low: { qualityTier: 'low', maxPixelRatio: 1, shadows: false, mediapipeFps: 10, label: 'Low' },
+  high: {
+    qualityTier: 'high',
+    maxPixelRatio: 2,
+    shadows: true,
+    mediapipeFps: 30,
+    pipFps: 20,
+    pipDefaultEnabled: true,
+    label: 'High',
+  },
+  balanced: {
+    qualityTier: 'medium',
+    maxPixelRatio: 1.5,
+    shadows: true,
+    mediapipeFps: 18,
+    pipFps: 12,
+    pipDefaultEnabled: true,
+    label: 'Balanced',
+  },
+  low: {
+    qualityTier: 'low',
+    maxPixelRatio: 1,
+    shadows: false,
+    mediapipeFps: 10,
+    pipFps: 8,
+    pipDefaultEnabled: false,
+    label: 'Low',
+  },
 };
 
 export type TransientSubscriber = (snapshot: TransientRoverState) => void;
@@ -66,6 +112,16 @@ export class TransientRoboticsStore {
     eStopActive: false,
     performanceTier: 'high',
     mediapipeTargetFps: 30,
+    pipTargetFps: 20,
+    bcPolicy: {
+      active: false,
+      trained: false,
+      confidence: 0,
+      nearestDist: 0,
+      inferenceTimeMs: 0,
+      demoCount: 0,
+      sampleCount: 0,
+    },
   };
 
   private readonly subscribers = new Set<TransientSubscriber>();
@@ -133,9 +189,26 @@ export class TransientRoboticsStore {
     s.eStopActive = input.eStopActive;
   }
 
+  public writeBcPolicyMetrics(metrics: BcPolicyTelemetry): void {
+    const b = this.state.bcPolicy;
+    b.active = metrics.active;
+    b.trained = metrics.trained;
+    b.confidence = metrics.confidence;
+    b.nearestDist = metrics.nearestDist;
+    b.inferenceTimeMs = metrics.inferenceTimeMs;
+    b.demoCount = metrics.demoCount;
+    b.sampleCount = metrics.sampleCount;
+  }
+
   public setPerformanceTier(tier: WorkbenchPerformanceTier): void {
+    const cfg = PERFORMANCE_TIER_CONFIG[tier];
     this.state.performanceTier = tier;
-    this.state.mediapipeTargetFps = PERFORMANCE_TIER_CONFIG[tier].mediapipeFps;
+    this.state.mediapipeTargetFps = cfg.mediapipeFps;
+    this.state.pipTargetFps = cfg.pipFps;
+    PerceptionStore.getInstance().setPipConfig({
+      targetFps: cfg.pipFps,
+      enabled: cfg.pipDefaultEnabled,
+    });
   }
 
   public getState(): TransientRoverState {
@@ -150,6 +223,7 @@ export class TransientRoboticsStore {
       quaternion: [s.quaternion[0], s.quaternion[1], s.quaternion[2], s.quaternion[3]],
       linearVelocity: [s.linearVelocity[0], s.linearVelocity[1], s.linearVelocity[2]],
       angularVelocity: [s.angularVelocity[0], s.angularVelocity[1], s.angularVelocity[2]],
+      bcPolicy: { ...s.bcPolicy },
     };
   }
 

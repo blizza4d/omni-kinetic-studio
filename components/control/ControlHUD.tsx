@@ -28,6 +28,7 @@ import { CameraMode } from '@/lib/storage/settings';
 
 export interface SensorOverlayFlags {
   lidar: boolean;
+  velocity: boolean;
   contacts: boolean;
   stability: boolean;
   path: boolean;
@@ -322,7 +323,8 @@ export default function ControlHUD({
                 </div>
                 {(
                   [
-                    ['lidar', 'LiDAR Range Scan (24 rays)'],
+                    ['lidar', 'LiDAR Range Scan'],
+                    ['velocity', '3D Velocity Vector'],
                     ['contacts', 'Foot GRF & Contact Vectors'],
                     ['stability', 'Support Polygon & CoM'],
                     ['path', 'Planned Path & Trajectory'],

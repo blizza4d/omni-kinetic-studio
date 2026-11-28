@@ -76,7 +76,8 @@ import {
   DemonstrationStep,
 } from '@/contracts';
 import { TransientRoboticsStore } from '@/lib/telemetry/transientStore';
-import { RecordedDemonstrationEpisode } from '@/lib/dataset/episodeRecorder';
+import { globalEpisodeRecorder, RecordedDemonstrationEpisode } from '@/lib/dataset/episodeRecorder';
+import { globalImitationPolicy } from '@/src/robotics/imitationPolicy';
 import { generateDeterministicEnvironmentSpec } from '@/lib/nebius/prompts';
 import { TelemetryStore } from '@/lib/telemetry/store';
 import { PerfProbe } from '@/lib/perf/probe';
@@ -162,6 +163,7 @@ export default function Shell() {
   const [terrainVersion, setTerrainVersion] = useState(1);
   const [sensors, setSensors] = useState<SensorOverlayFlags>({
     lidar: false,
+    velocity: false,
     contacts: false,
     stability: false,
     path: false,
@@ -1041,6 +1043,7 @@ export default function Shell() {
             <button
               type="button"
               onClick={() => {
+                engine.setBehaviorCloningEnabled(false);
                 if (!arbiterSnap.isManual || arbiterSnap.activeSource !== 'keyboard') {
                   engine.arbiter.takeManualControl('keyboard', engine.clock.getElapsed());
                   handleUiSync();
@@ -1058,6 +1061,7 @@ export default function Shell() {
             <button
               type="button"
               onClick={() => {
+                engine.setBehaviorCloningEnabled(false);
                 setIsTeleopOpen(true);
                 engine.arbiter.takeManualControl('cv', engine.clock.getElapsed());
                 handleUiSync();
@@ -1074,17 +1078,45 @@ export default function Shell() {
             <button
               type="button"
               onClick={() => {
+                engine.setBehaviorCloningEnabled(false);
                 engine.arbiter.releaseToPolicy();
                 handleUiSync();
               }}
               title="Autonomous navigation using NVIDIA Nemotron trajectory waypoints"
               className={`px-2 py-0.5 rounded font-bold uppercase transition-colors ${
-                !arbiterSnap.isManual
+                !arbiterSnap.isManual && !engine.isBehaviorCloningEnabled()
                   ? 'bg-sage text-charcoal-deep shadow-sm'
                   : 'text-cream-dim hover:text-cream'
               }`}
             >
               Autonomous <span className="hidden xl:inline">(Nemotron)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (!globalImitationPolicy.isTrained()) {
+                  globalImitationPolicy.fit(globalEpisodeRecorder.getEpisodes(), 5);
+                }
+                if (!globalImitationPolicy.isTrained()) {
+                  showToast('Record & tag at least 1 Success episode in Dataset tab to run Policy (BC).', 'warn');
+                  return;
+                }
+                engine.setBehaviorCloningEnabled(true);
+                engine.arbiter.releaseToPolicy();
+                showToast(
+                  `Engaged Policy (BC) trained on ${globalImitationPolicy.getStats().episodeCount} demo(s).`,
+                  'info'
+                );
+                handleUiSync();
+              }}
+              title="Closed-loop In-Browser Behavior Cloning Imitation Policy"
+              className={`px-2 py-0.5 rounded font-bold uppercase transition-colors ${
+                !arbiterSnap.isManual && engine.isBehaviorCloningEnabled()
+                  ? 'bg-sage text-charcoal-deep shadow-sm'
+                  : 'text-cream-dim hover:text-cream'
+              }`}
+            >
+              Policy <span className="hidden xl:inline">(BC)</span>
             </button>
           </div>
 
@@ -1466,6 +1498,10 @@ export default function Shell() {
             onCanvasReady={(c) => { canvasRef.current = c; }}
             onUiSync={handleUiSync}
             onBoundaryWarning={(st, dist) => showToast(`Arena ${st} edge (${dist.toFixed(1)}m) — safety layer active.`, 'warn')}
+            onToggleSensor={(k) => setSensors((prev) => ({ ...prev, [k]: !prev[k] }))}
+            onTogglePip={() =>
+              updateSettings({ ...settings, camera: { ...settings.camera, pipEnabled: !settings.camera.pipEnabled } })
+            }
           />
 
           {/* Top-Center Hardware Profile / Digital Twin Mode Indicator */}
@@ -1737,13 +1773,33 @@ export default function Shell() {
                     ? 'gesture'
                     : arbiterSnap.activeSource === 'keyboard'
                     ? 'keyboard'
+                    : engine.isBehaviorCloningEnabled()
+                    ? 'bc_policy'
                     : arbiterSnap.activeSource === 'pointer' || engine.getAutonomousPlanState().active
                     ? 'nemotron'
                     : 'keyboard'
                 }
                 gravityMps2={scenario.gravity}
                 terrainSeed={scenario.seed}
+                domainMeta={engine.getDomainPhysics()}
+                isBcPolicyActive={!arbiterSnap.isManual && engine.isBehaviorCloningEnabled()}
                 onReplayEpisode={handleReplayEpisode}
+                onTrainAndRunPolicy={(stats) => {
+                  if (!stats.trained) {
+                    showToast('Tag at least 1 recorded episode as Success first.', 'warn');
+                    return;
+                  }
+                  engine.setBehaviorCloningEnabled(true);
+                  engine.arbiter.releaseToPolicy();
+                  showToast(
+                    `Policy (BC) active — ${stats.episodeCount} demo(s), ${stats.sampleCount} samples`,
+                    'info'
+                  );
+                  handleUiSync();
+                }}
+                onScrubFrame={(pos, quat) => {
+                  engine.previewDemonstrationPose(pos, quat);
+                }}
                 className="flex-1"
               />
             )}

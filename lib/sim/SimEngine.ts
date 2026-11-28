@@ -55,6 +55,7 @@ import { PerceptionStore } from '../perception/lidar';
 import { TransientRoboticsStore } from '../telemetry/transientStore';
 import { quaternionToEuler, Quaternion4 } from '../frames';
 import { gaussian, mulberry32 } from './prng';
+import { ImitationPolicy, globalImitationPolicy } from '@/src/robotics/imitationPolicy';
 
 export interface InterpolatedDroidRenderState {
   time: number;
@@ -145,8 +146,12 @@ export class SimEngine {
   private domainImuNoiseSigma = 0;
   private readonly noiseRng = mulberry32(99173);
   private domainLatencyMs = 0;
+  private domainSeed = 0;
   private readonly cmdDelayBuffer: { vx: number; vy: number; yawRate: number }[] = [];
   private digitalTwinEnabled = false;
+  // In-Browser Behavior Cloning Imitation Policy
+  private bcPolicyEnabled = false;
+  private bcPolicy: ImitationPolicy = globalImitationPolicy;
   // Autonomous Nemotron / Benchmark Waypoint Plan
   private autonomousWaypoints: { id: string; x: number; z: number; targetSpeed: number; tolerance: number }[] = [];
   private autonomousConstraints: { maxSpeed?: number; maxTiltDeg?: number } | null = null;
@@ -324,6 +329,7 @@ export class SimEngine {
     maxTorqueNm?: number;
     imuNoiseSigma?: number;
     controlLatencyMs?: number;
+    seed?: number;
   }): void {
     if (cfg.gravityMps2 !== undefined) {
       this.scenario.gravity = cfg.gravityMps2;
@@ -346,6 +352,9 @@ export class SimEngine {
         this.cmdDelayBuffer.length = 0;
       }
     }
+    if (cfg.seed !== undefined) {
+      this.domainSeed = cfg.seed;
+    }
   }
 
   public getDomainPhysics() {
@@ -356,7 +365,50 @@ export class SimEngine {
       maxTorqueNm: this.domainMaxTorqueNm,
       imuNoiseSigma: this.domainImuNoiseSigma,
       controlLatencyMs: this.domainLatencyMs,
+      seed: this.domainSeed,
     };
+  }
+
+  public setBehaviorCloningEnabled(enabled: boolean): void {
+    this.bcPolicyEnabled = enabled && this.bcPolicy.isTrained();
+    const stats = this.bcPolicy.getStats();
+    TransientRoboticsStore.getInstance().writeBcPolicyMetrics({
+      active: this.bcPolicyEnabled,
+      trained: stats.trained,
+      confidence: 0,
+      nearestDist: 0,
+      inferenceTimeMs: 0,
+      demoCount: stats.episodeCount,
+      sampleCount: stats.sampleCount,
+    });
+  }
+
+  public isBehaviorCloningEnabled(): boolean {
+    return this.bcPolicyEnabled;
+  }
+
+  public getBehaviorCloningPolicy(): ImitationPolicy {
+    return this.bcPolicy;
+  }
+
+  public previewDemonstrationPose(
+    pos: readonly [number, number, number],
+    quat: readonly [number, number, number, number]
+  ): void {
+    this.currPos[0] = pos[0];
+    this.currPos[1] = pos[1];
+    this.currPos[2] = pos[2];
+    this.prevPos[0] = pos[0];
+    this.prevPos[1] = pos[1];
+    this.prevPos[2] = pos[2];
+    this.currQuat[0] = quat[0];
+    this.currQuat[1] = quat[1];
+    this.currQuat[2] = quat[2];
+    this.currQuat[3] = quat[3];
+    this.prevQuat[0] = quat[0];
+    this.prevQuat[1] = quat[1];
+    this.prevQuat[2] = quat[2];
+    this.prevQuat[3] = quat[3];
   }
 
   public setDigitalTwinEnabled(enabled: boolean): void {
@@ -461,7 +513,7 @@ export class SimEngine {
   }
 
   public getArbiterSnapshot(): ControlArbiterSnapshot {
-    return this.arbiter.snapshot('POLICY v1');
+    return this.arbiter.snapshot(this.bcPolicyEnabled ? 'POLICY (BC)' : 'POLICY v1');
   }
 
   public getClockSnapshot(): SimClockSnapshot {
@@ -760,9 +812,47 @@ export class SimEngine {
     const rHeading = snap.heading;
     const nowSec = stepIndex * dt;
 
-    // 2. Compute autonomous Policy v1 command (autonomous plan waypoints OR mission marker / default goal)
+    // 2. Compute autonomous command: Behavior Cloning Policy (BC), Nemotron Plan, or Policy v1
     let nextMarker = null as ReturnType<MissionRuntime['getNextMarker']>;
-    if (this.autonomousWaypoints.length > 0) {
+    if (this.bcPolicyEnabled && this.bcPolicy.isTrained() && !this.arbiter.isManualEngaged()) {
+      const transientState = TransientRoboticsStore.getInstance().getState();
+      const pred = this.bcPolicy.predict({
+        position: this.currPos,
+        yawRad: rHeading,
+        linearVel: transientState.linearVelocity,
+        angularVelDegS: this._angVelOut,
+        pitchDeg: transientState.pitch,
+        rollDeg: transientState.roll,
+        lidarRanges: PerceptionStore.getInstance().getLatestLidarRanges(),
+      });
+      const stats = this.bcPolicy.getStats();
+      TransientRoboticsStore.getInstance().writeBcPolicyMetrics({
+        active: true,
+        trained: stats.trained,
+        confidence: pred.confidence,
+        nearestDist: pred.nearestDist,
+        inferenceTimeMs: pred.inferenceTimeMs,
+        demoCount: stats.episodeCount,
+        sampleCount: stats.sampleCount,
+      });
+      const eStopNow = this.arbiter.snapshot().emergencyStop;
+      const tiltSafetyTripped = transientState.tiltWarning;
+      if (eStopNow || tiltSafetyTripped) {
+        this._policyCmd.vx = 0;
+        this._policyCmd.vy = 0;
+        this._policyCmd.yawRate = 0;
+        this._policyCmd.stop = true;
+      } else {
+        this._policyCmd.vx = pred.throttle;
+        this._policyCmd.vy = 0;
+        this._policyCmd.yawRate = pred.steering;
+        this._policyCmd.stop = false;
+      }
+      this._policyCmd.bodyHeight = 0.5;
+      this._policyCmd.gait = 'auto';
+      this._policyCmd.hop = false;
+      this._policyCmd.hopCharge = 0;
+    } else if (this.autonomousWaypoints.length > 0) {
       if (this.autonomousPlanCompleted || this.autonomousWpIndex >= this.autonomousWaypoints.length) {
         this._policyCmd.vx = 0;
         this._policyCmd.vy = 0;
@@ -1202,6 +1292,8 @@ export class SimEngine {
             ? 'gesture'
             : currentSource === 'keyboard'
             ? 'keyboard'
+            : this.bcPolicyEnabled
+            ? 'bc_policy'
             : currentSource === 'pointer' || this.autonomousWaypoints.length > 0
             ? 'nemotron'
             : 'manual';
